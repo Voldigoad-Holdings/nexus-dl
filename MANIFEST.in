@@ -1,0 +1,231 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — MANIFEST.in
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# 1. FICHIERS RACINE
+# ────────────────────────────────────────────────────────────────────
+include README.md
+include LICENSE
+include CHANGELOG.md
+include SECURITY.md
+include SECURITY_HALL_OF_FAME.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include nexus.dl
+include pyproject.toml
+include MANIFEST.in
+
+# Exemples de configuration (pas les fichiers réels)
+include .env.example
+include .editorconfig
+include .gitattributes
+include .gitignore
+include .dockerignore
+include .python-version
+include .pre-commit-config.yaml
+
+# ────────────────────────────────────────────────────────────────────
+# 2. PACKAGE PYTHON — src/nexusdl/
+# ────────────────────────────────────────────────────────────────────
+# Le package Python est découvert automatiquement par hatchling,
+# mais on inclut explicitement les données non-Python nécessaires.
+
+# ── Données runtime (indispensables au fonctionnement) ──
+recursive-include src/nexusdl/data *.yaml
+recursive-include src/nexusdl/data *.yml
+recursive-include src/nexusdl/data *.json
+recursive-include src/nexusdl/data *.xml
+recursive-include src/nexusdl/data *.txt
+recursive-include src/nexusdl/data/translations *.json
+
+# ── Migrations SQL (indispensables au démarrage) ──
+recursive-include src/nexusdl/core/library/migrations *.sql
+
+# ── Marqueur PEP 561 (typage) ──
+include src/nexusdl/py.typed
+
+# ── Exemple de plugin (référence pour la communauté) ──
+recursive-include src/nexusdl/plugins/_example *.py
+recursive-include src/nexusdl/plugins/_example *.yaml
+
+# ── Template de parser custom (référence pour la communauté) ──
+recursive-include src/nexusdl/parsers/custom *.py
+
+# ── Themes Textual (TUI) ──
+recursive-include src/nexusdl/interfaces/cli *.tcss
+
+# ────────────────────────────────────────────────────────────────────
+# 3. CONFIGURATION (exemples uniquement)
+# ────────────────────────────────────────────────────────────────────
+recursive-include config *.example.yaml
+recursive-include config *.example.yml
+include config/logging.yaml
+
+# ────────────────────────────────────────────────────────────────────
+# 4. DOCUMENTATION (uniquement les sources, pas les builds)
+# ────────────────────────────────────────────────────────────────────
+recursive-include docs/source *.md
+recursive-include docs/source *.rst
+recursive-include docs/source *.py
+recursive-include docs/source *.css
+recursive-include docs/source *.html
+recursive-include docs/source *.png
+recursive-include docs/source *.svg
+include docs/API.md
+include docs/README.md
+
+# ────────────────────────────────────────────────────────────────────
+# 5. SCRIPTS UTILITAIRES
+# ────────────────────────────────────────────────────────────────────
+recursive-include scripts *.py
+include scripts/README.md
+
+# ────────────────────────────────────────────────────────────────────
+# 6. DOCKER (référence pour auto-hébergement)
+# ────────────────────────────────────────────────────────────────────
+include docker/Dockerfile
+include docker/Dockerfile.gui
+include docker/Dockerfile.web
+include docker/docker-compose.yml
+include docker/docker-compose.dev.yml
+include docker/entrypoint.sh
+include docker/entrypoint.ps1
+include docker/nginx.conf
+
+# ────────────────────────────────────────────────────────────────────
+# 7. GITHUB (templates pour contributeurs)
+# ────────────────────────────────────────────────────────────────────
+include .github/CODEOWNERS
+include .github/dependabot.yml
+include .github/PULL_REQUEST_TEMPLATE.md
+recursive-include .github/ISSUE_TEMPLATE *.md
+
+# ────────────────────────────────────────────────────────────────────
+# 8. ASSETS LÉGERS (bannière, logo — pas les screenshots)
+# ────────────────────────────────────────────────────────────────────
+include assets/banner.png
+include assets/banner_dark.png
+include assets/logo_animated.svg
+include assets/icons/nexusdl.svg
+include assets/icons/nexusdl.png
+
+# ────────────────────────────────────────────────────────────────────
+# 9. TESTS (référence pour contributeurs, sans fixtures lourdes)
+# ────────────────────────────────────────────────────────────────────
+recursive-include tests *.py
+include tests/pytest.ini
+include tests/conftest.py
+
+# Fixtures légères (JSON/YAML) uniquement — pas les binaires
+recursive-include tests/fixtures *.json
+recursive-include tests/fixtures *.yaml
+
+# ────────────────────────────────────────────────────────────────────
+# 10. BUILD & CI (référence)
+# ────────────────────────────────────────────────────────────────────
+include Makefile
+include justfile
+include tox.ini
+include .github/workflows/*.yml
+
+# ════════════════════════════════════════════════════════════════════
+# EXCLUSIONS — ne JAMAIS inclure dans le sdist
+# ════════════════════════════════════════════════════════════════════
+
+# ── Secrets ──
+exclude .env
+exclude .env.*
+exclude .env.local
+exclude .env.production
+exclude .env.development
+recursive-exclude . *.key
+recursive-exclude . *.keyfile
+recursive-exclude . *.pem
+recursive-exclude . *.p12
+recursive-exclude . *.pfx
+
+# ── Frontend Next.js (distribué séparément) ──
+prune src/nexusdl/interfaces/web/frontend/node_modules
+prune src/nexusdl/interfaces/web/frontend/.next
+prune src/nexusdl/interfaces/web/frontend/out
+prune src/nexusdl/interfaces/web/frontend/.turbo
+prune src/nexusdl/interfaces/web/frontend/public/screenshots
+exclude src/nexusdl/interfaces/web/frontend/.env.local
+exclude src/nexusdl/interfaces/web/frontend/.env.*.local
+exclude src/nexusdl/interfaces/web/frontend/*.tsbuildinfo
+exclude src/nexusdl/interfaces/web/frontend/.eslintcache
+
+# ── Fichiers Python générés ──
+recursive-exclude . __pycache__
+recursive-exclude . *.py[cod]
+recursive-exclude . *$py.class
+recursive-exclude . *.so
+recursive-exclude . *.pyd
+recursive-exclude . .mypy_cache
+recursive-exclude . .ruff_cache
+recursive-exclude . .pytest_cache
+recursive-exclude . .hypothesis
+recursive-exclude . .tox
+recursive-exclude . .nox
+
+# ── Environnements virtuels ──
+prune .venv
+prune venv
+prune env
+prune ENV
+prune node_modules
+
+# ── Artefacts de build ──
+prune build
+prune dist
+prune .eggs
+prune *.egg-info
+recursive-exclude . *.egg
+recursive-exclude . *.whl
+
+# ── Données runtime NexusDL ──
+prune data
+prune downloads
+prune temp
+prune tmp
+prune logs
+prune .cache
+prune .nexusdl
+exclude library.db
+exclude library.db-*
+exclude cookies.enc
+recursive-exclude . *.sqlite
+recursive-exclude . *.sqlite3
+recursive-exclude . *.log
+recursive-exclude . *.log.*
+
+# ── Screenshots (trop lourds) ──
+prune assets/screenshots
+prune src/nexusdl/interfaces/web/frontend/public/screenshots
+
+# ── IDE / éditeurs ──
+prune .idea
+prune .vscode
+prune .settings
+recursive-exclude . *.iml
+recursive-exclude . *.swp
+recursive-exclude . *.swo
+recursive-exclude . *~
+
+# ── OS ──
+exclude .DS_Store
+exclude ._*
+exclude .Spotlight-V100
+exclude .Trashes
+exclude Thumbs.db
+exclude desktop.ini
+exclude Icon?
+
+# ── Divers ──
+prune .github/workflows/ci-tmp
+recursive-exclude . *.tmp
+recursive-exclude . *.bak
+recursive-exclude . *.orig
+recursive-exclude . *.rej
+prune .git

@@ -1,0 +1,225 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Docker build context exclusion list
+#
+# Objectif : réduire la taille du contexte de build et éviter de
+# copier dans l'image des fichiers inutiles (secrets, node_modules,
+# artefacts, caches, données runtime, docs, tests, IDE, OS…).
+#
+# Ce fichier est lu par `docker build` et `docker compose build`.
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# Git & CI (le code source réel sera copié, pas l'historique)
+# ────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+.gitmodules
+.github/
+.gitlab-ci.yml
+.travis.yml
+.circleci/
+.pre-commit-config.yaml
+.editorconfig
+
+# ────────────────────────────────────────────────────────────────────
+# Secrets — JAMAIS dans une image Docker
+# ────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keyfile
+secrets/
+secrets.yaml
+config/config.yaml
+config/proxy.yaml
+config/sites_overrides.yaml
+
+# ────────────────────────────────────────────────────────────────────
+# Python — caches, bytecode, environnements virtuels
+# ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+build/
+dist/
+develop-eggs/
+downloads/
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+.cache/
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# ────────────────────────────────────────────────────────────────────
+# Node.js / Next.js frontend
+# ────────────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+.turbo/
+.vercel/
+.npm/
+.pnpm-store/
+.yarn/
+.yarnrc
+.npmrc
+*.tsbuildinfo
+.eslintcache
+.parcel-cache/
+src/nexusdl/interfaces/web/frontend/node_modules/
+src/nexusdl/interfaces/web/frontend/.next/
+src/nexusdl/interfaces/web/frontend/out/
+src/nexusdl/interfaces/web/frontend/.turbo/
+src/nexusdl/interfaces/web/frontend/.env.local
+src/nexusdl/interfaces/web/frontend/.env.*.local
+
+# ────────────────────────────────────────────────────────────────────
+# Données runtime NexusDL
+# ────────────────────────────────────────────────────────────────────
+data/
+!.gitkeep
+downloads/
+temp/
+logs/
+*.log
+*.log.*
+library.db
+library.db-*
+library.db-journal
+library.db-wal
+library.db-shm
+cookies.enc
+*.cookies
+*.session
+*.sqlite
+*.sqlite3
+
+# ────────────────────────────────────────────────────────────────────
+# Build & cache divers
+# ────────────────────────────────────────────────────────────────────
+*.whl
+*.tar.gz
+*.zip
+*.cbz
+*.cb7
+*.cbr
+*.cbt
+*.pdf
+.cache/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ────────────────────────────────────────────────────────────────────
+# Tests (non requis dans l'image de prod)
+# ────────────────────────────────────────────────────────────────────
+tests/
+!tests/.gitkeep
+pytest.ini
+tox.ini
+.nojekyll
+
+# ────────────────────────────────────────────────────────────────────
+# Documentation (non requise dans l'image)
+# ────────────────────────────────────────────────────────────────────
+docs/
+!docs/.gitkeep
+*.md
+!README.md
+!CHANGELOG.md
+!LICENSE
+!SECURITY.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md
+mkdocs.yml
+site/
+
+# ────────────────────────────────────────────────────────────────────
+# Scripts de développement (non requis dans l'image de prod)
+# ────────────────────────────────────────────────────────────────────
+scripts/
+!scripts/.gitkeep
+Makefile
+justfile
+
+# ────────────────────────────────────────────────────────────────────
+# IDE / éditeurs
+# ────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.code-workspace
+.project
+.classpath
+.settings/
+
+# ────────────────────────────────────────────────────────────────────
+# OS — fichiers système
+# ────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*~
+*.swp
+
+# ────────────────────────────────────────────────────────────────────
+# Docker & CI locaux
+# ────────────────────────────────────────────────────────────────────
+docker/
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# ────────────────────────────────────────────────────────────────────
+# Divers
+# ────────────────────────────────────────────────────────────────────
+*.pid
+*.seed
+*.pid.lock
+.nyc_output/
+jest_0/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+!src/nexusdl/interfaces/web/frontend/pnpm-lock.yaml

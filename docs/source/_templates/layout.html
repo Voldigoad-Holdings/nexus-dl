@@ -1,0 +1,314 @@
+{#
+════════════════════════════════════════════════════════════════════
+ NexusDL — Sphinx RTD theme layout override
+ File: docs/source/_templates/layout.html
+
+ Override du template `layout.html` de `sphinx-rtd-theme`.
+
+ Hérite du template parent via `{{ super() }}` et injecte :
+   - Métadonnées SEO / OpenGraph / Twitter Card
+   - Bannière de version (nexus.dl)
+   - Lien "Edit on GitHub" sur chaque page
+   - Footer custom avec liens communautaires
+   - Bannière de pré-release (si alpha/beta/rc)
+
+ ⚠️  Ne pas dupliquer les blocs déjà gérés par le thème parent.
+ ⚠️  Les classes `wy-*` sont celles du thème RTD (stables v2.0+).
+════════════════════════════════════════════════════════════════════
+#}
+{%- extends "!layout.html" %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   1. BLOC `extrahead` — métadonnées SEO, OpenGraph, Twitter
+   ════════════════════════════════════════════════════════════════ #}
+{%- block extrahead %}
+{{ super() }}
+
+{# ─── Métadonnées de base ─── #}
+<meta name="description" content="{{ meta_description|default('NexusDL — Multi-site manga, webtoon, comic and doujinshi downloader with CLI, TUI, GUI and Web interfaces.', true) }}">
+<meta name="author" content="{{ meta_author|default('Voldigoad-Holdings', true) }}">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#6366f1">
+<meta name="color-scheme" content="light dark">
+
+{# ─── OpenGraph (Facebook, LinkedIn, Discord, Slack…) ─── #}
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="{{ project|default('NexusDL', true) }}">
+<meta property="og:title" content="{{ title|striptags|e }}{% if title != project %} · {{ project }}{% endif %}">
+<meta property="og:description" content="{{ meta_description|default('Multi-site manga, webtoon, comic and doujinshi downloader.', true) }}">
+<meta property="og:url" content="{{ pageurl|default('', true) }}">
+{%- if meta_og_image is defined %}
+<meta property="og:image" content="{{ meta_og_image }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="{{ project }} banner">
+{%- endif %}
+<meta property="og:locale" content="en_US">
+
+{# ─── Twitter Card ─── #}
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ title|striptags|e }}{% if title != project %} · {{ project }}{% endif %}">
+<meta name="twitter:description" content="{{ meta_description|default('Multi-site manga, webtoon, comic and doujinshi downloader.', true) }}">
+{%- if meta_og_image is defined %}
+<meta name="twitter:image" content="{{ meta_og_image }}">
+{%- endif %}
+{%- if meta_twitter_site is defined %}
+<meta name="twitter:site" content="{{ meta_twitter_site }}">
+{%- endif %}
+
+{# ─── Canonical URL (évite le duplicate content) ─── #}
+{%- if pageurl is defined %}
+<link rel="canonical" href="{{ pageurl }}">
+{%- endif %}
+
+{# ─── Favicon (utilise le logo NexusDL) ─── #}
+<link rel="icon" type="image/svg+xml" href="{{ pathto('_static/logo.png', 1) }}">
+<link rel="apple-touch-icon" href="{{ pathto('_static/logo.png', 1) }}">
+
+{# ─── Preconnect (si on ajoute des webfonts plus tard) ─── #}
+{# <link rel="preconnect" href="https://fonts.googleapis.com"> #}
+
+{# ─── JSON-LD structured data (SEO avancé) ─── #}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "{{ project }}",
+  "applicationCategory": "UtilitiesApplication",
+  "operatingSystem": "Linux, macOS, Windows",
+  "softwareVersion": "{{ version|default('0.1.0', true) }}",
+  "license": "https://www.gnu.org/licenses/gpl-3.0.html",
+  "url": "https://github.com/Voldigoad-Holdings/nexus-dl",
+  "description": "Multi-site manga, webtoon, comic and doujinshi downloader with CLI, TUI, GUI and Web interfaces.",
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+</script>
+{%- endblock extrahead %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   2. BLOC `relbar1` — barre de navigation supérieure
+   ════════════════════════════════════════════════════════════════ #}
+{%- block relbar1 %}
+{{ super() }}
+
+{# ─── Bannière de pré-release (affichée en haut de page) ─── #}
+{%- if release_status is defined and release_status in ['alpha', 'beta', 'rc'] %}
+<div class="nexus-prerelease-banner" role="alert" style="
+    background: linear-gradient(90deg, #f59e0b, #d97706);
+    color: white;
+    text-align: center;
+    padding: 0.5em 1em;
+    font-size: 0.9em;
+    font-weight: 600;
+">
+    ⚠️ This documentation is for the <strong>{{ release_status|upper }}</strong> version
+    ({{ version }}). Features may change without notice.
+    See the <a href="https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CHANGELOG.md"
+              style="color: white; text-decoration: underline;">changelog</a>.
+</div>
+{%- endif %}
+{%- endblock relbar1 %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   3. BLOC `extrabody` — injecté en début de <body>
+   ════════════════════════════════════════════════════════════════ #}
+{%- block extrabody %}
+{{ super() }}
+
+{# ─── Lien d'évitement (skip link) pour l'accessibilité ─── #}
+<a href="#main-content"
+   class="nexus-skip-link"
+   style="
+       position: absolute;
+       left: -9999px;
+       top: 0;
+       background: #6366f1;
+       color: white;
+       padding: 0.75em 1.25em;
+       border-radius: 0 0 6px 0;
+       font-weight: 600;
+       z-index: 9999;
+       text-decoration: none;
+   "
+   onfocus="this.style.left='0'"
+   onblur="this.style.left='-9999px'">
+    Skip to main content
+</a>
+{%- endblock extrabody %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   4. BLOC `sidebarlogo` — logo dans la sidebar
+   ════════════════════════════════════════════════════════════════ #}
+{%- block sidebarlogo %}
+<div class="nexus-sidebar-logo" style="text-align: center; padding: 1em 0;">
+    <a href="{{ pathto(master_doc) }}">
+        <img src="{{ pathto('_static/logo.png', 1) }}"
+             alt="{{ project }} logo"
+             style="max-width: 80px; height: auto; border-radius: 12px;">
+    </a>
+    <div style="
+        margin-top: 0.5em;
+        font-size: 0.85em;
+        color: rgba(255, 255, 255, 0.7);
+    ">
+        {{ version }}
+        {%- if release_status is defined and release_status != 'stable' %}
+        <span class="nexus-version-badge">{{ release_status }}</span>
+        {%- endif %}
+    </div>
+</div>
+{{ super() }}
+{%- endblock sidebarlogo %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   5. BLOC `document` — contenu principal avec lien "Edit on GitHub"
+   ════════════════════════════════════════════════════════════════ #}
+{%- block document %}
+<div id="main-content"></div>
+
+{# ─── Lien "Edit on GitHub" (uniquement si la page a un source) ─── #}
+{%- if github_url is defined and show_source|default(false) %}
+<div class="nexus-edit-link" style="
+    text-align: right;
+    margin-bottom: 1em;
+    font-size: 0.9em;
+">
+    <a href="{{ github_url }}{{ pagename }}.md"
+       target="_blank"
+       rel="noopener noreferrer"
+       title="Edit this page on GitHub">
+        ✏️ Edit on GitHub
+    </a>
+</div>
+{%- endif %}
+
+{{ super() }}
+{%- endblock document %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   6. BLOC `footer` — footer custom avec liens communautaires
+   ════════════════════════════════════════════════════════════════ #}
+{%- block footer %}
+<footer class="nexus-footer" role="contentinfo" style="
+    margin-top: 4em;
+    padding: 2em 1em;
+    border-top: 1px solid #e2e8f0;
+    text-align: center;
+    font-size: 0.9em;
+    color: #64748b;
+">
+
+    {# ─── Liens communautaires ─── #}
+    <div class="nexus-footer-links" style="
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 1.5em;
+        margin-bottom: 1.5em;
+    ">
+        <a href="https://github.com/Voldigoad-Holdings/nexus-dl"
+           target="_blank" rel="noopener noreferrer">
+            GitHub
+        </a>
+        <a href="https://github.com/Voldigoad-Holdings/nexus-dl/issues"
+           target="_blank" rel="noopener noreferrer">
+            Issues
+        </a>
+        <a href="https://github.com/Voldigoad-Holdings/nexus-dl/discussions"
+           target="_blank" rel="noopener noreferrer">
+            Discussions
+        </a>
+        <a href="https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CONTRIBUTING.md"
+           target="_blank" rel="noopener noreferrer">
+            Contributing
+        </a>
+        <a href="https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/SECURITY.md"
+           target="_blank" rel="noopener noreferrer">
+            Security
+        </a>
+        <a href="https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CODE_OF_CONDUCT.md"
+           target="_blank" rel="noopener noreferrer">
+            Code of Conduct
+        </a>
+    </div>
+
+    {# ─── Copyright ─── #}
+    <div class="nexus-footer-copy">
+        © {{ copyright|default('2026, Voldigoad-Holdings', true) }}
+        &nbsp;·&nbsp;
+        Licensed under
+        <a href="https://www.gnu.org/licenses/gpl-3.0.html"
+           target="_blank" rel="noopener noreferrer">
+            GPL-3.0-or-later
+        </a>
+    </div>
+
+    {# ─── Built with ─── #}
+    <div class="nexus-footer-built" style="margin-top: 0.75em; font-size: 0.85em;">
+        Built with
+        <a href="https://www.sphinx-doc.org/" target="_blank" rel="noopener noreferrer">
+            Sphinx
+        </a>
+        and
+        <a href="https://sphinx-rtd-theme.readthedocs.io/" target="_blank" rel="noopener noreferrer">
+            Read the Docs theme
+        </a>
+        &nbsp;·&nbsp;
+        Last updated on {{ last_updated|default('', true) }}
+    </div>
+
+    {# ─── Back to top ─── #}
+    <div style="margin-top: 1.5em;">
+        <a href="#" onclick="window.scrollTo({top: 0, behavior: 'smooth'}); return false;"
+           title="Back to top"
+           aria-label="Back to top">
+            ⬆ Back to top
+        </a>
+    </div>
+</footer>
+
+{# ─── Conserver le footer natif du thème (versions, etc.) ─── #}
+{{ super() }}
+{%- endblock footer %}
+
+
+{# ════════════════════════════════════════════════════════════════
+   7. BLOC `menu` — menu de navigation latéral
+   ════════════════════════════════════════════════════════════════ #}
+{%- block menu %}
+{{ super() }}
+
+{# ─── Liens externes en bas de la sidebar ─── #}
+<div class="nexus-sidebar-extras" style="
+    padding: 1em;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    margin-top: 1em;
+    font-size: 0.85em;
+">
+    <a href="https://github.com/Voldigoad-Holdings/nexus-dl"
+       target="_blank" rel="noopener noreferrer"
+       style="display: block; margin-bottom: 0.5em;">
+        ⭐ Star on GitHub
+    </a>
+    <a href="https://github.com/Voldigoad-Holdings/nexus-dl/releases"
+       target="_blank" rel="noopener noreferrer"
+       style="display: block; margin-bottom: 0.5em;">
+        📦 Releases
+    </a>
+    <a href="https://pypi.org/project/nexusdl/"
+       target="_blank" rel="noopener noreferrer"
+       style="display: block; margin-bottom: 0.5em;">
+        🐍 PyPI
+    </a>
+</div>
+{%- endblock menu %}

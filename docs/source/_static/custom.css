@@ -1,0 +1,632 @@
+/* ════════════════════════════════════════════════════════════════════
+   NexusDL — Sphinx RTD theme overrides
+   File: docs/source/_static/custom.css
+   
+   Surcharge légère du thème `sphinx-rtd-theme` pour :
+     - une identité visuelle cohérente avec le projet
+     - une meilleure lisibilité du code
+     - un mode sombre automatique (prefers-color-scheme)
+     - un rendu responsive mobile
+     - une impression propre
+   
+   ⚠️  Ce fichier est chargé après le CSS du thème : il ne remplace
+       pas, il surcharge. Utiliser des sélecteurs spécifiques.
+   ════════════════════════════════════════════════════════════════════ */
+
+/* ────────────────────────────────────────────────────────────────────
+   1. VARIABLES CSS — palette NexusDL
+   ──────────────────────────────────────────────────────────────────── */
+:root {
+    /* Couleurs de marque NexusDL */
+    --nexus-primary: #6366f1;        /* indigo 500 */
+    --nexus-primary-dark: #4f46e5;   /* indigo 600 */
+    --nexus-primary-light: #a5b4fc;  /* indigo 300 */
+    --nexus-accent: #06b6d4;         /* cyan 500 */
+    --nexus-accent-dark: #0891b2;    /* cyan 600 */
+
+    /* Couleurs sémantiques */
+    --nexus-success: #10b981;        /* emerald 500 */
+    --nexus-warning: #f59e0b;        /* amber 500 */
+    --nexus-danger: #ef4444;         /* red 500 */
+    --nexus-info: #3b82f6;           /* blue 500 */
+
+    /* Surfaces (mode clair) */
+    --nexus-bg: #ffffff;
+    --nexus-bg-alt: #f8fafc;
+    --nexus-bg-code: #f1f5f9;
+    --nexus-border: #e2e8f0;
+    --nexus-text: #0f172a;
+    --nexus-text-muted: #64748b;
+
+    /* Typographie */
+    --nexus-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+    --nexus-font-mono: "JetBrains Mono", "Fira Code", "SF Mono", Menlo,
+        Consolas, "Liberation Mono", monospace;
+    --nexus-font-size-base: 16px;
+    --nexus-line-height: 1.7;
+
+    /* Layout */
+    --nexus-radius: 6px;
+    --nexus-radius-lg: 10px;
+    --nexus-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+    --nexus-shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.10);
+    --nexus-transition: 150ms ease-in-out;
+
+    /* Surcharges du thème RTD (variables natives) */
+    --sidebar-width: 320px;
+    --content-max-width: 900px;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   2. MODE SOMBRE AUTOMATIQUE
+   ──────────────────────────────────────────────────────────────────── */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --nexus-bg: #0f172a;
+        --nexus-bg-alt: #1e293b;
+        --nexus-bg-code: #1e293b;
+        --nexus-border: #334155;
+        --nexus-text: #e2e8f0;
+        --nexus-text-muted: #94a3b8;
+
+        --nexus-primary: #818cf8;        /* indigo 400 */
+        --nexus-primary-dark: #6366f1;
+        --nexus-primary-light: #c7d2fe;
+        --nexus-accent: #22d3ee;         /* cyan 400 */
+    }
+
+    /* Surcharges du thème RTD pour le dark mode */
+    body,
+    .wy-body-for-nav {
+        background-color: var(--nexus-bg) !important;
+        color: var(--nexus-text) !important;
+    }
+
+    .wy-nav-side,
+    .wy-side-nav-search {
+        background-color: var(--nexus-bg-alt) !important;
+        border-right: 1px solid var(--nexus-border);
+    }
+
+    .wy-nav-content {
+        background-color: var(--nexus-bg) !important;
+    }
+
+    .rst-content pre,
+    .rst-content code {
+        background-color: var(--nexus-bg-code) !important;
+        color: #f8fafc !important;
+    }
+
+    .rst-content table.docutils {
+        background-color: var(--nexus-bg-alt);
+    }
+
+    .rst-content table.docutils th {
+        background-color: #1e293b;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   3. TYPOGRAPHIE
+   ──────────────────────────────────────────────────────────────────── */
+body,
+.wy-body-for-nav {
+    font-family: var(--nexus-font-sans);
+    font-size: var(--nexus-font-size-base);
+    line-height: var(--nexus-line-height);
+    color: var(--nexus-text);
+}
+
+.rst-content {
+    max-width: var(--content-max-width);
+}
+
+/* Titres */
+.rst-content h1,
+.rst-content h2,
+.rst-content h3,
+.rst-content h4,
+.rst-content h5,
+.rst-content h6 {
+    font-family: var(--nexus-font-sans);
+    font-weight: 700;
+    color: var(--nexus-text);
+    line-height: 1.3;
+    margin-top: 2em;
+    margin-bottom: 0.75em;
+    scroll-margin-top: 80px; /* pour les liens d'ancre */
+}
+
+.rst-content h1 {
+    font-size: 2.25em;
+    border-bottom: 2px solid var(--nexus-border);
+    padding-bottom: 0.3em;
+    margin-top: 0;
+}
+
+.rst-content h2 {
+    font-size: 1.65em;
+    border-bottom: 1px solid var(--nexus-border);
+    padding-bottom: 0.25em;
+}
+
+.rst-content h3 {
+    font-size: 1.3em;
+    color: var(--nexus-primary);
+}
+
+.rst-content h4 {
+    font-size: 1.1em;
+}
+
+/* Liens */
+.rst-content a {
+    color: var(--nexus-primary);
+    text-decoration: none;
+    transition: color var(--nexus-transition);
+}
+
+.rst-content a:hover {
+    color: var(--nexus-primary-dark);
+    text-decoration: underline;
+}
+
+.rst-content a:visited {
+    color: var(--nexus-primary-dark);
+}
+
+/* Liens d'ancrage (¶) au survol des titres */
+.rst-content .headerlink {
+    visibility: hidden;
+    opacity: 0;
+    color: var(--nexus-text-muted);
+    font-size: 0.85em;
+    margin-left: 0.4em;
+    transition: opacity var(--nexus-transition);
+}
+
+.rst-content h1:hover .headerlink,
+.rst-content h2:hover .headerlink,
+.rst-content h3:hover .headerlink,
+.rst-content h4:hover .headerlink {
+    visibility: visible;
+    opacity: 1;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   4. SIDEBAR
+   ──────────────────────────────────────────────────────────────────── */
+.wy-nav-side {
+    background-color: var(--nexus-bg-alt);
+    border-right: 1px solid var(--nexus-border);
+}
+
+.wy-side-nav-search {
+    background-color: var(--nexus-primary);
+}
+
+.wy-side-nav-search input[type="text"] {
+    border-radius: var(--nexus-radius);
+    border: 1px solid var(--nexus-primary-dark);
+    padding: 0.5em 0.75em;
+    width: 100%;
+}
+
+.wy-side-nav-search input[type="text"]:focus {
+    outline: 2px solid var(--nexus-accent);
+    outline-offset: 2px;
+}
+
+.wy-menu-vertical a {
+    color: var(--nexus-text);
+    transition: background-color var(--nexus-transition);
+}
+
+.wy-menu-vertical a:hover {
+    background-color: var(--nexus-primary);
+    color: white;
+}
+
+.wy-menu-vertical li.current > a,
+.wy-menu-vertical li.current a:hover {
+    background-color: var(--nexus-primary);
+    color: white;
+    border-right: 3px solid var(--nexus-accent);
+}
+
+.wy-menu-vertical li.toctree-l1.current > a {
+    border-right: 3px solid var(--nexus-accent);
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   5. BLOCS DE CODE
+   ──────────────────────────────────────────────────────────────────── */
+.rst-content pre,
+.rst-content .highlight {
+    font-family: var(--nexus-font-mono);
+    font-size: 0.9em;
+    line-height: 1.55;
+    border-radius: var(--nexus-radius);
+    border: 1px solid var(--nexus-border);
+    background-color: var(--nexus-bg-code);
+    overflow-x: auto;
+    box-shadow: var(--nexus-shadow);
+}
+
+.rst-content pre {
+    padding: 1em 1.2em;
+    margin: 1.5em 0;
+}
+
+.rst-content code {
+    font-family: var(--nexus-font-mono);
+    font-size: 0.88em;
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    background-color: var(--nexus-bg-code);
+    color: var(--nexus-primary-dark);
+    border: 1px solid var(--nexus-border);
+}
+
+/* Éviter le double padding dans les blocs de code */
+.rst-content pre code {
+    padding: 0;
+    background-color: transparent;
+    border: none;
+    color: inherit;
+}
+
+/* Numéros de ligne (si activés dans conf.py) */
+.rst-content .highlight .lineno {
+    color: var(--nexus-text-muted);
+    user-select: none;
+    padding-right: 1em;
+}
+
+/* Bouton "copier" (si activé) */
+.rst-content .copybtn {
+    opacity: 0.6;
+    transition: opacity var(--nexus-transition);
+}
+
+.rst-content .copybtn:hover {
+    opacity: 1;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   6. ADMONITIONS (note, warning, tip, etc.)
+   ──────────────────────────────────────────────────────────────────── */
+.rst-content .admonition {
+    padding: 1em 1.25em;
+    margin: 1.5em 0;
+    border-radius: var(--nexus-radius);
+    border-left: 4px solid var(--nexus-info);
+    background-color: rgba(59, 130, 246, 0.08);
+    box-shadow: var(--nexus-shadow);
+}
+
+.rst-content .admonition .admonition-title {
+    font-weight: 700;
+    margin-top: 0;
+    margin-bottom: 0.5em;
+    color: var(--nexus-info);
+}
+
+/* Variantes */
+.rst-content .admonition.note {
+    border-left-color: var(--nexus-info);
+    background-color: rgba(59, 130, 246, 0.08);
+}
+.rst-content .admonition.note .admonition-title {
+    color: var(--nexus-info);
+}
+
+.rst-content .admonition.warning {
+    border-left-color: var(--nexus-warning);
+    background-color: rgba(245, 158, 11, 0.10);
+}
+.rst-content .admonition.warning .admonition-title {
+    color: var(--nexus-warning);
+}
+
+.rst-content .admonition.danger,
+.rst-content .admonition.error {
+    border-left-color: var(--nexus-danger);
+    background-color: rgba(239, 68, 68, 0.10);
+}
+.rst-content .admonition.danger .admonition-title,
+.rst-content .admonition.error .admonition-title {
+    color: var(--nexus-danger);
+}
+
+.rst-content .admonition.tip,
+.rst-content .admonition.hint {
+    border-left-color: var(--nexus-success);
+    background-color: rgba(16, 185, 129, 0.10);
+}
+.rst-content .admonition.tip .admonition-title,
+.rst-content .admonition.hint .admonition-title {
+    color: var(--nexus-success);
+}
+
+.rst-content .admonition.important {
+    border-left-color: var(--nexus-accent);
+    background-color: rgba(6, 182, 212, 0.10);
+}
+.rst-content .admonition.important .admonition-title {
+    color: var(--nexus-accent);
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   7. TABLEAUX
+   ──────────────────────────────────────────────────────────────────── */
+.rst-content table.docutils {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1.5em 0;
+    font-size: 0.95em;
+    border: 1px solid var(--nexus-border);
+    border-radius: var(--nexus-radius);
+    overflow: hidden;
+    box-shadow: var(--nexus-shadow);
+}
+
+.rst-content table.docutils thead {
+    background-color: var(--nexus-bg-alt);
+}
+
+.rst-content table.docutils th {
+    padding: 0.75em 1em;
+    font-weight: 700;
+    text-align: left;
+    border-bottom: 2px solid var(--nexus-border);
+    color: var(--nexus-text);
+}
+
+.rst-content table.docutils td {
+    padding: 0.65em 1em;
+    border-bottom: 1px solid var(--nexus-border);
+    vertical-align: top;
+}
+
+.rst-content table.docutils tbody tr:hover {
+    background-color: var(--nexus-bg-alt);
+}
+
+.rst-content table.docutils tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   8. BLOCS DE CITATION ET LIGNES DE SÉPARATION
+   ──────────────────────────────────────────────────────────────────── */
+.rst-content blockquote {
+    border-left: 4px solid var(--nexus-primary-light);
+    padding-left: 1.25em;
+    margin: 1.5em 0;
+    color: var(--nexus-text-muted);
+    font-style: italic;
+}
+
+.rst-content hr {
+    border: none;
+    border-top: 1px solid var(--nexus-border);
+    margin: 2.5em 0;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   9. NAVIGATION PRÉCÉDENT / SUIVANT
+   ──────────────────────────────────────────────────────────────────── */
+.rst-content .rst-footer-buttons {
+    margin-top: 3em;
+    padding-top: 1.5em;
+    border-top: 1px solid var(--nexus-border);
+}
+
+.rst-content .btn {
+    display: inline-block;
+    padding: 0.6em 1.2em;
+    border-radius: var(--nexus-radius);
+    border: 1px solid var(--nexus-border);
+    background-color: var(--nexus-bg-alt);
+    color: var(--nexus-text);
+    font-weight: 600;
+    text-decoration: none;
+    transition: all var(--nexus-transition);
+}
+
+.rst-content .btn:hover {
+    background-color: var(--nexus-primary);
+    color: white;
+    border-color: var(--nexus-primary);
+    transform: translateY(-1px);
+    box-shadow: var(--nexus-shadow-lg);
+}
+
+.rst-content .btn-neutral {
+    background-color: var(--nexus-bg-alt);
+    color: var(--nexus-text);
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   10. BARRE DE RECHERCHE (résultats)
+   ──────────────────────────────────────────────────────────────────── */
+#search-results .search {
+    margin-top: 2em;
+}
+
+#search-results .search li {
+    list-style: none;
+    margin-bottom: 1.5em;
+    padding-bottom: 1em;
+    border-bottom: 1px solid var(--nexus-border);
+}
+
+#search-results .search li a {
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+#search-results .search .context {
+    color: var(--nexus-text-muted);
+    font-size: 0.9em;
+    margin-top: 0.4em;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   11. VERSION SWITCHER (si activé)
+   ──────────────────────────────────────────────────────────────────── */
+.rst-versions {
+    background-color: var(--nexus-primary-dark);
+    border-top: 1px solid var(--nexus-primary);
+}
+
+.rst-versions .rst-current-version {
+    background-color: var(--nexus-primary);
+    color: white;
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   12. RESPONSIVE — MOBILE
+   ──────────────────────────────────────────────────────────────────── */
+@media screen and (max-width: 768px) {
+    .rst-content h1 {
+        font-size: 1.75em;
+    }
+
+    .rst-content h2 {
+        font-size: 1.35em;
+    }
+
+    .rst-content h3 {
+        font-size: 1.15em;
+    }
+
+    .rst-content pre {
+        font-size: 0.82em;
+        padding: 0.75em 1em;
+    }
+
+    .rst-content table.docutils {
+        font-size: 0.85em;
+    }
+
+    .rst-content table.docutils th,
+    .rst-content table.docutils td {
+        padding: 0.5em 0.6em;
+    }
+
+    /* Tables : scroll horizontal sur mobile */
+    .rst-content .table-wrapper {
+        overflow-x: auto;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   13. PRINT — impression
+   ──────────────────────────────────────────────────────────────────── */
+@media print {
+    .wy-nav-side,
+    .wy-nav-top,
+    .rst-footer-buttons,
+    .rst-versions,
+    .headerlink,
+    .copybtn {
+        display: none !important;
+    }
+
+    .wy-nav-content {
+        max-width: 100% !important;
+        padding: 0 !important;
+    }
+
+    .rst-content pre,
+    .rst-content code {
+        background-color: #f5f5f5 !important;
+        color: #000 !important;
+        border: 1px solid #ccc !important;
+    }
+
+    .rst-content a {
+        color: #000 !important;
+        text-decoration: underline;
+    }
+
+    .rst-content a[href^="http"]::after {
+        content: " (" attr(href) ")";
+        font-size: 0.85em;
+        color: #555;
+    }
+
+    .rst-content h1,
+    .rst-content h2,
+    .rst-content h3 {
+        page-break-after: avoid;
+    }
+
+    .rst-content pre,
+    .rst-content table {
+        page-break-inside: avoid;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   14. FOCUS / ACCESSIBILITÉ
+   ──────────────────────────────────────────────────────────────────── */
+.rst-content a:focus-visible,
+.rst-content button:focus-visible,
+.rst-content input:focus-visible,
+.rst-content .btn:focus-visible {
+    outline: 2px solid var(--nexus-accent);
+    outline-offset: 2px;
+    border-radius: var(--nexus-radius);
+}
+
+/* Respect de `prefers-reduced-motion` */
+@media (prefers-reduced-motion: reduce) {
+    * {
+        transition: none !important;
+        animation: none !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ────────────────────────────────────────────────────────────────────
+   15. PETITES TOUCHES NEXUSDL
+   ──────────────────────────────────────────────────────────────────── */
+
+/* Badge de version dans le header */
+.nexus-version-badge {
+    display: inline-block;
+    padding: 0.15em 0.5em;
+    font-size: 0.75em;
+    font-weight: 600;
+    background-color: var(--nexus-accent);
+    color: white;
+    border-radius: 999px;
+    margin-left: 0.5em;
+    vertical-align: middle;
+}
+
+/* Encart "Prêt pour NexusDL" (utilisable via `.. raw:: html`) */
+.nexus-hero {
+    padding: 2em;
+    border-radius: var(--nexus-radius-lg);
+    background: linear-gradient(135deg, var(--nexus-primary), var(--nexus-accent));
+    color: white;
+    margin: 2em 0;
+    text-align: center;
+}
+
+.nexus-hero h2 {
+    color: white;
+    border: none;
+    margin-top: 0;
+}
+
+.nexus-hero a {
+    color: white;
+    text-decoration: underline;
+}

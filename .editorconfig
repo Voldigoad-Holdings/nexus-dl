@@ -1,0 +1,193 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — EditorConfig
+#
+# Standardise l'indentation, les fins de ligne et l'encodage entre
+# tous les éditeurs (VSCode, JetBrains, Vim, Emacs, Sublime…).
+#
+# Spec : https://editorconfig.org/
+# Support natif : VSCode (extension), JetBrains, Vim, Emacs, Sublime.
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# Racine — empêche EditorConfig de remonter au-delà du projet
+# ────────────────────────────────────────────────────────────────────
+root = true
+
+# ────────────────────────────────────────────────────────────────────
+# Règles universelles — appliquées à TOUS les fichiers
+# ────────────────────────────────────────────────────────────────────
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# ────────────────────────────────────────────────────────────────────
+# Python
+# ────────────────────────────────────────────────────────────────────
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+[*.pyi]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# ────────────────────────────────────────────────────────────────────
+# TypeScript / JavaScript / JSX / TSX (frontend Next.js)
+# ────────────────────────────────────────────────────────────────────
+[*.{js,jsx,ts,tsx,mjs,cjs}]
+indent_style = space
+indent_size = 2
+max_line_length = 100
+
+# ────────────────────────────────────────────────────────────────────
+# JSON / JSONC
+# ────────────────────────────────────────────────────────────────────
+[*.{json,jsonc}]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# YAML — indentation 2 espaces (standard)
+# ────────────────────────────────────────────────────────────────────
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# TOML (pyproject.toml)
+# ────────────────────────────────────────────────────────────────────
+[*.toml]
+indent_style = space
+indent_size = 2
+max_line_length = 100
+
+# ────────────────────────────────────────────────────────────────────
+# Markdown — on préserve les espaces significatifs (sauts de ligne MD)
+# ────────────────────────────────────────────────────────────────────
+[*.md]
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = false
+max_line_length = off
+
+[*.{mdx,rst}]
+indent_style = space
+indent_size = 2
+trim_trailing_whitespace = false
+
+# ────────────────────────────────────────────────────────────────────
+# CSS / SCSS / Tailwind
+# ────────────────────────────────────────────────────────────────────
+[*.{css,scss,sass,less}]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# HTML / templates
+# ────────────────────────────────────────────────────────────────────
+[*.{html,htm}]
+indent_style = space
+indent_size = 2
+
+[*.{jinja,jinja2,j2}]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# Shell Unix (bash, sh, zsh) — LF
+# ────────────────────────────────────────────────────────────────────
+[*.{sh,bash,zsh}]
+indent_style = space
+indent_size = 2
+end_of_line = lf
+
+# ────────────────────────────────────────────────────────────────────
+# Shell Windows (PowerShell, batch) — CRLF obligatoire
+# ────────────────────────────────────────────────────────────────────
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4
+end_of_line = crlf
+
+[*.{bat,cmd}]
+indent_style = space
+indent_size = 4
+end_of_line = crlf
+
+# ────────────────────────────────────────────────────────────────────
+# Dockerfile / docker-compose
+# ────────────────────────────────────────────────────────────────────
+[{Dockerfile,Dockerfile.*,*.dockerfile}]
+indent_style = space
+indent_size = 4
+
+[docker-compose*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# nginx
+# ────────────────────────────────────────────────────────────────────
+[nginx.conf]
+indent_style = space
+indent_size = 4
+
+# ────────────────────────────────────────────────────────────────────
+# SQL (migrations Alembic)
+# ────────────────────────────────────────────────────────────────────
+[*.sql]
+indent_style = space
+indent_size = 4
+
+# ────────────────────────────────────────────────────────────────────
+# INI / cfg / conf / properties
+# ────────────────────────────────────────────────────────────────────
+[*.{ini,cfg,conf,properties}]
+indent_style = space
+indent_size = 4
+
+# ────────────────────────────────────────────────────────────────────
+# Makefile / justfile — tabulations obligatoires pour les recettes
+# ────────────────────────────────────────────────────────────────────
+[{Makefile,makefile,GNUmakefile,*.mk}]
+indent_style = tab
+indent_size = 4
+
+[justfile]
+indent_style = tab
+indent_size = 4
+
+# ────────────────────────────────────────────────────────────────────
+# Textual CSS (TUI)
+# ────────────────────────────────────────────────────────────────────
+[*.tcss]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# XML (ComicInfo.xml)
+# ────────────────────────────────────────────────────────────────────
+[*.xml]
+indent_style = space
+indent_size = 2
+
+# ────────────────────────────────────────────────────────────────────
+# Lockfiles — ne PAS toucher (générés)
+# ────────────────────────────────────────────────────────────────────
+[{uv.lock,pnpm-lock.yaml,package-lock.json,yarn.lock}]
+insert_final_newline = true
+trim_trailing_whitespace = false
+
+# ────────────────────────────────────────────────────────────────────
+# Fichiers binaires / assets — pas de trailing whitespace trimming
+# ────────────────────────────────────────────────────────────────────
+[*.{png,jpg,jpeg,gif,ico,icns,svg,webp,avif,pdf,cbz,cb7,cbt,zip,7z,tar,gz}]
+trim_trailing_whitespace = false
+insert_final_newline = false

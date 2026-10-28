@@ -1,0 +1,254 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — pre-commit hooks
+# ════════════════════════════════════════════════════════════════════
+
+default_language_version:
+  python: python3.12
+
+default_stages: [pre-commit]
+
+# Ne pas exécuter les hooks sur les fichiers frontend (Node/TS).
+exclude: |
+  (?x)^(
+    src/nexusdl/interfaces/web/frontend/.*|
+    \.venv/.*|
+    venv/.*|
+    node_modules/.*|
+    \.git/.*|
+    build/.*|
+    dist/.*|
+    htmlcov/.*|
+    \.ruff_cache/.*|
+    \.mypy_cache/.*|
+    \.pytest_cache/.*
+  )$
+
+
+repos:
+  # ──────────────────────────────────────────────────────────────────
+  # 1. Hooks standards (pre-commit-hooks)
+  # ──────────────────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # Fichiers volumineux (protection contre les commits accidentels)
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+
+      # Syntaxe
+      - id: check-ast
+        name: check-ast (syntaxe Python)
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+        args: ["--allow-multiple-documents", "--unsafe"]
+        exclude: |
+          (?x)^(
+            src/nexusdl/data/sites\.yaml|
+            src/nexusdl/plugins/_example/nexus\.plugin\.yaml
+          )$
+      - id: check-xml
+
+      # Conflits et problèmes de merge
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-symlinks
+      - id: destroyed-symlinks
+
+      # Sécurité basique
+      - id: detect-private-key
+      - id: forbid-submodules
+      - id: forbid-new-submodules
+
+      # Exécutables
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+      # Normalisation
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+        exclude: |
+          (?x)^(
+            .*\.ps1|
+            .*\.psm1|
+            .*\.psd1|
+            .*\.bat|
+            .*\.cmd
+          )$
+      - id: fix-byte-order-marker
+
+      # Debug
+      - id: debug-statements
+        name: debug-statements (pas de breakpoint/pdb)
+
+  # ──────────────────────────────────────────────────────────────────
+  # 2. Ruff — lint + format (remplace flake8, isort, black)
+  # ──────────────────────────────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.10
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+        name: ruff (format)
+
+  # ──────────────────────────────────────────────────────────────────
+  # 3. Mypy — typage strict
+  # ──────────────────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        additional_dependencies:
+          - "pydantic>=2.7"
+          - "pydantic-settings>=2.3"
+          - "types-PyYAML"
+          - "types-aiofiles"
+        args:
+          - "--strict"
+          - "--config-file=pyproject.toml"
+          - "--no-incremental"
+        files: |
+          (?x)^(
+            src/nexusdl/(core|parsers|plugins|data)/.*\.py|
+            src/nexusdl/version\.py
+          )$
+        exclude: |
+          (?x)^(
+            src/nexusdl/interfaces/.*|
+            src/nexusdl/__main__\.py
+          )$
+
+  # ──────────────────────────────────────────────────────────────────
+  # 4. Hooks customisés NexusDL (scripts locaux)
+  # ──────────────────────────────────────────────────────────────────
+  - repo: local
+    hooks:
+      # ── Architecture hexagonale ──
+      - id: check-imports
+        name: check-imports (architecture hexagonale)
+        entry: python scripts/check_imports.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        files: ^src/nexusdl/(core|parsers|plugins|data)/.*\.py$
+        stages: [pre-commit]
+
+      # ── Schéma sites.yaml ──
+      - id: validate-sites
+        name: validate-sites (sites.yaml contre schéma JSON)
+        entry: python scripts/validate_sites.py
+        language: system
+        pass_filenames: false
+        files: ^src/nexusdl/data/(sites\.yaml|sites_schema\.json)$
+        stages: [pre-commit]
+
+      # ── Aucun token GitHub en dur ──
+      - id: no-token-leak
+        name: no-token-leak (aucun token GitHub/secret en dur)
+        entry: python scripts/check_imports.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      # ── pyproject.toml cohérent avec le package ──
+      - id: check-pyproject
+        name: check-pyproject (pyproject.toml lisible et cohérent)
+        entry: python -c "
+import sys, tomllib, pathlib;
+p = pathlib.Path('pyproject.toml');
+d = tomllib.loads(p.read_text(encoding='utf-8'));
+assert 'project' in d, 'section [project] manquante';
+assert 'name' in d['project'], 'project.name manquant';
+assert d['project']['requires-python'].startswith('>='), 'requires-python doit commencer par >=';
+print('✅ pyproject.toml OK')
+"
+        language: system
+        pass_filenames: false
+        files: ^pyproject\.toml$
+        stages: [pre-commit]
+
+      # ── Pas de print() dans src/ (hors scripts et cli_entry) ──
+      - id: no-print-in-src
+        name: no-print-in-src (utiliser loguru, pas print())
+        entry: bash -c '
+if grep -rn --include="*.py" -E "^\s*print\(" src/nexusdl/ \
+  | grep -v "interfaces/cli/cli_entry.py" \
+  | grep -v "interfaces/cli/screens/" \
+  | grep -v "interfaces/cli/widgets/" \
+  | grep -v "interfaces/gui/"; then
+  echo "❌ print() détecté dans src/ — utiliser loguru.";
+  exit 1;
+fi
+'
+        language: system
+        pass_filenames: false
+        files: ^src/nexusdl/.*\.py$
+        stages: [pre-commit]
+
+      # ── Fichiers YAML bien indentés (2 espaces) ──
+      - id: yaml-indent
+        name: yaml-indent (indentation 2 espaces, pas de tab)
+        entry: bash -c '
+files=$(find . -type f \( -name "*.yml" -o -name "*.yaml" \) \
+  ! -path "./.git/*" ! -path "./node_modules/*" ! -path "./.venv/*");
+fail=0;
+for f in $files; do
+  if grep -Pn "^\t" "$f" >/dev/null 2>&1; then
+    echo "❌ Tabulation dans $f";
+    fail=1;
+  fi;
+done;
+exit $fail
+'
+        language: system
+        pass_filenames: false
+        files: \.(yml|yaml)$
+        stages: [pre-commit]
+
+      # ── Fichiers __init__.py ne doivent pas être vides dans les couches clés ──
+      - id: init-not-empty-core
+        name: init-not-empty (core/, parsers/, plugins/)
+        entry: bash -c '
+files=$(find src/nexusdl/core src/nexusdl/parsers src/nexusdl/plugins \
+  -name "__init__.py" -empty 2>/dev/null || true);
+if [ -n "$files" ]; then
+  echo "❌ __init__.py vides dans core/parsers/plugins :";
+  echo "$files";
+  echo "(laisser vide uniquement si intentionnel)";
+  exit 1;
+fi
+'
+        language: system
+        pass_filenames: false
+        files: ^src/nexusdl/(core|parsers|plugins)/.*__init__\.py$
+        stages: [pre-commit]
+
+
+  # ──────────────────────────────────────────────────────────────────
+  # 5. Commit message — Conventional Commits (commit-msg stage)
+  # ──────────────────────────────────────────────────────────────────
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v3.4.0
+    hooks:
+      - id: conventional-pre-commit
+        name: conventional-pre-commit (commit message)
+        stages: [commit-msg]
+        args:
+          - "feat"
+          - "fix"
+          - "docs"
+          - "style"
+          - "refactor"
+          - "perf"
+          - "test"
+          - "build"
+          - "ci"
+          - "chore"
+          - "revert"

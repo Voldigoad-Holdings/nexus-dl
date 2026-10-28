@@ -1,220 +1,359 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — .gitignore
+#
+# Organisation :
+#   1. Secrets et configuration locale
+#   2. Python
+#   3. Node.js / Next.js frontend
+#   4. Données runtime NexusDL
+#   5. Outils (ruff, mypy, pytest, coverage, hypothesis)
+#   6. Build et distribution
+#   7. Environnements virtuels
+#   8. Docker
+#   9. IDE et éditeurs
+#  10. OS
+#  11. Divers
+#
+# ⚠️  Rappel : un fichier ignoré n'est PAS versionné. Ne jamais retirer
+#     les entrées "Secrets" sous aucun prétexte.
+# ════════════════════════════════════════════════════════════════════
 
-# C extensions
-*.so
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-#   Usually these files are written by a python script from a template
-#   before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-*.lcov
-.hypothesis/
-.pytest_cache/
-cover/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
-
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-# Pipfile.lock
-
-# uv
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-# uv.lock
-
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-# poetry.lock
-# poetry.toml
-
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-# pdm.lock
-# pdm.toml
-.pdm-python
-.pdm-build/
-
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-# pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi/*
-!.pixi/config.toml
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule*
-celerybeat.pid
-
-# Redis
-*.rdb
-*.aof
-*.pid
-
-# RabbitMQ
-mnesia/
-rabbitmq/
-rabbitmq-data/
-
-# ActiveMQ
-activemq-data/
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
+# ────────────────────────────────────────────────────────────────────
+# 1. SECRETS ET CONFIGURATION LOCALE
+# ────────────────────────────────────────────────────────────────────
 .env
-.envrc
-.venv
-env/
+.env.*
+!.env.example
+!.env.template
+
+# Fichiers de configuration locaux (à créer à partir des .example)
+config/config.yaml
+config/proxy.yaml
+config/sites_overrides.yaml
+config/logging.local.yaml
+
+# Clés, certificats, keystores
+*.key
+*.keyfile
+*.pem
+*.p12
+*.pfx
+secrets/
+secrets.yaml
+*.cookies
+cookies.enc
+
+
+# ────────────────────────────────────────────────────────────────────
+# 2. PYTHON
+# ────────────────────────────────────────────────────────────────────
+# Bytecode et caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.pyd
+
+# Environnements virtuels
+.venv/
 venv/
+env/
 ENV/
 env.bak/
 venv.bak/
+.python-version
 
-# Spyder project settings
-.spyderproject
-.spyproject
+# Packaging et distribution
+build/
+dist/
+develop-eggs/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+*.whl
+pip-wheel-metadata/
+share/python-wheels/
+MANIFEST
+.installed.cfg
 
-# Rope project settings
-.ropeproject
+# PyInstaller / Nuitka
+*.manifest
+*.spec
+*.build/
+*.dist/
+*.onefile-build/
+__pyinstaller/
+pyinstaller/
 
-# mkdocs/Zensical documentation
-/site
+# pyenv
+.python-version
 
-# mypy
+
+# ────────────────────────────────────────────────────────────────────
+# 3. NODE.JS / NEXT.JS FRONTEND
+# ────────────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+.turbo/
+.vercel/
+.npm/
+.pnpm-store/
+.yarn/
+.eslintcache
+.parcel-cache/
+*.tsbuildinfo
+next-env.d.ts
+
+# Environnements frontend locaux
+src/nexusdl/interfaces/web/frontend/.env.local
+src/nexusdl/interfaces/web/frontend/.env.*.local
+
+# Build frontend
+src/nexusdl/interfaces/web/frontend/build/
+src/nexusdl/interfaces/web/frontend/dist/
+
+
+# ────────────────────────────────────────────────────────────────────
+# 4. DONNÉES RUNTIME NEXUSDL
+# ────────────────────────────────────────────────────────────────────
+# Base de données locale
+data/
+!data/.gitkeep
+library.db
+library.db-*
+library.db-journal
+library.db-wal
+library.db-shm
+*.sqlite
+*.sqlite3
+
+# Dossiers de travail
+downloads/
+temp/
+tmp/
+logs/
+*.log
+*.log.*
+
+# Caches runtime
+.cache/
+.nexusdl/
+
+
+# ────────────────────────────────────────────────────────────────────
+# 5. OUTILS (lint, type, tests, coverage)
+# ────────────────────────────────────────────────────────────────────
+# Ruff
+.ruff_cache/
+
+# Mypy
 .mypy_cache/
 .dmypy.json
 dmypy.json
 
-# Pyre type checker
-.pyre/
+# Pytest
+.pytest_cache/
+pytestdebug.log
 
-# pytype static type analyzer
-.pytype/
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+*.cover
 
-# Cython debug symbols
-cython_debug/
+# Hypothesis
+.hypothesis/
 
-# PyCharm
-#   JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#   and can be added to the global gitignore or merged into this file.  For a more nuclear
-#   option (not recommended) you can uncomment the following to ignore the entire idea folder.
-# .idea/
+# Tox / Nox
+.tox/
+.nox/
 
-# Abstra
-#   Abstra is an AI-powered process automation framework.
-#   Ignore directories containing user credentials, local state, and settings.
-#   Learn more at https://abstra.io/docs
-.abstra/
+# Pre-commit
+.pre-commit-cache/
 
-# Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
-# .vscode/
-# Temporary file for partial code execution
-tempCodeRunnerFile.py
 
-# Ruff stuff:
-.ruff_cache/
+# ────────────────────────────────────────────────────────────────────
+# 6. BUILD ET DISTRIBUTION (non-Python)
+# ────────────────────────────────────────────────────────────────────
+# Sorties génériques
+out/
+output/
+release/
+releases/
 
-# PyPI configuration file
-.pypirc
+# Fichiers d'archive générés localement
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.cbz
+*.cb7
+*.cbt
+*.cbr
+*.pdf
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+# Exceptions — les fixtures de test et le template ComicInfo
+!tests/fixtures/*.zip
+!tests/fixtures/*.cbz
+!tests/fixtures/*.pdf
+!src/nexusdl/data/comic_info_template.xml
 
-# Streamlit
-.streamlit/secrets.toml
+
+# ────────────────────────────────────────────────────────────────────
+# 7. DOCKER
+# ────────────────────────────────────────────────────────────────────
+.docker/
+docker-compose.override.yml
+docker-compose.*.local.yml
+
+
+# ────────────────────────────────────────────────────────────────────
+# 8. IDE ET ÉDITEURS
+# ────────────────────────────────────────────────────────────────────
+# VSCode
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ, WebStorm)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+*~
+.[a-z]*
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime
+*.sublime-project
+*.sublime-workspace
+
+# Eclipse
+.project
+.classpath
+.settings/
+.factorypath
+
+# NetBeans
+nbproject/private/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+# Misc
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.user
+*.userosscache
+*.sln.docstates
+
+
+# ────────────────────────────────────────────────────────────────────
+# 9. OS — FICHIERS SYSTÈME
+# ────────────────────────────────────────────────────────────────────
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+ehthumbs.db
+ehthumbs_vista.db
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+
+# Linux
+.directory
+.Trash-*
+.fuse_hidden*
+.nfs*
+
+
+# ────────────────────────────────────────────────────────────────────
+# 10. DIVERS
+# ────────────────────────────────────────────────────────────────────
+# Process IDs
+*.pid
+*.pid.lock
+*.seed
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Fichiers temporaires
+*.tmp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+
+# Fixtures générées
+tests/.coverage
+tests/fixtures/tmp/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Fichiers de swap / lock d'outils
+*.lock.tmp
+.pnpm-debug.log
+
+
+# ────────────────────────────────────────────────────────────────────
+# 11. EXCEPTIONS NEXUSDL — fichiers à VERSIONNER explicitement
+# ────────────────────────────────────────────────────────────────────
+# Ces règles annulent les patterns génériques ci-dessus pour les
+# fichiers qui DOIVENT être commités.
+
+!.gitkeep
+!src/nexusdl/data/*.yaml
+!src/nexusdl/data/*.json
+!src/nexusdl/data/*.xml
+!src/nexusdl/data/*.txt
+!src/nexusdl/data/translations/*.json
+!src/nexusdl/py.typed
+!src/nexusdl/version.py
+!src/nexusdl/interfaces/web/frontend/pnpm-lock.yaml
+!uv.lock
+!nexus.dl
+!LICENSE
+!README.md
+!CHANGELOG.md
+!SECURITY.md
+!SECURITY_HALL_OF_FAME.md
+!CONTRIBUTING.md
+!CODE_OF_CONDUCT.md

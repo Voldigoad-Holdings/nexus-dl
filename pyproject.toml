@@ -1,0 +1,547 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — pyproject.toml
+#
+# Build backend : hatchling (PEP 621 natif)
+# Dependency manager : uv (uv.lock)
+#
+# ⚠️  Aucun secret, aucune URL de site, aucun credential dans ce fichier.
+# ⚠️  Le frontend Next.js est exclu du wheel et du sdist.
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# Build system
+# ────────────────────────────────────────────────────────────────────
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+# ────────────────────────────────────────────────────────────────────
+# Project metadata (PEP 621)
+# ────────────────────────────────────────────────────────────────────
+[project]
+name = "nexusdl"
+version = "0.1.0"
+description = "Multi-site manga, webtoon, comic and doujinshi downloader with CLI, TUI, GUI and Web interfaces."
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+requires-python = ">=3.12"
+keywords = [
+    "manga",
+    "webtoon",
+    "comic",
+    "doujinshi",
+    "downloader",
+    "scraper",
+    "cli",
+    "tui",
+    "gui",
+    "web",
+    "api",
+    "self-hosted",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Terminals :: Terminal Emulators/X Terminals",
+    "Typing :: Typed",
+]
+
+authors = [
+    { name = "Voldigoad-Holdings", email = "drxenon487@gmail.com" },
+]
+
+maintainers = [
+    { name = "Voldigoad-Holdings", email = "drxenon487@gmail.com" },
+]
+
+# ────────────────────────────────────────────────────────────────────
+# Core dependencies (always installed)
+# ────────────────────────────────────────────────────────────────────
+dependencies = [
+    # Validation & config
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.3,<3",
+    "orjson>=3.10",
+    "PyYAML>=6.0",
+    # HTTP
+    "httpx[http2]>=0.27",
+    "aiohttp>=3.9",
+    "hishel>=0.0.30",
+    # Async I/O
+    "aiofiles>=23.2",
+    # Logging
+    "loguru>=0.7",
+    # Retry
+    "tenacity>=8.3",
+    # Database
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "alembic>=1.13",
+    # Paths
+    "platformdirs>=4.2",
+    # Parsing
+    "selectolax>=0.3",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    # Image
+    "Pillow>=10.3",
+    "img2pdf>=0.5",
+    # Archives
+    "py7zr>=0.21",
+    # Text
+    "python-slugify>=8.0",
+    "Unidecode>=1.3",
+    # Crypto
+    "cryptography>=42.0",
+    # Metrics
+    "prometheus-client>=0.20",
+]
+
+# ────────────────────────────────────────────────────────────────────
+# Optional dependencies (extras)
+# ────────────────────────────────────────────────────────────────────
+[project.optional-dependencies]
+# CLI + TUI
+cli = [
+    "rich>=13.7",
+    "typer>=0.12",
+    "textual>=0.60",
+]
+
+# Desktop GUI
+gui = [
+    "customtkinter>=5.2",
+]
+
+# Web backend + API
+web = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "websockets>=12.0",
+    "python-jose[cryptography]>=3.3",
+    "passlib[bcrypt]>=1.7",
+]
+
+# Playwright (JS-heavy sites / Cloudflare)
+playwright = [
+    "playwright>=1.45",
+]
+
+# Redis (distributed cache, optional)
+redis = [
+    "redis>=5.0",
+]
+
+# Development tooling
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "respx>=0.21",
+    "hypothesis>=6.100",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "tox>=4.15",
+    "pip-audit>=2.7",
+    "jsonschema>=4.22",
+    "check-manifest>=0.49",
+    "build>=1.2",
+    # Type stubs
+    "types-PyYAML",
+    "types-aiofiles",
+    "types-jsonschema",
+]
+
+# Documentation
+docs = [
+    "sphinx>=7.3",
+    "sphinx-rtd-theme>=2.0",
+    "myst-parser>=3.0",
+]
+
+# Everything
+all = [
+    "nexusdl[cli,gui,web,playwright,redis,docs]",
+]
+
+# ────────────────────────────────────────────────────────────────────
+# Entry points (console scripts)
+# ────────────────────────────────────────────────────────────────────
+[project.scripts]
+nexusdl = "nexusdl.interfaces.cli.cli_entry:main"
+nexusdl-tui = "nexusdl.interfaces.cli.cli_entry:tui"
+nexusdl-gui = "nexusdl.interfaces.gui.app:main"
+nexusdl-web = "nexusdl.interfaces.web.backend.main:main"
+
+# ────────────────────────────────────────────────────────────────────
+# Project URLs
+# ────────────────────────────────────────────────────────────────────
+[project.urls]
+Homepage = "https://github.com/Voldigoad-Holdings/nexus-dl"
+Documentation = "https://github.com/Voldigoad-Holdings/nexus-dl/tree/main/docs"
+Repository = "https://github.com/Voldigoad-Holdings/nexus-dl"
+Issues = "https://github.com/Voldigoad-Holdings/nexus-dl/issues"
+Discussions = "https://github.com/Voldigoad-Holdings/nexus-dl/discussions"
+Changelog = "https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CHANGELOG.md"
+Security = "https://github.com/Voldigoad-Holdings/nexus-dl/security/policy"
+"Code of Conduct" = "https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CODE_OF_CONDUCT.md"
+Contributing = "https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CONTRIBUTING.md"
+Funding = "https://github.com/sponsors/Voldigoad-Holdings"
+
+# ════════════════════════════════════════════════════════════════════
+# HATCH — Packaging (wheel + sdist)
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# Wheel (binaire installable via pip)
+# ────────────────────────────────────────────────────────────────────
+[tool.hatch.build.targets.wheel]
+packages = ["src/nexusdl"]
+
+# Le frontend Next.js ne doit JAMAIS être dans le wheel Python.
+# Il est distribué séparément (npm / pnpm) ou inclus dans l'image Docker web.
+exclude = [
+    "src/nexusdl/interfaces/web/frontend",
+]
+
+# ────────────────────────────────────────────────────────────────────
+# SDist (source distribution) — aligné avec MANIFEST.in
+# ────────────────────────────────────────────────────────────────────
+[tool.hatch.build.targets.sdist]
+include = [
+    # Racine — métadonnées
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/SECURITY_HALL_OF_FAME.md",
+    "/CONTRIBUTING.md",
+    "/CODE_OF_CONDUCT.md",
+    "/nexus.dl",
+    "/MANIFEST.in",
+    "/.env.example",
+    "/.editorconfig",
+    "/.gitattributes",
+    "/.pre-commit-config.yaml",
+    "/.python-version",
+    "/Makefile",
+    "/justfile",
+    "/tox.ini",
+    # Package Python complet (y compris data/, migrations/, etc.)
+    "/src/nexusdl",
+    # Config exemples
+    "/config/*.example.yaml",
+    "/config/logging.yaml",
+    # Documentation
+    "/docs",
+    # Scripts
+    "/scripts",
+    # Tests
+    "/tests",
+    # Docker
+    "/docker",
+    # GitHub templates
+    "/.github/CODEOWNERS",
+    "/.github/dependabot.yml",
+    "/.github/PULL_REQUEST_TEMPLATE.md",
+    "/.github/ISSUE_TEMPLATE",
+    # Assets légers
+    "/assets/banner.png",
+    "/assets/banner_dark.png",
+    "/assets/logo_animated.svg",
+    "/assets/icons/nexusdl.svg",
+    "/assets/icons/nexusdl.png",
+]
+
+exclude = [
+    # Frontend complet (distribué séparément)
+    "/src/nexusdl/interfaces/web/frontend",
+    # Artefacts de build
+    "/build",
+    "/dist",
+    "/**/__pycache__",
+    "/**/*.pyc",
+    "/**/*.pyo",
+    "/**/*.pyd",
+    "/**/*.so",
+    "/**/*.egg-info",
+    # Environnements virtuels et Node
+    "/.venv",
+    "/venv",
+    "/node_modules",
+    # Caches
+    "/.mypy_cache",
+    "/.ruff_cache",
+    "/.pytest_cache",
+    "/.hypothesis",
+    "/.tox",
+    "/.nox",
+    # Données runtime
+    "/data",
+    "/downloads",
+    "/temp",
+    "/tmp",
+    "/logs",
+    "/.cache",
+    "/.nexusdl",
+    "/library.db",
+    "/library.db-*",
+    "/cookies.enc",
+    "/**/*.log",
+    # Secrets (par sécurité, même si .gitignore les bloque déjà)
+    "/.env",
+    "/.env.local",
+    "/**/*.key",
+    "/**/*.keyfile",
+    "/**/*.pem",
+    "/**/*.p12",
+    "/**/*.pfx",
+    # Screenshots (trop lourds)
+    "/assets/screenshots",
+    # IDE / OS
+    "/.idea",
+    "/.vscode",
+    "/**/*.iml",
+    "/**/*.swp",
+    "/**/*.swo",
+    "/.DS_Store",
+    "/**/._*",
+    "/**/Thumbs.db",
+    "/**/desktop.ini",
+    # Divers
+    "/**/*.tmp",
+    "/**/*.bak",
+    "/**/*.orig",
+    "/**/*.rej",
+]
+
+# ────────────────────────────────────────────────────────────────────
+# Force-include : fichiers normalement hors du package mais nécessaires
+# ────────────────────────────────────────────────────────────────────
+[tool.hatch.build.targets.wheel.force-include]
+"src/nexusdl/data" = "nexusdl/data"
+"src/nexusdl/core/library/migrations" = "nexusdl/core/library/migrations"
+
+# ════════════════════════════════════════════════════════════════════
+# RUFF — Lint + format
+# ════════════════════════════════════════════════════════════════════
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = [
+    "src/nexusdl/interfaces/web/frontend",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "N",     # pep8-naming
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "SIM",   # flake8-simplify
+    "TID",   # flake8-tidy-imports
+    "RUF",   # ruff-specific
+    "S",     # flake8-bandit (security)
+    "ASYNC", # flake8-async
+    "RET",   # flake8-return
+    "ARG",   # flake8-unused-arguments
+    "PTH",   # flake8-use-pathlib
+    "T20",   # flake8-print (no print in src)
+    "PT",    # flake8-pytest-style
+    "PL",    # pylint (subset)
+    "TRY",   # tryceratops (try/except best practices)
+    "PERF",  # perflint (performance)
+]
+ignore = [
+    "E501",    # line length (géré par formatter)
+    "S101",    # assert (tests)
+    "S311",    # random non-crypto (jitter retry)
+    "PLR0913", # too many arguments
+    "PLR0915", # too many statements
+    "PLR2004", # magic value in comparison
+    "RUF001",  # fausses alertes unicode
+    "RUF002",
+    "RUF003",
+    "TRY003",  # avoid specifying long messages outside exception class
+    "TRY300",  # consider moving statement to else block
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ARG", "PLR2004", "PT011"]
+"scripts/**" = ["S", "T201", "PLR2004"]
+"src/nexusdl/parsers/**" = ["S105", "S106"]
+"src/nexusdl/interfaces/cli/cli_entry.py" = ["T201"]
+"src/nexusdl/interfaces/cli/screens/**" = ["T201"]
+"src/nexusdl/interfaces/cli/widgets/**" = ["T201"]
+"src/nexusdl/interfaces/gui/**" = ["T201"]
+"src/nexusdl/plugins/_example/**" = ["S", "T201"]
+"src/nexusdl/parsers/custom/_template.py" = ["S", "T201"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nexusdl"]
+force-single-line = false
+lines-after-imports = 2
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+
+# ════════════════════════════════════════════════════════════════════
+# MYPY — Type checking strict
+# ════════════════════════════════════════════════════════════════════
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_no_return = true
+show_error_codes = true
+show_column_numbers = true
+pretty = true
+plugins = ["pydantic.mypy"]
+exclude = [
+    "^src/nexusdl/interfaces/web/frontend/",
+    "^build/",
+    "^dist/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "customtkinter.*",
+    "playwright.*",
+    "py7zr.*",
+    "img2pdf.*",
+    "selectolax.*",
+    "hishel.*",
+    "textual.*",
+]
+ignore_missing_imports = true
+
+# ════════════════════════════════════════════════════════════════════
+# PYTEST — Test runner
+# ════════════════════════════════════════════════════════════════════
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--cov=nexusdl",
+    "--cov-report=term-missing",
+    "--cov-report=html:htmlcov",
+]
+markers = [
+    "slow: tests lents (désactiver avec -m 'not slow')",
+    "integration: tests d'intégration (réseau requis)",
+    "smoke: smoke tests parsers (réseau requis)",
+    "unit: tests unitaires rapides",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:playwright.*",
+    "ignore::DeprecationWarning:pkg_resources.*",
+]
+
+# ════════════════════════════════════════════════════════════════════
+# COVERAGE
+# ════════════════════════════════════════════════════════════════════
+[tool.coverage.run]
+source = ["src/nexusdl"]
+branch = true
+omit = [
+    "*/interfaces/web/frontend/*",
+    "*/_example/*",
+    "*/custom/_template.py",
+    "*/__main__.py",
+    "*/version.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+    "if __name__ == .__main__.:",
+]
+fail_under = 70
+show_missing = true
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+# ════════════════════════════════════════════════════════════════════
+# TOX — Test matrix
+# ════════════════════════════════════════════════════════════════════
+[tool.tox]
+legacy_tox_ini = """
+[tox]
+envlist = py312, py313, lint, typecheck
+isolated_build = true
+skip_missing_interpreters = true
+
+[testenv]
+extras = dev, cli
+commands =
+    pytest {posargs}
+
+[testenv:lint]
+extras = dev
+commands =
+    ruff check src tests
+    ruff format --check src tests
+
+[testenv:typecheck]
+extras = dev
+commands =
+    mypy src
+"""
+
+# ════════════════════════════════════════════════════════════════════
+# UV — Dependency manager (optional but recommended)
+# ════════════════════════════════════════════════════════════════════
+[tool.uv]
+# Extras par défaut installés par `uv sync`
+default-groups = ["dev"]
+# Packages exclus du sync (trop lourds pour dev)
+exclude = []
+
+# ════════════════════════════════════════════════════════════════════
+# PYPROJECT — Tools metadata (optional)
+# ════════════════════════════════════════════════════════════════════
+[tool.setuptools_scm]
+write_to = "src/nexusdl/_version.py"
+# Note: désactivé car on gère la version manuellement.
+# À activer plus tard si on veut la version auto depuis git tags.

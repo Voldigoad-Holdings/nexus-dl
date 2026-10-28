@@ -1,0 +1,315 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Project Manifest
+#
+# Fichier unique de métadonnées du projet. Format YAML, extension
+# `.dl` custom. Il n'existe qu'UN SEUL `nexus.dl` dans tout le dépôt,
+# à la racine.
+#
+# Rôle :
+#   - Source de vérité pour les scripts de release (scripts/build.py)
+#   - Métadonnées lisibles par l'humain ET la machine
+#   - Référence rapide pour les contributeurs
+#   - Compatible avec les futurs outils NexusDL (CLI, plugins)
+#
+# Ne contient AUCUN secret, AUCUNE URL de site scrapé, AUCUNE
+# donnée dépendante du déploiement. Ces informations vivent dans
+# `.env` (secrets) et `src/nexusdl/data/sites.yaml` (config métier).
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# Identité du projet
+# ────────────────────────────────────────────────────────────────────
+
+manifest_version: 1
+project: nexusdl
+display_name: NexusDL
+tagline: "Multi-site manga, webtoon, comic and doujinshi downloader."
+version: "0.1.0"
+release_status: alpha                  # alpha | beta | rc | stable
+release_date: null                     # ISO 8601 (ex: "2026-06-01"), null si non publié
+license: GPL-3.0-or-later
+python_min: "3.12"
+python_max_tested: "3.13"
+
+description: |
+  NexusDL is a modern, modular, and extensible downloader for manga,
+  webtoons, comics, and doujinshi from 60+ sites. It is built around
+  hexagonal architecture, strict typing, and async-first I/O, and
+  ships with four interfaces: CLI, TUI, GUI, and Web (API + UI).
+
+homepage: "https://github.com/Voldigoad-Holdings/nexus-dl"
+documentation: "https://github.com/Voldigoad-Holdings/nexus-dl/tree/main/docs"
+changelog: "https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/CHANGELOG.md"
+
+# ────────────────────────────────────────────────────────────────────
+# Auteurs et mainteneurs
+# ────────────────────────────────────────────────────────────────────
+
+authors:
+  - name: Voldigoad-Holdings
+    email: drxenon487@gmail.com
+    role: lead-maintainer
+    github: Voldigoad-Holdings
+
+maintainers:
+  - name: Voldigoad-Holdings
+    email: drxenon487@gmail.com
+    role: lead
+    areas: [core, parsers, interfaces, docs]
+
+# ────────────────────────────────────────────────────────────────────
+# Dépôts et liens communautaires
+# ────────────────────────────────────────────────────────────────────
+
+repositories:
+  source: "https://github.com/Voldigoad-Holdings/nexus-dl"
+  issues: "https://github.com/Voldigoad-Holdings/nexus-dl/issues"
+  discussions: "https://github.com/Voldigoad-Holdings/nexus-dl/discussions"
+  security_advisories: "https://github.com/Voldigoad-Holdings/nexus-dl/security/advisories"
+  pull_requests: "https://github.com/Voldigoad-Holdings/nexus-dl/pulls"
+  wiki: "https://github.com/Voldigoad-Holdings/nexus-dl/wiki"
+
+community:
+  code_of_conduct: "CODE_OF_CONDUCT.md"
+  contributing: "CONTRIBUTING.md"
+  security_policy: "SECURITY.md"
+  security_hall_of_fame: "SECURITY_HALL_OF_FAME.md"
+
+# ────────────────────────────────────────────────────────────────────
+# Distribution
+# ────────────────────────────────────────────────────────────────────
+
+package_managers:
+  pypi: nexusdl
+  docker: ghcr.io/voldigoad-holdings/nexus-dl
+  docker_web: ghcr.io/voldigoad-holdings/nexus-dl-web
+  docker_gui: ghcr.io/voldigoad-holdings/nexus-dl-gui
+
+entry_points:
+  - name: nexusdl
+    module: nexusdl.interfaces.cli.cli_entry:main
+    description: "CLI commands (Typer)"
+  - name: nexusdl-tui
+    module: nexusdl.interfaces.cli.cli_entry:tui
+    description: "Textual TUI"
+  - name: nexusdl-gui
+    module: nexusdl.interfaces.gui.app:main
+    description: "CustomTkinter desktop GUI"
+  - name: nexusdl-web
+    module: nexusdl.interfaces.web.backend.main:main
+    description: "FastAPI backend + Next.js frontend"
+
+# ────────────────────────────────────────────────────────────────────
+# Plateformes supportées
+# ────────────────────────────────────────────────────────────────────
+
+platforms:
+  - linux
+  - macos
+  - windows
+  - docker
+
+architectures:
+  - x86_64
+  - arm64
+
+ci_matrix:
+  - ubuntu-latest
+  - macos-latest
+  - windows-latest
+
+# ────────────────────────────────────────────────────────────────────
+# Capacités fonctionnelles
+# ────────────────────────────────────────────────────────────────────
+
+interfaces:
+  - cli
+  - tui
+  - gui
+  - web
+  - api
+  - python_api
+
+supported_formats:
+  - FOLDER
+  - ZIP
+  - CBZ
+  - CB7
+  - PDF
+  - CBT
+
+unsupported_formats:
+  - format: CBR
+    reason: "RAR is proprietary and incompatible with GPL-3.0."
+    adr: "docs/source/development/decisions/002-no-cbr.md"
+
+languages:
+  interface:
+    - en
+    - fr
+    - es
+    - de
+  content:
+    - fr
+    - en
+    - ko
+    - ja
+    - zh
+    - es
+    - pt
+    - it
+    - ru
+    - ar
+
+features:
+  - multi_site_search
+  - local_library_fts5
+  - reading_progress
+  - incremental_updates
+  - plugin_system
+  - cloudflare_bypass
+  - proxy_rotation
+  - rate_limiting
+  - circuit_breaker
+  - http_caching
+  - user_agent_rotation
+  - jwt_auth
+  - encrypted_cookies
+  - robots_txt_enforcement
+  - content_filtering_opt_in
+  - multi_format_export
+
+adult_support: true                   # opt-in via NEXUSDL_ALLOW_ADULT
+adult_enabled_by_default: false
+plugin_system: true
+plugin_sandboxed: false               # trusted-only (voir docs)
+
+# ────────────────────────────────────────────────────────────────────
+# Architecture (référence)
+# ────────────────────────────────────────────────────────────────────
+
+architecture:
+  style: hexagonal
+  adr: "docs/source/development/decisions/001-hexagonal-architecture.md"
+  layers:
+    - name: interfaces
+      role: "Primary adapters (CLI, TUI, GUI, Web)"
+      may_import: [core]
+    - name: core
+      role: "Domain logic (models, downloader, packaging, library, session)"
+      may_import: []
+      must_not_import: [parsers, interfaces, plugins]
+    - name: parsers
+      role: "Secondary adapters (site-specific scrapers)"
+      may_import: [core]
+      must_not_import: [interfaces, plugins]
+    - name: plugins
+      role: "User extensions"
+      may_import: [core]
+      must_not_import: [interfaces, parsers]
+  enforcement_script: "scripts/check_imports.py"
+
+# ────────────────────────────────────────────────────────────────────
+# Qualité
+# ────────────────────────────────────────────────────────────────────
+
+quality:
+  type_checking: mypy-strict
+  linter: ruff
+  formatter: ruff-format
+  test_framework: pytest
+  coverage_target_core: 90
+  coverage_target_global: 70
+  pre_commit: true
+  ci: github-actions
+  import_rule_enforcement: true
+  secret_scanning: true
+
+# ────────────────────────────────────────────────────────────────────
+# Sécurité
+# ────────────────────────────────────────────────────────────────────
+
+security:
+  secret_management: pydantic-SecretStr
+  cookie_encryption: cryptography.Fernet
+  jwt_algorithm_min: HS256
+  jwt_algorithm_recommended: RS256
+  password_hashing: bcrypt
+  dependency_audit: pip-audit
+  dependabot: true
+  codeql: true
+  secret_scanning: true
+  responsible_disclosure: true
+  security_advisories: true
+  security_hall_of_fame: "SECURITY_HALL_OF_FAME.md"
+  disclosure_window_days: 90
+
+# ────────────────────────────────────────────────────────────────────
+# Dépendances critiques (pour audit de licence)
+# ────────────────────────────────────────────────────────────────────
+
+key_dependencies:
+  python: ">=3.12"
+  pydantic: ">=2.7"
+  pydantic-settings: ">=2.3"
+  httpx: ">=0.27"
+  aiohttp: ">=3.9"
+  sqlalchemy: ">=2.0"
+  fastapi: ">=0.111"
+  playwright: ">=1.45"
+  cryptography: ">=42.0"
+  pillow: ">=10.3"
+  py7zr: ">=0.21"
+
+license_compatibility:
+  project: GPL-3.0-or-later
+  verified_at: null                   # ISO 8601, à remplir lors du prochain audit
+  incompatible_dependencies: []       # doit rester vide
+  known_issues:
+    - dependency: unrar
+      status: not-used
+      reason: "Proprietary, incompatible with GPL. CBR not supported."
+
+# ────────────────────────────────────────────────────────────────────
+# Versionning & release
+# ────────────────────────────────────────────────────────────────────
+
+versioning:
+  scheme: semver
+  source: pyproject.toml
+  module: src/nexusdl/version.py
+  tag_format: "v{version}"
+  changelog: CHANGELOG.md
+  changelog_format: keep-a-changelog-1.1.0
+  commits: conventional-commits
+
+release_process:
+  - "Update CHANGELOG.md"
+  - "Update pyproject.toml version"
+  - "Update src/nexusdl/version.py __version__"
+  - "Update nexus.dl version"
+  - "git commit -m 'chore(release): vX.Y.Z'"
+  - "git tag -a vX.Y.Z -m 'Release vX.Y.Z'"
+  - "git push origin main --tags"
+  - "GitHub Actions release.yml builds + publishes"
+
+# ────────────────────────────────────────────────────────────────────
+# Métadonnées techniques
+# ────────────────────────────────────────────────────────────────────
+
+build_backend: hatchling
+dependency_manager: uv
+lockfile: uv.lock
+task_runner: just
+task_runner_fallback: make
+
+default_branch: main
+license_file: LICENSE
+readme: README.md
+manifest: nexus.dl
+python_version_file: .python-version
+env_template: .env.example
+
+# ────────────────────────────────────────────────────────────────────
+# Fin du manifeste
+# ────────────────────────────────────────────────────────────────────

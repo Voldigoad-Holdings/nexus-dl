@@ -124,4 +124,3 @@ directly via [GitHub Security Advisories](https://github.com/Voldigoad-Holdings/
 
 This file is part of NexusDL and is licensed under
 [GPL-3.0-or-later](LICENSE).
-```

@@ -1,0 +1,34 @@
+{
+  "_fixture_version": 1,
+  "_description": "Sample Manga fixture for NexusDL tests. Represents One Piece from MangaDex (English, ongoing, safe). The id field matches sample_chapter.json's manga_id so both fixtures form a valid parent/child pair. Used by test_manga.py, test_chapter.py, test_search.py, test_comic_info.py, and test_site_registry.py. No secrets, no cookies, no tokens.",
+
+  "id": "a1b2c3d4e5f6a7b8",
+  "source_id": "a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6",
+  "site": "mangadex",
+  "title": "One Piece",
+  "alternative_titles": [
+    "ワンピース",
+    "One Piece (Color)",
+    "One Piece Digital Colored Comics"
+  ],
+  "description": "Monkey D. Luffy, a young man made of rubber after unintentionally eating a Devil Fruit, sets out to become the Pirate King and find the legendary treasure known as One Piece. Along the way, he assembles a diverse crew of pirates, each with their own dreams and backstories, and confronts the World Government, the Marines, and rival pirates.",
+  "author": "Oda Eiichiro",
+  "artist": "Oda Eiichiro",
+  "genres": [
+    "Action",
+    "Adventure",
+    "Comedy",
+    "Drama",
+    "Fantasy",
+    "Shounen"
+  ],
+  "status": "ongoing",
+  "year": 1997,
+  "cover_url": "https://uploads.mangadex.org/covers/a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6/cover-abc123def456.jpg",
+  "language": "en",
+  "content_rating": "safe",
+  "url": "https://mangadex.org/title/a1b2c3d4-e5f6-a7b8-c9d0-e1f2a3b4c5d6",
+  "updated_at": "2026-10-29T12:00:00Z",
+
+  "chapters": []
+}

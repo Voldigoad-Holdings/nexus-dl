@@ -1,0 +1,402 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Site overrides (sites_overrides.yaml)
+#
+# Copie ce fichier en `config/sites_overrides.yaml` pour surcharger
+# `sites.yaml` SANS modifier le fichier versionné du package.
+#
+# ⚠️  NE MODIFIE JAMAIS `src/nexusdl/data/sites.yaml` directement.
+#     Les mises à jour de NexusDL écraseraient tes changements.
+#     Utilise CE fichier.
+#
+# ⚠️  NE COMMITE JAMAIS `config/sites_overrides.yaml` (déjà dans
+#     .gitignore). Chaque déploiement a ses propres overrides.
+#
+# ⚠️  JAMAIS DE SECRETS ICI. Les valeurs de cookies et credentials
+#     vivent dans .env :
+#       NEXUSDL_<SITE>_<COOKIE>=...       (ex: NEXUSDL_NHENTAI_CF_CLEARANCE)
+#       NEXUSDL_<SITE>_USERNAME=...
+#       NEXUSDL_<SITE>_PASSWORD=...
+#     (voir ADR-004)
+#
+# Activation :
+#   Dans .env :
+#     NEXUSDL_SITES_OVERRIDES_FILE=config/sites_overrides.yaml
+#   Ou via CLI :
+#     nexusdl --sites-overrides config/sites_overrides.yaml ...
+#
+# Fusion (merge strategy) :
+#   - Les champs scalaires sont REMPLACÉS (ex: name, language, enabled)
+#   - Les listes sont REMPLACÉES (ex: domains, cookies_required)
+#   - Les dicts (capabilities, default_headers) sont FUSIONNÉS
+#     (récursivement : les nouvelles clés s'ajoutent, les existantes
+#     sont écrasées si présentes dans l'override)
+#   - Pour REMPLACER un dict au lieu de le fusionner :
+#       capabilities:
+#         $replace: {supports_search: true}
+#
+# Validation : Pydantic v2 + JSON Schema (sites_schema.json)
+# Format    : YAML 1.2, UTF-8, indentation 2 espaces.
+# ════════════════════════════════════════════════════════════════════
+
+
+# ────────────────────────────────────────────────────────────────────
+# MÉTADONNÉES
+# ────────────────────────────────────────────────────────────────────
+version: 1
+# Description optionnelle (affichée dans `nexusdl config show`)
+description: "Local site overrides for production deployment"
+
+# Date de dernière mise à jour (informatif)
+updated_at: null  # ISO 8601, ex: "2026-10-29T12:00:00Z"
+
+
+# ────────────────────────────────────────────────────────────────────
+# GLOBAL OVERRIDES
+# ────────────────────────────────────────────────────────────────────
+# Ces paramètres s'appliquent à tous les sites (avant les overrides
+# individuels). Utile pour ajuster les defaults d'un déploiement.
+global:
+  # Rate limit par défaut pour tous les sites sans override
+  default_rate_limit_per_second: 2.0
+
+  # Concurrency par défaut
+  max_concurrent_downloads: 4
+  max_concurrent_pages_per_chapter: 8
+
+  # Headers ajoutés à TOUS les sites
+  default_headers:
+    User-Agent: "NexusDL/0.1.0 (+https://github.com/Voldigoad-Holdings/nexus-dl)"
+    Accept-Language: "en-US,en;q=0.9"
+
+  # Timeout HTTP (secondes)
+  http_timeout_seconds: 30
+
+  # Retry (tenacity)
+  http_max_retries: 3
+  http_retry_backoff_seconds: 2.0
+
+  # Respect robots.txt (override de NEXUSDL_RESPECT_ROBOTS_TXT)
+  # null = utiliser la valeur de .env
+  respect_robots_txt: null
+
+
+# ────────────────────────────────────────────────────────────────────
+# SITE OVERRIDES
+# ────────────────────────────────────────────────────────────────────
+# Chaque entrée a :
+#   - id         : (requis) ID du site à surcharger (doit exister
+#                  dans sites.yaml, ou être nouveau si `create: true`)
+#   - create     : (optionnel) true = créer un nouveau site au lieu
+#                  de surcharger. Défaut: false
+#   - enabled    : (optionnel) activer/désactiver le site
+#   - ...        : (optionnel) tout champ de sites.yaml
+#
+# Fusion : chaque champ override remplace la valeur de sites.yaml.
+# Le reste est conservé.
+
+sites:
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 1 — Désactiver un site
+  # ════════════════════════════════════════════════════════════════
+  - id: nhentai
+    enabled: false
+    reason: "Adult site disabled on this deployment"
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 2 — Ajouter un mirror à un site existant
+  # ════════════════════════════════════════════════════════════════
+  - id: mangadex
+    domains:
+      - https://mangadex.org
+      - https://mangadex-mirror.example.com  # mirror perso
+    default_headers:
+      Referer: "https://mangadex.org/"
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 3 — Réduire le rate limit (site fragile)
+  # ════════════════════════════════════════════════════════════════
+  - id: sushiscan
+    capabilities:
+      default_rate_limit_per_second: 1.0
+      max_concurrent_downloads: 2
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 4 — Activer Cloudflare bypass pour un site
+  # ════════════════════════════════════════════════════════════════
+  - id: hentaizone
+    capabilities:
+      requires_cloudflare_bypass: true
+    cookies_required:
+      - cf_clearance
+    # La VALEUR du cookie va dans .env :
+    #   NEXUSDL_HENTAIZONE_CF_CLEARANCE=<value>
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 5 — Ajouter un cookie requis (sans valeur)
+  # ════════════════════════════════════════════════════════════════
+  - id: scan-manga
+    cookies_required:
+      - cf_clearance
+      - cf_bm
+    # Valeurs dans .env :
+    #   NEXUSDL_SCAN_MANGA_CF_CLEARANCE=<value>
+    #   NEXUSDL_SCAN_MANGA_CF_BM=<value>
+    # ⚠️  L'ID du site avec tiret devient _ dans l'env var :
+    #     scan-manga → SCAN_MANGA
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 6 — Override de parser_class (fork custom)
+  # ════════════════════════════════════════════════════════════════
+  - id: mangafire
+    parser_class: "my_fork.parsers.mangafire:MyMangaFireParser"
+    # ⚠️  Le module doit être importable (installé via pip ou PYTHONPATH)
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 7 — Désactiver certains capabilities
+  # ════════════════════════════════════════════════════════════════
+  - id: mangakakalot
+    capabilities:
+      # Ce site bloque le search depuis 2024-01, on le désactive
+      supports_search: false
+      # Mais le download direct reste OK
+      supports_download: true
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 8 — Remplacer un dict au lieu de fusionner
+  # ════════════════════════════════════════════════════════════════
+  - id: batoto
+    capabilities:
+      # Sans $replace, ça fusionne. Avec $replace, ça remplace tout.
+      $replace:
+        supports_search: true
+        supports_manga_info: true
+        supports_chapters: true
+        supports_pages: true
+        supports_download: true
+        requires_auth: false
+        requires_cloudflare_bypass: true
+        max_concurrent_downloads: 2
+        default_rate_limit_per_second: 1.0
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 9 — Créer un nouveau site (parser custom)
+  # ════════════════════════════════════════════════════════════════
+  - id: my-private-site
+    create: true                       # ← nouveau site
+    name: "My Private Site"
+    domains:
+      - https://private.example.com
+    parser_class: "my_fork.parsers.private:PrivateParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: true              # login requis
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 2
+      default_rate_limit_per_second: 0.5
+    default_headers:
+      User-Agent: "MyPrivateFork/1.0"
+    cookies_required: []
+    # Credentials dans .env :
+    #   NEXUSDL_MY_PRIVATE_SITE_USERNAME=...
+    #   NEXUSDL_MY_PRIVATE_SITE_PASSWORD=...
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 10 — Surcharger le language et adult
+  # ════════════════════════════════════════════════════════════════
+  - id: toonily
+    language: en                       # override explicite
+    adult: false                       # override explicite
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 11 — Priorité de download (custom)
+  # ════════════════════════════════════════════════════════════════
+  - id: mangadex
+    priority: high                     # site prioritaire
+    # (utilisé par DownloadManager si plusieurs sources disponibles)
+
+  # ════════════════════════════════════════════════════════════════
+  # EXEMPLE 12 — Timeout custom (site lent)
+  # ════════════════════════════════════════════════════════════════
+  - id: manhwaclub
+    http_timeout_seconds: 60           # plus tolérant
+    http_max_retries: 5
+
+
+# ────────────────────────────────────────────────────────────────────
+# DISABLED SITES (raccourci)
+# ────────────────────────────────────────────────────────────────────
+# Alternative à `enabled: false` par site. Utile pour désactiver
+# plusieurs sites d'un coup.
+disabled_sites:
+  #- nhentai
+  #- hentaizone
+  # - pururin
+  # - scan-hentai
+  # - x-manga
+
+
+# ────────────────────────────────────────────────────────────────────
+# ALIASES
+# ────────────────────────────────────────────────────────────────────
+# Crée des alias de site_id (pratique pour des noms plus courts).
+# Les alias pointent vers le site réel mais utilisent un ID différent.
+aliases:
+  md: mangadex
+  mf: mangafire
+  ss: sushiscan
+  nh: nhentai
+
+
+# ────────────────────────────────────────────────────────────────────
+# CATEGORY OVERRIDES
+# ────────────────────────────────────────────────────────────────────
+# Surcharge tous les sites d'une catégorie (fr, en, kr, adult).
+# Appliqué APRÈS global, AVANT les overrides par site.
+categories:
+  fr:
+    capabilities:
+      default_rate_limit_per_second: 1.5
+    default_headers:
+      Accept-Language: "fr-FR,fr;q=0.9,en;q=0.5"
+
+  en:
+    capabilities:
+      default_rate_limit_per_second: 2.0
+    default_headers:
+      Accept-Language: "en-US,en;q=0.9"
+
+  kr:
+    capabilities:
+      default_rate_limit_per_second: 1.0
+    default_headers:
+      Accept-Language: "ko-KR,ko;q=0.9,en;q=0.5"
+
+  adult:
+    enabled: null                    # null = utiliser NEXUSDL_ALLOW_ADULT
+    capabilities:
+      requires_cloudflare_bypass: true
+      default_rate_limit_per_second: 1.0
+    cookies_required:
+      - cf_clearance
+
+
+# ────────────────────────────────────────────────────────────────────
+# EXAMPLES — scénarios de production courants
+# ────────────────────────────────────────────────────────────────────
+
+# ── Scénario A : déploiement généraliste (sans adult) ──
+# disabled_sites:
+#   - nhentai
+#   - hentaizone
+#   - pururin
+#   - scan-hentai
+#   - x-manga
+# global:
+#   respect_robots_txt: true
+
+# ── Scénario B : déploiement privé (avec adult) ──
+# (NEXUSDL_ALLOW_ADULT=true dans .env)
+# sites:
+#   - id: nhentai
+#     capabilities:
+#       requires_cloudflare_bypass: true
+#     cookies_required: [cf_clearance]
+#   - id: hentaizone
+#     capabilities:
+#       requires_cloudflare_bypass: true
+#     cookies_required: [cf_clearance]
+
+# ── Scénario C : fork avec parsers custom ──
+# sites:
+#   - id: my-private-site
+#     create: true
+#     name: "Private Site"
+#     domains: [https://private.example.com]
+#     parser_class: "my_fork.parsers.private:PrivateParser"
+#     language: en
+#     adult: false
+#     capabilities:
+#       supports_search: true
+#       supports_manga_info: true
+#       supports_chapters: true
+#       supports_pages: true
+#       supports_download: true
+#       requires_auth: true
+#       requires_cloudflare_bypass: false
+#       max_concurrent_downloads: 2
+#       default_rate_limit_per_second: 0.5
+
+# ── Scénario D : déploiement à rate limit réduit (IP fragile) ──
+# global:
+#   default_rate_limit_per_second: 0.5
+#   max_concurrent_downloads: 1
+#   max_concurrent_pages_per_chapter: 2
+# sites:
+#   - id: mangadex
+#     capabilities:
+#       default_rate_limit_per_second: 1.0
+#   - id: sushiscan
+#     capabilities:
+#       default_rate_limit_per_second: 0.5
+
+# ── Scénario E : ajouter un mirror pour chaque site FR ──
+# sites:
+#   - id: sushiscan
+#     domains:
+#       - https://sushiscan.net
+#       - https://sushiscan-mirror.example.com
+#   - id: scan-manga
+#     domains:
+#       - https://scan-manga.com
+#       - https://scan-manga-mirror.example.com
+
+
+# ────────────────────────────────────────────────────────────────────
+# NOTES
+# ────────────────────────────────────────────────────────────────────
+# 1. Priorité de fusion (bas → haut) :
+#       sites.yaml  →  categories  →  global  →  sites  →  disabled_sites
+#    (chaque niveau surcharge le précédent)
+#
+# 2. Création de site :
+#    - `create: true` permet d'ajouter un site qui n'existe pas dans
+#      sites.yaml
+#    - Le parser_class DOIT être importable
+#    - Le site_id DOIT être unique (pas de collision avec sites.yaml)
+#
+# 3. Credentials (JAMAIS ici) :
+#    - Cookies       → NEXUSDL_<SITE>_<COOKIE>=...   (dans .env)
+#    - Username      → NEXUSDL_<SITE>_USERNAME=...   (dans .env)
+#    - Password      → NEXUSDL_<SITE>_PASSWORD=...   (dans .env)
+#    - L'ID avec tiret devient _ :
+#        scan-manga → NEXUSDL_SCAN_MANGA_CF_CLEARANCE
+#
+# 4. Désactivation :
+#    - `enabled: false` sur le site         → désactive ce site
+#    - `disabled_sites: [a, b]`             → désactive en masse
+#    - Les deux sont cumulables
+#
+# 5. Fusion de dicts :
+#    - Par défaut, les dicts sont FUSIONNÉS récursivement
+#    - `$replace: {...}` REMPLACE complètement
+#    - Les listes sont toujours REMPLACÉES (pas de fusion)
+#
+# 6. Validation :
+#    - `python scripts/validate_sites.py`  (valide sites.yaml)
+#    - `nexusdl config validate`           (valide aussi overrides)
+#    - `nexusdl sites`                     (affiche les sites finaux)
+#
+# 7. Multi-déploiements :
+#    - Un fichier par déploiement (dev, staging, prod)
+#    - `NEXUSDL_SITES_OVERRIDES_FILE` dans .env pointe vers le bon
+#
+# 8. Rollback :
+#    - Ce fichier est git-ignoré → pas de versioning
+#    - Pour versionner, copie-le en `config/sites_overrides.<env>.yaml`
+#      et commit-le (sans secrets)

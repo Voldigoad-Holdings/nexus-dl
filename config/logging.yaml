@@ -1,0 +1,466 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Logging configuration (loguru)
+#
+# Fichier : config/logging.yaml
+#
+# Rôle : définir les sinks, formats, rotations et filtres pour loguru.
+#
+# Chargé par `nexusdl.core.logger.configure_logging()` (Phase 1).
+#
+# PRÉCÉDENCE (bas → haut) :
+#   1. Defaults (core/logger.py)
+#   2. config/logging.yaml     ← CE FICHIER
+#   3. .env                    (NEXUSDL_LOG_LEVEL, NEXUSDL_LOG_FORMAT)
+#   4. CLI args                (--log-level, --log-format)
+#
+# ⚠️  NE COMMITE JAMAIS de secrets dans ce fichier.
+# ⚠️  Les chemins utilisent les tokens loguru :
+#       {time}, {level}, {name}, {function}, {line}, {message}, {extra}
+# ⚠️  Ce fichier est VERSIONNÉ (contrairement à config/config.yaml).
+#
+# Format : YAML 1.2, UTF-8, indentation 2 espaces.
+# ════════════════════════════════════════════════════════════════════
+
+
+# ────────────────────────────────────────────────────────────────────
+# GLOBAL
+# ────────────────────────────────────────────────────────────────────
+# Options appliquées à tous les sinks (sauf override local).
+defaults:
+  # Niveau minimum pour tous les sinks (sauf override).
+  level: INFO
+
+  # Format par défaut (utilisé si un sink ne spécifie pas le sien).
+  # Le format `pretty` est coloré et lisible en dev.
+  format: pretty
+
+  # Encodage des fichiers de sortie.
+  encoding: utf-8
+
+  # Backtrace : affiche la pile d'appels complète en cas d'exception.
+  # ⚠️  Coûteux en prod — laisser false.
+  backtrace: false
+
+  # Diagnose : affiche les valeurs des variables locales dans les
+  # tracebacks. ⚠️  Peut fuiter des secrets — laisser false.
+  diagnose: false
+
+  # Enqueue : sérialise les écritures (thread-safe, async-safe).
+  # Recommandé si plusieurs threads/processus écrivent.
+  enqueue: false
+
+  # Catch : capture les exceptions non gérées des handlers.
+  catch: true
+
+  # Colorize : force la coloration (null = auto-détection TTY).
+  colorize: null
+
+
+# ────────────────────────────────────────────────────────────────────
+# SINKS
+# ────────────────────────────────────────────────────────────────────
+# Chaque sink est une destination. Loguru les écrit tous en parallèle.
+# Ordre : du plus verbeux au moins verbeux.
+
+sinks:
+  # ════════════════════════════════════════════════════════════════
+  # 1. CONSOLE (stdout) — toujours actif
+  # ════════════════════════════════════════════════════════════════
+  - id: console
+    enabled: true
+    type: stream
+    stream: ext://sys.stdout
+    level: INFO                    # override via --log-level
+    format: pretty                 # override via --log-format
+    colorize: null                 # null = auto (TTY = oui)
+    backtrace: false
+    diagnose: false
+    filter: null                   # tous les messages
+    # Format détaillé pour la console en dev
+    format_string: >
+      <green>{time:HH:mm:ss}</green> |
+      <level>{level: <8}</level> |
+      <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> —
+      <level>{message}</level>
+    # Format compact pour la console en prod (moins de bruit)
+    compact_format_string: >
+      <level>{level: <8}</level> <cyan>{name}</cyan> — <level>{message}</level>
+
+  # ════════════════════════════════════════════════════════════════
+  # 2. STDERR — erreurs uniquement (toujours actif)
+  # ════════════════════════════════════════════════════════════════
+  - id: stderr
+    enabled: true
+    type: stream
+    stream: ext://sys.stderr
+    level: WARNING                 # seulement WARNING et au-dessus
+    format: pretty
+    colorize: null
+    backtrace: true                # traceback complet sur stderr
+    diagnose: false
+    filter: null
+    format_string: >
+      <red>{time:HH:mm:ss}</red> |
+      <level>{level: <8}</level> |
+      <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> —
+      <level>{message}</level>
+
+  # ════════════════════════════════════════════════════════════════
+  # 3. FICHIER PRINCIPAL — DEBUG et au-dessus
+  # ════════════════════════════════════════════════════════════════
+  - id: file_main
+    enabled: true
+    type: file
+    path: "{logs_dir}/nexusdl.log"
+    level: DEBUG                   # capture TOUT (utile pour support)
+    format: text
+    colorize: false
+    backtrace: true
+    diagnose: false
+    encoding: utf-8
+    rotation: "10 MB"              # nouvelle rotation à 10 MB
+    retention: "30 days"           # garde 30 jours
+    compression: "zip"             # compresse les fichiers rotés
+    delay: false                   # ouvre le fichier immédiatement
+    watch: false                   # ne pas recharger la config
+    filter: null
+    format_string: >
+      {time:YYYY-MM-DD HH:mm:ss.SSS} |
+      {level: <8} |
+      {name}:{function}:{line} |
+      {message} |
+      {extra}
+
+  # ════════════════════════════════════════════════════════════════
+  # 4. FICHIER JSON — pour log shippers (Loki, ELK, Datadog)
+  # ════════════════════════════════════════════════════════════════
+  - id: file_json
+    enabled: true
+    type: file
+    path: "{logs_dir}/nexusdl.jsonl"
+    level: INFO
+    format: json
+    colorize: false
+    backtrace: true
+    diagnose: false
+    encoding: utf-8
+    rotation: "50 MB"
+    retention: "7 days"
+    compression: "gzip"
+    delay: true                    # ouvre à la première écriture
+    watch: false
+    filter: null
+    # Format JSON structuré (voir nexusdl.core.logger.json_formatter)
+    format_string: null            # géré par json_formatter
+
+  # ════════════════════════════════════════════════════════════════
+  # 5. FICHIER ERREURS — ERROR et CRITICAL uniquement
+  # ════════════════════════════════════════════════════════════════
+  - id: file_errors
+    enabled: true
+    type: file
+    path: "{logs_dir}/nexusdl-errors.log"
+    level: ERROR
+    format: text
+    colorize: false
+    backtrace: true
+    diagnose: true                 # valeurs locales pour debug
+    encoding: utf-8
+    rotation: "5 MB"
+    retention: "90 days"           # garde plus longtemps
+    compression: "zip"
+    delay: false
+    watch: false
+    filter: null
+    format_string: >
+      {time:YYYY-MM-DD HH:mm:ss.SSS} |
+      {level: <8} |
+      {name}:{function}:{line} |
+      {message} |
+      {extra}
+
+  # ════════════════════════════════════════════════════════════════
+  # 6. FICHIER DOWNLOADS — task-specific (par task_id)
+  # ════════════════════════════════════════════════════════════════
+  - id: file_downloads
+    enabled: true
+    type: file
+    path: "{logs_dir}/downloads/{time:YYYY-MM-DD}/{extra[task_id]}.log"
+    level: INFO
+    format: text
+    colorize: false
+    backtrace: false
+    diagnose: false
+    encoding: utf-8
+    rotation: "1 MB"
+    retention: "7 days"
+    compression: "gzip"
+    delay: true                    # crée le fichier à la 1re écriture
+    watch: false
+    # Filtre : seulement les logs avec task_id dans extra
+    filter:
+      extra_contains: [task_id]
+    format_string: >
+      {time:HH:mm:ss.SSS} | {level: <8} | {message}
+
+
+# ────────────────────────────────────────────────────────────────────
+# FILTRES PAR MODULE
+# ────────────────────────────────────────────────────────────────────
+# Surcharge le niveau par module (plus verbeux ou moins verbeux).
+# Utile pour debug ciblé : augmente le niveau d'un seul module.
+module_levels:
+  # ── NexusDL core ──
+  "nexusdl.core.downloader": DEBUG           # détails des téléchargements
+  "nexusdl.core.session.http_session": DEBUG # requêtes HTTP
+  "nexusdl.core.session.circuit_breaker": INFO
+  "nexusdl.core.session.rate_limiter": DEBUG # tokens consommés
+  "nexusdl.core.packaging": INFO
+  "nexusdl.core.library": INFO
+  "nexusdl.core.registry": INFO
+  "nexusdl.core.compliance": INFO
+
+  # ── NexusDL parsers ──
+  "nexusdl.parsers": INFO                    # default
+  "nexusdl.parsers.mixins": DEBUG            # détail des mixins
+  "nexusdl.parsers.fr": INFO
+  "nexusdl.parsers.en": INFO
+  "nexusdl.parsers.adult": INFO
+
+  # ── NexusDL interfaces ──
+  "nexusdl.interfaces.cli": INFO
+  "nexusdl.interfaces.gui": INFO
+  "nexusdl.interfaces.web.backend": INFO
+  "nexusdl.interfaces.web.backend.middleware": DEBUG  # auth, cors, rate limit
+
+  # ── Third-party (réduire le bruit) ──
+  "httpx": WARNING
+  "httpcore": WARNING
+  "asyncio": WARNING
+  "urllib3": WARNING
+  "sqlalchemy.engine": WARNING               # queries SQL
+  "uvicorn": INFO
+  "uvicorn.access": WARNING                  # désactive access logs
+  "uvicorn.error": INFO
+  "playwright": WARNING
+  "websockets": WARNING
+  "pydantic": WARNING
+  "alembic": INFO
+
+
+# ────────────────────────────────────────────────────────────────────
+# PROFILS PAR ENVIRONNEMENT
+# ────────────────────────────────────────────────────────────────────
+# Surcharges appliquées selon NEXUSDL_APP_ENVIRONMENT.
+profiles:
+  dev:
+    # Mode développeur : verveux, coloré, pas de JSON
+    sinks:
+      console:
+        level: DEBUG
+        format: pretty
+      stderr:
+        level: WARNING
+      file_main:
+        level: TRACE
+      file_json:
+        enabled: false
+      file_errors:
+        level: ERROR
+    defaults:
+      diagnose: true
+      backtrace: true
+      colorize: true
+
+  staging:
+    # Pré-prod : INFO, JSON activé, pas de couleurs
+    sinks:
+      console:
+        level: INFO
+        format: text
+      file_main:
+        level: DEBUG
+      file_json:
+        enabled: true
+      file_errors:
+        level: ERROR
+    defaults:
+      diagnose: false
+      backtrace: true
+      colorize: false
+
+  prod:
+    # Production : WARNING seulement en console, JSON complet
+    sinks:
+      console:
+        level: WARNING
+        format: text
+      stderr:
+        level: ERROR
+      file_main:
+        level: INFO
+      file_json:
+        enabled: true
+        level: INFO
+      file_errors:
+        level: ERROR
+    defaults:
+      diagnose: false
+      backtrace: false
+      colorize: false
+      enqueue: true                 # thread-safe pour la prod
+
+
+# ────────────────────────────────────────────────────────────────────
+# SÉCURITÉ — filtres anti-fuite de secrets
+# ────────────────────────────────────────────────────────────────────
+# Patterns regex qui seront remplacés par "***" AVANT écriture.
+# Appliqué à tous les sinks.
+redact:
+  enabled: true
+  replacement: "***"
+  patterns:
+    # Tokens GitHub
+    - "gh[pousr]_[A-Za-z0-9]{20,}"
+    # AWS access keys
+    - "AKIA[0-9A-Z]{16}"
+    # Clés privées (PEM)
+    - "-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"
+    # JWT (3 segments base64url séparés par .)
+    - "eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+    # Cookie Cloudflare
+    - "cf_clearance=[A-Za-z0-9._-]{20,}"
+    # Pattern "password=..." dans les URLs
+    - "://[^:]+:[^@]+@"
+    # Clés d'API communes (Google, Stripe, etc.)
+    - "AIza[0-9A-Za-z_-]{35}"
+    - "sk_live_[0-9a-zA-Z]{24,}"
+  # Clés `extra` à ne JAMAIS logger (masquées automatiquement)
+  forbidden_extra_keys:
+    - "password"
+    - "passwd"
+    - "pwd"
+    - "secret"
+    - "token"
+    - "api_key"
+    - "apikey"
+    - "jwt"
+    - "cookie"
+    - "authorization"
+    - "private_key"
+
+
+# ────────────────────────────────────────────────────────────────────
+# ROTATION & COMPRESSION
+# ────────────────────────────────────────────────────────────────────
+# Doc : https://loguru.readthedocs.io/en/stable/api/logger.html#file
+rotation:
+  # Stratégies supportées :
+  #   - "10 MB", "100 MB"         → taille
+  #   - "1 day", "00:00"           → temps
+  #   - "1 week", "monday"         → jour
+  # Recommandé : taille pour file_main, temps pour file_json
+  strategy: size                   # size | time | both
+
+retention:
+  # Combien de fichiers rotés garder :
+  #   - "30 days", "1 week"        → temps
+  #   - 10                         → nombre
+  # Recommandé : 30 jours pour main, 7 pour JSON, 90 pour errors
+  default: "30 days"
+
+compression:
+  # Format de compression des fichiers rotés :
+  #   - "zip", "gz", "bz2", "xz"
+  # Recommandé : zip pour compatibilité, gzip pour la taille
+  default: "zip"
+
+# ────────────────────────────────────────────────────────────────────
+# JSON FORMATTER (pour file_json)
+# ────────────────────────────────────────────────────────────────────
+# Définit les champs du JSON structuré.
+json_formatter:
+  # Champs racine
+  fields:
+    timestamp: "{time:YYYY-MM-DDTHH:mm:ss.SSSZ}"
+    level: "{level}"
+    logger: "{name}"
+    function: "{function}"
+    line: "{line}"
+    message: "{message}"
+    module: "{module}"
+    process_id: "{process.id}"
+    thread_id: "{thread.id}"
+    extra: "{extra}"
+
+  # Champs `extra` exclus (en plus de redact.forbidden_extra_keys)
+  exclude_extra:
+    - "password"
+    - "secret"
+    - "token"
+
+  # Inclure la stack trace si présente
+  include_exception: true
+  include_backtrace: false
+
+  # Format des exceptions (truncate si trop longues)
+  max_exception_length: 4096
+
+  # Clés triées alphabétiquement (pour diff/dedup)
+  sort_keys: true
+
+  # Indentation (0 = compact, 2 = pretty pour debug)
+  indent: 0
+
+
+# ────────────────────────────────────────────────────────────────────
+# PERFORMANCE
+# ────────────────────────────────────────────────────────────────────
+performance:
+  # Buffer size pour les écritures fichier (bytes).
+  buffer_size: 8192
+
+  # Flush immédiat (false = buffering, plus rapide mais risque de perte).
+  # Recommandé : false en dev, true en prod.
+  flush_immediately: false
+
+  # Enqueue global (thread-safe).
+  # Recommandé : true en prod avec plusieurs workers.
+  enqueue: false
+
+  # Nombre max de messages en queue avant blocage.
+  queue_max_size: 10000
+
+  # Timeout d'écriture (secondes) avant abandon.
+  write_timeout_seconds: 5
+
+  # Rate limit : max N messages par seconde par sink (0 = illimité).
+  # Évite le spam en cas de boucle.
+  rate_limit_per_second: 1000
+
+
+# ────────────────────────────────────────────────────────────────────
+# NOTES
+# ────────────────────────────────────────────────────────────────────
+# Tokens loguru disponibles dans les formats :
+#   {time}, {level}, {name}, {function}, {line}, {module},
+#   {process}, {thread}, {message}, {extra}, {exception}
+#
+# Niveaux loguru : TRACE(5), DEBUG(10), INFO(20), SUCCESS(25),
+#                  WARNING(30), ERROR(40), CRITICAL(50)
+#
+# Niveau par défaut si non spécifié : INFO
+#
+# Variables d'environnement qui surchargent ce fichier :
+#   NEXUSDL_LOG_LEVEL    → level de tous les sinks
+#   NEXUSDL_LOG_FORMAT   → format de la console
+#   NEXUSDL_LOG_ROTATION → rotation des fichiers
+#   NEXUSDL_LOG_RETENTION → retention des fichiers
+#   NEXUSDL_APP_ENVIRONMENT → profil (dev | staging | prod)
+#
+# CLI args qui surchargent tout :
+#   --log-level LEVEL
+#   --log-format FORMAT
+#
+# ⚠️  En cas de conflit, l'ordre est :
+#     CLI > env > .env > profil > fichier > defaults

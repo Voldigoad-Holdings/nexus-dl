@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  NexusDL — Animated logo
+  File: assets/logo_animated.svg
+  
+  A stylized "N" inside a hexagonal shield, with:
+    - A subtle pulse (scale + opacity) on the inner node
+    - A slow rotation of the outer ring
+    - A gradient shimmer across the "N"
+  
+  Designed for:
+    - README banners (GitHub)
+    - Documentation headers (Sphinx)
+    - PWA splash screens
+    - Social media
+  
+  Constraints:
+    - Pure SVG 1.1 (no script, no foreignObject)
+    - Respects prefers-reduced-motion (CSS media query)
+    - < 15 KB minified
+    - Works on light and dark backgrounds
+  
+  Fallback: a static version is available at assets/logo.svg
+-->
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  xmlns:xlink="http://www.w3.org/1999/xlink"
+  viewBox="0 0 256 256"
+  width="256"
+  height="256"
+  role="img"
+  aria-labelledby="nexus-title nexus-desc"
+  version="1.1"
+>
+  <title id="nexus-title">NexusDL</title>
+  <desc id="nexus-desc">
+    Stylized letter N inside a hexagonal shield, with a shimmering gradient
+    and a subtle pulsing node, representing a hub for manga downloads.
+  </desc>
+
+  <!-- ════════════════════════════════════════════════════════════
+       DEFS — gradients, filters, keyframes
+       ════════════════════════════════════════════════════════════ -->
+  <defs>
+    <!-- Primary gradient (indigo → cyan) -->
+    <linearGradient id="nexus-grad-primary" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1" />
+      <stop offset="50%" stop-color="#4f46e5" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+
+    <!-- Shimmer gradient (for the "N" highlight) -->
+    <linearGradient id="nexus-grad-shimmer" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0" />
+      <stop offset="50%" stop-color="#ffffff" stop-opacity="0.6" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0" />
+      <animateTransform
+        attributeName="gradientTransform"
+        type="translate"
+        from="-1 0"
+        to="1 0"
+        dur="3s"
+        repeatCount="indefinite"
+      />
+    </linearGradient>
+
+    <!-- Soft glow filter -->
+    <filter id="nexus-glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="blur" />
+      <feColorMatrix
+        in="blur"
+        type="matrix"
+        values="1 0 0 0 0.4  0 1 0 0 0.4  0 0 1 0 0.9  0 0 0 0.5 0"
+        result="glow"
+      />
+      <feMerge>
+        <feMergeNode in="glow" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- Clip path for the shimmer (only on the N) -->
+    <clipPath id="nexus-clip-n">
+      <path d="
+        M 88 180
+        L 88 76
+        L 112 76
+        L 144 148
+        L 144 76
+        L 168 76
+        L 168 180
+        L 144 180
+        L 112 108
+        L 112 180
+        Z
+      " />
+    </clipPath>
+
+    <!-- CSS for prefers-reduced-motion -->
+    <style>
+      @media (prefers-reduced-motion: reduce) {
+        .nexus-anim-pulse,
+        .nexus-anim-rotate,
+        .nexus-anim-shimmer {
+          animation: none !important;
+        }
+      }
+    </style>
+  </defs>
+
+  <!-- ════════════════════════════════════════════════════════════
+       BACKGROUND — rounded shield (hexagon-ish)
+       ════════════════════════════════════════════════════════════ -->
+  <g id="nexus-bg">
+    <!-- Outer shield -->
+    <path
+      d="
+        M 128 16
+        L 216 64
+        L 216 192
+        L 128 240
+        L 40 192
+        L 40 64
+        Z
+      "
+      fill="url(#nexus-grad-primary)"
+      stroke="none"
+    />
+
+    <!-- Inner cutout (creates the "frame" effect) -->
+    <path
+      d="
+        M 128 32
+        L 200 72
+        L 200 184
+        L 128 224
+        L 56 184
+        L 56 72
+        Z
+      "
+      fill="#0f172a"
+      fill-opacity="0.85"
+    />
+  </g>
+
+  <!-- ════════════════════════════════════════════════════════════
+       ROTATING RING — animated (subtle)
+       ════════════════════════════════════════════════════════════ -->
+  <g id="nexus-ring" class="nexus-anim-rotate">
+    <animateTransform
+      attributeName="transform"
+      type="rotate"
+      from="0 128 128"
+      to="360 128 128"
+      dur="20s"
+      repeatCount="indefinite"
+    />
+    <!-- Dashed ring -->
+    <circle
+      cx="128"
+      cy="128"
+      r="94"
+      fill="none"
+      stroke="#a5b4fc"
+      stroke-width="1.5"
+      stroke-opacity="0.4"
+      stroke-dasharray="4 8"
+    />
+  </g>
+
+  <!-- ════════════════════════════════════════════════════════════
+       THE "N" — main glyph
+       ════════════════════════════════════════════════════════════ -->
+  <g id="nexus-letter-n" filter="url(#nexus-glow)">
+    <!-- Base N -->
+    <path
+      d="
+        M 88 180
+        L 88 76
+        L 112 76
+        L 144 148
+        L 144 76
+        L 168 76
+        L 168 180
+        L 144 180
+        L 112 108
+        L 112 180
+        Z
+      "
+      fill="#ffffff"
+      fill-opacity="0.95"
+    />
+
+    <!-- Shimmer overlay (clipped to N) -->
+    <g clip-path="url(#nexus-clip-n)" class="nexus-anim-shimmer">
+      <rect
+        x="0"
+        y="0"
+        width="256"
+        height="256"
+        fill="url(#nexus-grad-shimmer)"
+      />
+    </g>
+  </g>
+
+  <!-- ════════════════════════════════════════════════════════════
+       NODE — pulsing dot (the "hub" of the nexus)
+       ════════════════════════════════════════════════════════════ -->
+  <g id="nexus-node" class="nexus-anim-pulse">
+    <!-- Outer pulse ring -->
+    <circle
+      cx="128"
+      cy="128"
+      r="6"
+      fill="none"
+      stroke="#06b6d4"
+      stroke-width="1.5"
+      opacity="0.6"
+    >
+      <animate
+        attributeName="r"
+        values="6;20;6"
+        dur="3s"
+        repeatCount="indefinite"
+      />
+      <animate
+        attributeName="opacity"
+        values="0.6;0;0.6"
+        dur="3s"
+        repeatCount="indefinite"
+      />
+    </circle>
+
+    <!-- Center dot -->
+    <circle
+      cx="128"
+      cy="128"
+      r="4"
+      fill="#06b6d4"
+    >
+      <animate
+        attributeName="r"
+        values="4;5;4"
+        dur="3s"
+        repeatCount="indefinite"
+      />
+    </circle>
+  </g>
+
+  <!-- ════════════════════════════════════════════════════════════
+       CORNER ACCENTS — 3 small nodes (subtle)
+       ════════════════════════════════════════════════════════════ -->
+  <g id="nexus-accents" opacity="0.7">
+    <circle cx="48" cy="64" r="2.5" fill="#a5b4fc" />
+    <circle cx="208" cy="64" r="2.5" fill="#a5b4fc" />
+    <circle cx="208" cy="192" r="2.5" fill="#a5b4fc" />
+  </g>
+
+  <!-- ════════════════════════════════════════════════════════════
+       VERSION TAG — hidden (for debugging)
+       ════════════════════════════════════════════════════════════ -->
+  <metadata>
+    <rdf:RDF
+      xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+    >
+      <rdf:Description>
+        <dc:title>NexusDL Logo (animated)</dc:title>
+        <dc:creator>Voldigoad-Holdings</dc:creator>
+        <dc:license>GPL-3.0-or-later</dc:license>
+        <dc:date>2026-10-29</dc:date>
+        <dc:format>image/svg+xml</dc:format>
+      </rdf:Description>
+    </rdf:RDF>
+  </metadata>
+</svg>

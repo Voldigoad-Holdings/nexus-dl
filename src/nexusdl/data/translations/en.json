@@ -1,0 +1,496 @@
+{
+  "_meta": {
+    "language": "en",
+    "language_name": "English",
+    "language_native": "English",
+    "version": 1,
+    "plural_rule": "germanic",
+    "translators": ["Voldigoad-Holdings"],
+    "last_updated": "2026-10-29"
+  },
+
+  "app": {
+    "name": "NexusDL",
+    "tagline": "Multi-site manga, webtoon, comic and doujinshi downloader",
+    "description": "NexusDL is a modern, modular and extensible downloader for manga, webtoons, comics and doujinshi from 60+ sites.",
+    "version": "Version {version}",
+    "loading": "Loading...",
+    "ready": "Ready",
+    "starting": "Starting...",
+    "stopping": "Stopping...",
+    "stopped": "Stopped",
+    "error": "Error",
+    "warning": "Warning",
+    "info": "Information"
+  },
+
+  "common": {
+    "ok": "OK",
+    "cancel": "Cancel",
+    "close": "Close",
+    "save": "Save",
+    "saved": "Saved",
+    "delete": "Delete",
+    "deleted": "Deleted",
+    "confirm": "Confirm",
+    "yes": "Yes",
+    "no": "No",
+    "back": "Back",
+    "next": "Next",
+    "previous": "Previous",
+    "finish": "Finish",
+    "retry": "Retry",
+    "refresh": "Refresh",
+    "reload": "Reload",
+    "reset": "Reset",
+    "apply": "Apply",
+    "apply_all": "Apply all",
+    "clear": "Clear",
+    "clear_all": "Clear all",
+    "copy": "Copy",
+    "copied": "Copied",
+    "paste": "Paste",
+    "cut": "Cut",
+    "undo": "Undo",
+    "redo": "Redo",
+    "search": "Search",
+    "searching": "Searching...",
+    "loading": "Loading...",
+    "processing": "Processing...",
+    "please_wait": "Please wait...",
+    "optional": "optional",
+    "required": "required",
+    "unknown": "Unknown",
+    "none": "None",
+    "all": "All",
+    "other": "Other",
+    "more": "More",
+    "less": "Less",
+    "show_more": "Show more",
+    "show_less": "Show less",
+    "select": "Select",
+    "select_all": "Select all",
+    "deselect_all": "Deselect all",
+    "download": "Download",
+    "downloading": "Downloading...",
+    "upload": "Upload",
+    "open": "Open",
+    "open_folder": "Open folder",
+    "reveal": "Reveal in file manager",
+    "edit": "Edit",
+    "add": "Add",
+    "remove": "Remove",
+    "update": "Update",
+    "updated": "Updated",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "enable": "Enable",
+    "disable": "Disable",
+    "status": "Status",
+    "actions": "Actions",
+    "details": "Details",
+    "name": "Name",
+    "description": "Description",
+    "type": "Type",
+    "size": "Size",
+    "date": "Date",
+    "time": "Time",
+    "language": "Language",
+    "path": "Path",
+    "url": "URL",
+    "id": "ID",
+    "version": "Version"
+  },
+
+  "nav": {
+    "home": "Home",
+    "search": "Search",
+    "downloads": "Downloads",
+    "library": "Library",
+    "settings": "Settings",
+    "logs": "Logs",
+    "help": "Help",
+    "about": "About",
+    "plugins": "Plugins",
+    "sites": "Sites",
+    "users": "Users",
+    "logout": "Logout",
+    "login": "Login"
+  },
+
+  "search": {
+    "title": "Search",
+    "placeholder": "Search manga, webtoon, comic...",
+    "button": "Search",
+    "no_results": "No results for \"{query}\".",
+    "try_shorter": "Try a shorter query.",
+    "results_count": "{count} result(s) found across {sites} site(s).",
+    "results_count_one": "1 result found across {sites} site(s).",
+    "results_count_other": "{count} results found across {sites} site(s).",
+    "searching_in": "Searching in {sites}...",
+    "all_sites": "All sites",
+    "select_sites": "Select sites",
+    "language_filter": "Language",
+    "include_adult": "Include adult content",
+    "no_results_filtered": "No results. Try changing the filters.",
+    "loading_more": "Loading more results...",
+    "load_more": "Load more",
+    "retry_failed": "Retry failed sites",
+    "sites_failed": "{count} site(s) failed",
+    "site_failed": "Site {site} failed: {error}"
+  },
+
+  "downloads": {
+    "title": "Downloads",
+    "empty": "No downloads yet.",
+    "empty_hint": "Use search to find manga to download.",
+    "filter": {
+      "all": "All",
+      "running": "Running",
+      "pending": "Pending",
+      "paused": "Paused",
+      "done": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "status": {
+      "pending": "Pending",
+      "running": "Running",
+      "paused": "Paused",
+      "done": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "actions": {
+      "pause": "Pause",
+      "resume": "Resume",
+      "cancel": "Cancel",
+      "retry": "Retry",
+      "remove": "Remove",
+      "clear_completed": "Clear completed",
+      "pause_all": "Pause all",
+      "resume_all": "Resume all",
+      "cancel_all": "Cancel all"
+    },
+    "progress": {
+      "pages": "{done} / {total} pages",
+      "percent": "{percent}%",
+      "speed": "{speed} pages/s",
+      "eta": "Remaining: {eta}",
+      "elapsed": "Elapsed: {elapsed}",
+      "bytes": "{done} / {total}",
+      "current_chapter": "Chapter {number}",
+      "current_page": "Page {current} of {total}"
+    },
+    "toast": {
+      "completed": "{manga} · Chapter {chapter} completed",
+      "failed": "{manga} · Chapter {chapter} failed",
+      "cancelled": "{manga} · Chapter {chapter} cancelled"
+    },
+    "confirm": {
+      "cancel_task": "Cancel this download?",
+      "cancel_all": "Cancel all downloads? This cannot be undone.",
+      "remove_task": "Remove this download from the list?"
+    }
+  },
+
+  "library": {
+    "title": "Library",
+    "empty": "Your library is empty.",
+    "empty_hint": "Download manga to see them here.",
+    "search_placeholder": "Search in library...",
+    "filter": {
+      "all": "All",
+      "reading": "Reading",
+      "completed": "Completed",
+      "not_started": "Not started"
+    },
+    "sort": {
+      "title": "Title",
+      "author": "Author",
+      "chapters": "Chapters",
+      "last_read": "Last read",
+      "added": "Added"
+    },
+    "chapters_count": "{done} / {total} chapters",
+    "last_read": "Last read: chapter {chapter}, page {page}",
+    "not_started": "Not started",
+    "completed": "Completed",
+    "actions": {
+      "open": "Open",
+      "read": "Read",
+      "continue_reading": "Continue reading",
+      "update": "Check for new chapters",
+      "remove": "Remove from library",
+      "open_folder": "Open folder",
+      "reveal": "Reveal in file manager"
+    },
+    "confirm": {
+      "remove": "Remove \"{title}\" from the library?",
+      "remove_files": "Also delete the downloaded files?",
+      "keep_files": "Keep downloaded files"
+    }
+  },
+
+  "settings": {
+    "title": "Settings",
+    "sections": {
+      "general": "General",
+      "downloads": "Downloads",
+      "appearance": "Appearance",
+      "content": "Content",
+      "network": "Network",
+      "advanced": "Advanced",
+      "users": "Users"
+    },
+    "general": {
+      "language": "Language",
+      "theme": "Theme",
+      "start_minimized": "Start minimized",
+      "check_updates": "Check for updates",
+      "auto_update": "Auto-update"
+    },
+    "downloads": {
+      "directory": "Download directory",
+      "default_format": "Default format",
+      "max_concurrent": "Max concurrent downloads",
+      "max_pages_per_chapter": "Max pages per chapter",
+      "skip_existing": "Skip existing",
+      "verify_checksums": "Verify checksums"
+    },
+    "appearance": {
+      "theme": "Theme",
+      "theme_dark": "Dark",
+      "theme_light": "Light",
+      "theme_system": "System",
+      "accent_color": "Accent color",
+      "font_scale": "Font size"
+    },
+    "content": {
+      "allow_adult": "Allow adult content (18+)",
+      "respect_robots": "Respect robots.txt",
+      "content_filter_strict": "Strict content filter",
+      "preferred_language": "Preferred language"
+    },
+    "network": {
+      "http_timeout": "HTTP timeout (seconds)",
+      "max_retries": "Max retries",
+      "enable_playwright": "Enable Playwright",
+      "flaresolverr_url": "FlareSolverr URL",
+      "proxy_url": "Proxy URL"
+    },
+    "advanced": {
+      "log_level": "Log level",
+      "log_format": "Log format",
+      "open_config": "Open config folder",
+      "open_logs": "Open logs folder",
+      "reset_settings": "Reset settings",
+      "restart_required": "Restart required",
+      "restart_now": "Restart now"
+    },
+    "confirm": {
+      "reset": "Reset all settings? This cannot be undone.",
+      "restart": "Restart now? All running downloads will be interrupted."
+    }
+  },
+
+  "formats": {
+    "folder": "Folder",
+    "zip": "ZIP archive",
+    "cbz": "CBZ (Comic Book ZIP)",
+    "cb7": "CB7 (Comic Book 7z)",
+    "pdf": "PDF document",
+    "cbt": "CBT (Comic Book TAR)",
+    "cbr": "CBR (not supported)",
+    "cbr_reason": "RAR is proprietary and incompatible with GPL-3.0.",
+    "select_format": "Select format",
+    "recommended": "Recommended"
+  },
+
+  "errors": {
+    "generic": "An error occurred.",
+    "unknown": "Unknown error.",
+    "network": "Network error.",
+    "timeout": "Request timed out.",
+    "rate_limited": "Too many requests. Please try again later.",
+    "cloudflare": "Cloudflare is blocking the request.",
+    "not_found": "Not found.",
+    "unauthorized": "Unauthorized.",
+    "forbidden": "Access denied.",
+    "validation": "Invalid input.",
+    "config": "Configuration error.",
+    "parser": "Parser error.",
+    "parser_not_found": "Parser for site {site} not found.",
+    "parser_response": "Site {site} responded with status {status}.",
+    "parser_parse": "Failed to parse HTML from {site}.",
+    "download": "Download error.",
+    "download_failed": "Download of {chapter} failed: {error}",
+    "packaging": "Packaging error.",
+    "library": "Library error.",
+    "compliance": "Compliance error (robots.txt).",
+    "session": "Session error.",
+    "cookie": "Cookie encryption error.",
+    "plugin": "Plugin error.",
+    "image": "Image error.",
+    "invalid_state": "Invalid state transition from {from_state} to {to_state}.",
+    "empty_chapter": "Chapter {chapter} has no pages.",
+    "file_not_found": "File not found: {path}",
+    "permission_denied": "Permission denied: {path}",
+    "disk_full": "Not enough disk space.",
+    "retry_exhausted": "All {attempts} attempts failed.",
+    "cancelled": "Operation cancelled."
+  },
+
+  "auth": {
+    "login": "Login",
+    "logout": "Logout",
+    "register": "Register",
+    "username": "Username",
+    "email": "Email",
+    "password": "Password",
+    "confirm_password": "Confirm password",
+    "remember_me": "Remember me",
+    "forgot_password": "Forgot password?",
+    "reset_password": "Reset password",
+    "login_success": "Successfully logged in",
+    "login_failed": "Login failed",
+    "invalid_credentials": "Invalid username or password",
+    "logout_success": "Successfully logged out",
+    "session_expired": "Session expired. Please log in again.",
+    "register_success": "Account successfully created",
+    "password_mismatch": "Passwords do not match",
+    "password_too_short": "Password must be at least {min} characters",
+    "email_invalid": "Invalid email address",
+    "username_taken": "Username already taken",
+    "email_taken": "Email already registered"
+  },
+
+  "site": {
+    "capabilities": {
+      "supports_search": "Supports search",
+      "supports_manga_info": "Supports manga info",
+      "supports_chapters": "Supports chapters",
+      "supports_pages": "Supports pages",
+      "supports_download": "Supports download",
+      "requires_auth": "Requires login",
+      "requires_cloudflare_bypass": "Requires Cloudflare bypass",
+      "max_concurrent_downloads": "Max concurrent downloads",
+      "rate_limit": "Rate limit"
+    },
+    "health": {
+      "healthy": "Healthy",
+      "degraded": "Degraded",
+      "down": "Down",
+      "unknown": "Unknown"
+    },
+    "adult": "Adult content",
+    "general": "General content"
+  },
+
+  "plugins": {
+    "title": "Plugins",
+    "empty": "No plugins installed.",
+    "install": "Install plugin",
+    "uninstall": "Uninstall plugin",
+    "enable": "Enable plugin",
+    "disable": "Disable plugin",
+    "reload": "Reload plugin",
+    "version": "Version {version}",
+    "author": "By {author}",
+    "hooks": "Hooks: {hooks}",
+    "status_enabled": "Enabled",
+    "status_disabled": "Disabled",
+    "status_error": "Error",
+    "confirm": {
+      "uninstall": "Uninstall plugin \"{name}\"?"
+    }
+  },
+
+  "cli": {
+    "searching": "Searching for \"{query}\"...",
+    "found_results": "{count} result(s) found.",
+    "downloading": "Downloading {manga} · Chapter {chapter}...",
+    "download_complete": "Download completed: {path}",
+    "download_failed": "Download failed: {error}",
+    "sites_listed": "{count} site(s) listed.",
+    "config_valid": "Configuration valid.",
+    "config_invalid": "Configuration invalid: {error}",
+    "version": "NexusDL version {version}",
+    "help_footer": "Use --help for more information.",
+    "interrupted": "Operation interrupted."
+  },
+
+  "tui": {
+    "title": "NexusDL",
+    "search_hint": "Press / to search",
+    "downloads_hint": "Press d for downloads",
+    "library_hint": "Press l for library",
+    "quit_hint": "Press q to quit",
+    "help_hint": "Press ? for help",
+    "loading": "Loading...",
+    "ready": "Ready",
+    "quitting": "Quitting..."
+  },
+
+  "gui": {
+    "window_title": "NexusDL",
+    "minimize_to_tray": "Minimize to tray",
+    "restore": "Restore",
+    "quit": "Quit",
+    "tray": {
+      "open": "Open NexusDL",
+      "pause_all": "Pause all downloads",
+      "resume_all": "Resume all downloads",
+      "quit": "Quit"
+    }
+  },
+
+  "web": {
+    "title": "NexusDL",
+    "login_title": "Login to NexusDL",
+    "register_title": "Create account",
+    "dashboard_title": "Dashboard",
+    "search_title": "Search",
+    "downloads_title": "Downloads",
+    "library_title": "Library",
+    "settings_title": "Settings",
+    "pwa_install": "Install NexusDL",
+    "pwa_installed": "NexusDL is installed",
+    "connection_lost": "Connection lost",
+    "reconnecting": "Reconnecting...",
+    "connected": "Connected"
+  },
+
+  "notifications": {
+    "download_complete": "Download completed",
+    "download_failed": "Download failed",
+    "chapters_available": "{count} new chapter(s) available",
+    "chapters_available_one": "1 new chapter available",
+    "chapters_available_other": "{count} new chapters available",
+    "update_available": "Update available",
+    "site_down": "Site {site} is down",
+    "site_back": "Site {site} is back up",
+    "welcome": "Welcome to NexusDL",
+    "goodbye": "Goodbye"
+  },
+
+  "validation": {
+    "required": "This field is required.",
+    "min_length": "Must be at least {min} characters.",
+    "max_length": "Must be at most {max} characters.",
+    "min_value": "Must be at least {min}.",
+    "max_value": "Must be at most {max}.",
+    "pattern": "Invalid format.",
+    "email": "Invalid email address.",
+    "url": "Invalid URL.",
+    "path": "Invalid path.",
+    "integer": "Must be an integer.",
+    "number": "Must be a number.",
+    "boolean": "Must be true or false.",
+    "date": "Invalid date.",
+    "datetime": "Invalid date and time.",
+    "enum": "Must be one of: {values}.",
+    "unique": "This value is already used.",
+    "not_found": "Value not found."
+  }
+}

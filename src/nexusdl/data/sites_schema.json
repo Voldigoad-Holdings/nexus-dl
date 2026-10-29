@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Voldigoad-Holdings/nexus-dl/blob/main/src/nexusdl/data/sites_schema.json",
+  "title": "NexusDL Sites Configuration",
+  "description": "Schema for validating sites.yaml. See ADR-002 (no CBR) and ADR-004 (no secrets, HTTPS only).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sites"],
+  "properties": {
+    "config_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Format version for future migrations."
+    },
+    "sites": {
+      "type": "array",
+      "description": "List of supported sites.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/site" }
+    },
+    "aliases": {
+      "type": "object",
+      "description": "Short aliases pointing to site IDs (e.g. 'md' → 'mangadex').",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*$",
+        "minLength": 1,
+        "maxLength": 50
+      }
+    },
+    "categories": {
+      "type": "object",
+      "description": "Per-category overrides (fr, en, kr, adult).",
+      "additionalProperties": { "$ref": "#/$defs/category_overrides" }
+    },
+    "disabled_sites": {
+      "type": "array",
+      "description": "Sites to disable (removed from registry).",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*$"
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "domains",
+        "parser_class",
+        "language",
+        "adult",
+        "capabilities"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique site ID (snake_case, matches parser.site_id).",
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "minLength": 1,
+          "maxLength": 50,
+          "examples": ["mangadex", "sushiscan", "nhentai", "asura_scans"]
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable site name.",
+          "minLength": 1,
+          "maxLength": 100,
+          "examples": ["MangaDex", "SushiScan", "nhentai"]
+        },
+        "domains": {
+          "type": "array",
+          "description": "List of HTTPS domains. First is primary.",
+          "minItems": 1,
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://[a-zA-Z0-9.-]+(:[0-9]+)?(/.*)?$",
+            "maxLength": 2000,
+            "examples": ["https://mangadex.org", "https://api.mangadex.org"]
+          }
+        },
+        "parser_class": {
+          "type": "string",
+          "description": "Format 'module:Class' (importable via importlib).",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_.]*:[A-Z][a-zA-Z0-9_]*$",
+          "minLength": 10,
+          "maxLength": 200,
+          "examples": [
+            "nexusdl.parsers.en.mangadex:MangaDexParser",
+            "nexusdl.parsers.fr.sushiscan:SushiScanParser"
+          ]
+        },
+        "language": {
+          "type": "string",
+          "description": "Primary language (ISO 639-1 or 'adult').",
+          "enum": ["fr", "en", "ja", "ko", "zh", "es", "pt", "it", "de", "ru", "ar", "adult", "unknown"]
+        },
+        "adult": {
+          "type": "boolean",
+          "description": "Site hosts adult content (18+). Filtered by NEXUSDL_ALLOW_ADULT."
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "default_headers": {
+          "type": "object",
+          "description": "Default HTTP headers (no Cookie, no Authorization).",
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "propertyNames": {
+            "not": { "enum": ["Cookie", "Authorization", "Proxy-Authorization"] }
+          }
+        },
+        "cookies_required": {
+          "type": "array",
+          "description": "Cookie NAMES required (values live in .env).",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "maxLength": 100
+          },
+          "uniqueItems": true,
+          "examples": [["cf_clearance", "cf_bm"]]
+        },
+        "_comment": {
+          "type": "string",
+          "description": "Free-form comment (ignored by parsers).",
+          "maxLength": 500
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supports_search",
+        "supports_manga_info",
+        "supports_chapters",
+        "supports_pages",
+        "supports_download",
+        "requires_auth",
+        "requires_cloudflare_bypass",
+        "max_concurrent_downloads",
+        "default_rate_limit_per_second"
+      ],
+      "properties": {
+        "supports_search": {
+          "type": "boolean",
+          "default": true
+        },
+        "supports_manga_info": {
+          "type": "boolean",
+          "default": true
+        },
+        "supports_chapters": {
+          "type": "boolean",
+          "default": true
+        },
+        "supports_pages": {
+          "type": "boolean",
+          "default": true
+        },
+        "supports_download": {
+          "type": "boolean",
+          "default": true
+        },
+        "requires_auth": {
+          "type": "boolean",
+          "default": false
+        },
+        "requires_cloudflare_bypass": {
+          "type": "boolean",
+          "default": false
+        },
+        "max_concurrent_downloads": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 4
+        },
+        "default_rate_limit_per_second": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "default": 2.0
+        }
+      }
+    },
+    "category_overrides": {
+      "type": "object",
+      "description": "Overrides applied to all sites of a category.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": ["boolean", "null"],
+          "default": null,
+          "description": "null = inherit from NEXUSDL_ALLOW_ADULT."
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_concurrent_downloads": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32
+            },
+            "default_rate_limit_per_second": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 100
+            }
+          }
+        },
+        "default_headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "cookies_required": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "config_version": 1,
+      "sites": [
+        {
+          "id": "mangadex",
+          "name": "MangaDex",
+          "domains": ["https://mangadex.org", "https://api.mangadex.org"],
+          "parser_class": "nexusdl.parsers.en.mangadex:MangaDexParser",
+          "language": "en",
+          "adult": false,
+          "capabilities": {
+            "supports_search": true,
+            "supports_manga_info": true,
+            "supports_chapters": true,
+            "supports_pages": true,
+            "supports_download": true,
+            "requires_auth": false,
+            "requires_cloudflare_bypass": false,
+            "max_concurrent_downloads": 4,
+            "default_rate_limit_per_second": 4.0
+          },
+          "default_headers": {},
+          "cookies_required": []
+        }
+      ],
+      "aliases": { "md": "mangadex" },
+      "categories": {
+        "fr": {
+          "default_headers": { "Accept-Language": "fr-FR,fr;q=0.9" }
+        }
+      },
+      "disabled_sites": []
+    }
+  ]
+}

@@ -1,0 +1,580 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Default configuration
+#
+# File: src/nexusdl/data/default_config.yaml
+#
+# This file contains the DEFAULT values for all runtime configuration.
+# It is loaded by `core/config.py:Settings` (Pydantic Settings v2) and
+# then OVERRIDDEN by:
+#
+#   1. config/config.yaml (user overrides, optional)
+#   2. .env / NEXUSDL_* env vars (secrets + deployment)
+#   3. CLI args (highest precedence)
+#
+# ⚠️  DO NOT put secrets here (API keys, JWT secrets, passwords).
+#     These MUST come from .env (see ADR-004).
+#
+# ⚠️  DO NOT put site URLs here (https://mangadex.org, etc.).
+#     These MUST live in data/sites.yaml (see ADR-004).
+#
+# ⚠️  Paths are resolved by `platformdirs` when set to `null`.
+#     Override them in .env (NEXUSDL_DOWNLOAD_DIR, etc.).
+#
+# Schema: validated by `core/config.py:Settings` (Pydantic v2 strict).
+# ════════════════════════════════════════════════════════════════════
+
+#: Configuration format version (for future migrations).
+config_version: 1
+
+
+# ────────────────────────────────────────────────────────────────────
+# APPLICATION
+# ────────────────────────────────────────────────────────────────────
+app:
+  #: Application name (overridden by NEXUSDL_APP_NAME).
+  name: NexusDL
+
+  #: Environment: dev | staging | prod (overridden by NEXUSDL_APP_ENVIRONMENT).
+  environment: dev
+
+  #: Debug mode (verbose logs, no cache). NEVER true in prod.
+  debug: false
+
+  #: Default language for the interface (ISO 639-1).
+  language: en
+
+  #: Enable telemetry? (always false in NexusDL — no tracking).
+  telemetry: false
+
+
+# ────────────────────────────────────────────────────────────────────
+# HTTP
+# ────────────────────────────────────────────────────────────────────
+http:
+  #: Timeout per request (seconds).
+  timeout_seconds: 30.0
+
+  #: Max retries (tenacity) for failed requests.
+  max_retries: 3
+
+  #: Retry backoff base (seconds, exponential).
+  retry_backoff_seconds: 2.0
+
+  #: Retry jitter ratio (0.0 to 1.0).
+  retry_jitter_ratio: 0.2
+
+  #: Follow redirects?
+  follow_redirects: true
+
+  #: Verify SSL certificates? (NEVER false in prod).
+  verify_ssl: true
+
+  #: Enable HTTP/2 (multiplexing).
+  http2: true
+
+  #: Default User-Agent (null = rotate from user_agents.txt).
+  user_agent: null
+
+  #: Respect robots.txt? (true = enforce, false = user responsibility).
+  respect_robots_txt: true
+
+  #: Cache robots.txt (hours).
+  robots_txt_cache_hours: 24
+
+
+# ────────────────────────────────────────────────────────────────────
+# RATE LIMITING
+# ────────────────────────────────────────────────────────────────────
+rate_limits:
+  #: Default rate limit per site (requests/second).
+  default_rate_limit_per_second: 2.0
+
+  #: Max concurrent downloads (global).
+  max_concurrent_downloads: 3
+
+  #: Max concurrent page downloads per chapter.
+  max_concurrent_pages_per_chapter: 8
+
+  #: Per-site overrides (site_id → rate limit).
+  per_site_overrides: {}
+
+
+# ────────────────────────────────────────────────────────────────────
+# SESSION (HTTP cache, cookies, circuit breaker)
+# ────────────────────────────────────────────────────────────────────
+session:
+  #: Enable HTTP cache (hishel).
+  cache_enabled: true
+
+  #: Cache TTL (seconds) if no Cache-Control header.
+  cache_ttl_seconds: 3600
+
+  #: Cache max size (MB, 0 = unlimited).
+  cache_max_size_mb: 500
+
+  #: Enable circuit breaker (per site).
+  circuit_breaker_enabled: true
+
+  #: Circuit breaker: failures before OPEN.
+  circuit_breaker_threshold: 5
+
+  #: Circuit breaker: seconds before HALF_OPEN.
+  circuit_breaker_timeout_seconds: 60
+
+  #: Cookie auto-refresh (for Cloudflare sites).
+  cookie_auto_refresh: true
+
+  #: Cookie refresh interval (minutes).
+  cookie_refresh_interval_minutes: 30
+
+
+# ────────────────────────────────────────────────────────────────────
+# STORAGE (paths — null = platformdirs)
+# ────────────────────────────────────────────────────────────────────
+storage:
+  #: Download directory (null = ~/Downloads/NexusDL).
+  download_dir: null
+
+  #: Temp directory (null = system temp / nexusdl).
+  temp_dir: null
+
+  #: Library DB path (null = user_data_dir / library.db).
+  library_db_path: null
+
+  #: Cookie storage path (null = user_data_dir / cookies.enc).
+  cookie_storage_path: null
+
+  #: Logs directory (null = user_log_dir).
+  logs_dir: null
+
+  #: Max disk usage for downloads (GB, null = unlimited).
+  max_disk_usage_gb: null
+
+
+# ────────────────────────────────────────────────────────────────────
+# LOGGING
+# ────────────────────────────────────────────────────────────────────
+logging:
+  #: Log level: TRACE | DEBUG | INFO | WARNING | ERROR | CRITICAL.
+  level: INFO
+
+  #: Log format: json | text | pretty.
+  format: pretty
+
+  #: Rotation size or time ("10 MB", "1 day", "00:00").
+  rotation: "10 MB"
+
+  #: Retention ("30 days", "1 week").
+  retention: "30 days"
+
+  #: Compress rotated logs?
+  compress: true
+
+  #: Log HTTP requests? (verbose, debug only).
+  log_http_requests: false
+
+  #: Log SQL queries? (verbose, debug only).
+  log_sql_queries: false
+
+
+# ────────────────────────────────────────────────────────────────────
+# CONTENT
+# ────────────────────────────────────────────────────────────────────
+content:
+  #: Allow violent/gore content (default: true).
+  allow_violent: true
+
+  #: Strict content filter (whitelist genres).
+  content_filter_strict: false
+
+  #: Allowed genres (if content_filter_strict=true).
+  allowed_genres: []
+
+  #: Blocked genres (if content_filter_strict=false).
+  blocked_genres: []
+
+  #: Preferred language for multi-language mangas.
+  preferred_language: en
+
+
+# ────────────────────────────────────────────────────────────────────
+# DOWNLOADER
+# ────────────────────────────────────────────────────────────────────
+downloader:
+  #: Default packaging format: FOLDER | ZIP | CBZ | CB7 | PDF | CBT.
+  default_format: CBZ
+
+  #: Skip existing files (resume).
+  skip_existing: true
+
+  #: Overwrite existing files (dangerous).
+  overwrite: false
+
+  #: Verify SHA-256 checksums (deduplication).
+  verify_checksums: true
+
+  #: Default priority: LOW | NORMAL | HIGH.
+  priority: NORMAL
+
+  #: Retry failed pages?
+  retry_failed_pages: true
+
+  #: Max retry attempts per page.
+  retry_max_attempts: 3
+
+  #: Retry backoff base (seconds).
+  retry_backoff_seconds: 2.0
+
+  #: Retry jitter ratio.
+  retry_jitter_ratio: 0.2
+
+  #: Resume partial downloads (.part files).
+  resume_partial: true
+
+
+# ────────────────────────────────────────────────────────────────────
+# PACKAGING
+# ────────────────────────────────────────────────────────────────────
+packaging:
+  #: ZIP compression level (0-9, 6 = default).
+  zip_compression_level: 6
+
+  #: 7z compression level (0-9, 7 = default).
+  cb7_compression_level: 7
+
+  #: PDF compression: lossless | jpeg | webp.
+  pdf_compression: lossless
+
+  #: PDF image quality (1-100, if lossy).
+  pdf_image_quality: 85
+
+  #: Include ComicInfo.xml (recommended).
+  include_comic_info_xml: true
+
+  #: Rename pages to 001.jpg, 002.jpg, etc.
+  rename_pages: true
+
+  #: Page filename zero-padding (3 = 001).
+  page_zero_padding: 3
+
+  #: Delete temp files after packaging.
+  delete_temp_after_packaging: true
+
+  #: Generate cover thumbnail.
+  thumbnail: true
+
+
+# ────────────────────────────────────────────────────────────────────
+# IMAGE
+# ────────────────────────────────────────────────────────────────────
+image:
+  #: Convert images to: null | jpeg | webp | avif.
+  convert_to: null
+
+  #: Image quality (1-100, if conversion).
+  quality: 85
+
+  #: Optimize images (lossless).
+  optimize: true
+
+  #: Strip EXIF/GPS metadata (privacy).
+  strip_metadata: true
+
+  #: Max image dimension (null = no resize).
+  max_dimension: null
+
+  #: Validate images (reject HTML pages, corrupted files).
+  validate: true
+
+  #: Min image size (bytes, 0 = no min).
+  min_size_bytes: 1024
+
+  #: Max image size (bytes, 0 = no max).
+  max_size_bytes: 10485760
+
+
+# ────────────────────────────────────────────────────────────────────
+# PLAYWRIGHT (for JS-heavy sites, Cloudflare)
+# ────────────────────────────────────────────────────────────────────
+playwright:
+  #: Headless mode.
+  headless: true
+
+  #: Max concurrent browser contexts.
+  max_contexts: 4
+
+  #: Context timeout (seconds).
+  context_timeout_seconds: 30
+
+  #: Navigation timeout (seconds).
+  navigation_timeout_seconds: 45
+
+  #: Block images (faster parsing).
+  block_images: false
+
+  #: Block media (video/audio).
+  block_media: true
+
+  #: Block fonts.
+  block_fonts: true
+
+  #: Viewport width.
+  viewport_width: 1280
+
+  #: Viewport height.
+  viewport_height: 1920
+
+  #: User-Agent (null = rotate from user_agents.txt).
+  user_agent: null
+
+  #: Locale (e.g. en-US).
+  locale: en-US
+
+  #: Timezone (e.g. UTC).
+  timezone: UTC
+
+
+# ────────────────────────────────────────────────────────────────────
+# FLARESOLVERR (alternative to Playwright for Cloudflare)
+# ────────────────────────────────────────────────────────────────────
+flaresolverr:
+  #: Timeout per request (seconds).
+  timeout_seconds: 60
+
+  #: Max concurrent requests.
+  max_concurrent_requests: 2
+
+  #: Retry on failure.
+  retry_on_failure: true
+
+  #: Max retry attempts.
+  retry_max_attempts: 2
+
+
+# ────────────────────────────────────────────────────────────────────
+# PROXY
+# ────────────────────────────────────────────────────────────────────
+proxy:
+  #: Enable proxy rotation.
+  enabled: false
+
+  #: Rotation strategy: round_robin | random | least_used.
+  rotation_strategy: round_robin
+
+  #: Health check interval (seconds).
+  health_check_interval_seconds: 300
+
+  #: Max failures before removal.
+  max_failures_before_removal: 3
+
+  #: Timeout per request (seconds).
+  timeout_seconds: 10
+
+  #: Retry on failure.
+  retry_on_failure: true
+
+
+# ────────────────────────────────────────────────────────────────────
+# LIBRARY
+# ────────────────────────────────────────────────────────────────────
+library:
+  #: Auto-scan library on startup.
+  auto_scan_on_startup: true
+
+  #: Scan interval (minutes, 0 = never).
+  scan_interval_minutes: 60
+
+  #: Auto-update mangas (check for new chapters).
+  auto_update_enabled: true
+
+  #: Auto-update interval (hours).
+  auto_update_interval_hours: 24
+
+  #: Enable FTS5 full-text search.
+  fts5_enabled: true
+
+  #: Sync reading progress across devices.
+  reading_progress_sync: true
+
+  #: Deduplicate by SHA-256 checksum.
+  deduplicate_by_checksum: true
+
+  #: Generate thumbnails.
+  generate_thumbnails: true
+
+  #: Thumbnail size (pixels).
+  thumbnail_size: 256
+
+
+# ────────────────────────────────────────────────────────────────────
+# API (REST + WebSocket)
+# ────────────────────────────────────────────────────────────────────
+api:
+  #: Bind host (0.0.0.0 = all interfaces, 127.0.0.1 = local only).
+  host: 127.0.0.1
+
+  #: Bind port.
+  port: 8000
+
+  #: Number of uvicorn workers (> 1 requires PostgreSQL).
+  workers: 1
+
+  #: Enable Swagger/ReDoc (NEVER true in prod).
+  enable_docs: false
+
+  #: Allow anonymous reads (GUEST role).
+  allow_anonymous: false
+
+  #: Allow registration (false after first admin).
+  allow_registration: false
+
+  #: Rate limit per IP (requests/minute).
+  rate_limit_per_minute: 60
+
+  #: Request ID header.
+  request_id_header: X-Request-ID
+
+  #: Max request size (MB).
+  max_request_size_mb: 100
+
+
+# ────────────────────────────────────────────────────────────────────
+# WEBSOCKET
+# ────────────────────────────────────────────────────────────────────
+websocket:
+  #: Enable WebSocket.
+  enabled: true
+
+  #: Server ping interval (seconds).
+  ping_interval_seconds: 30
+
+  #: Client ping timeout (seconds).
+  ping_timeout_seconds: 10
+
+  #: Max concurrent connections.
+  max_connections: 100
+
+  #: Max message size (KB).
+  max_message_size_kb: 1024
+
+  #: Progress update throttle (Hz).
+  progress_throttle_hz: 10
+
+
+# ────────────────────────────────────────────────────────────────────
+# TUI
+# ────────────────────────────────────────────────────────────────────
+tui:
+  #: Theme: dark | light.
+  theme: dark
+
+  #: Refresh rate (Hz).
+  refresh_rate_hz: 10
+
+  #: Show progress bars.
+  show_progress_bars: true
+
+  #: Enable mouse support.
+  mouse_enabled: true
+
+  #: Vim keybindings (hjkl for navigation).
+  vim_keys: true
+
+
+# ────────────────────────────────────────────────────────────────────
+# GUI
+# ────────────────────────────────────────────────────────────────────
+gui:
+  #: Theme: dark | light | system.
+  theme: system
+
+  #: Window width (pixels).
+  window_width: 1280
+
+  #: Window height (pixels).
+  window_height: 800
+
+  #: Remember window position.
+  remember_window_position: true
+
+  #: Start minimized to tray.
+  start_minimized: false
+
+  #: Enable system tray icon.
+  tray_enabled: true
+
+  #: Enable desktop notifications.
+  notifications: true
+
+  #: Font scale (0.8 to 1.5).
+  font_scale: 1.0
+
+
+# ────────────────────────────────────────────────────────────────────
+# PLUGINS
+# ────────────────────────────────────────────────────────────────────
+plugins:
+  #: Enable plugin system.
+  enabled: true
+
+  #: Auto-discover plugins on startup.
+  auto_discover: true
+
+  #: Install directory (null = platformdirs / plugins).
+  install_dir: null
+
+  #: Allow plugins to access network.
+  allow_network: true
+
+  #: Allow plugins to access filesystem.
+  allow_filesystem: true
+
+  #: Plugin execution timeout (seconds).
+  timeout_seconds: 30
+
+  #: Max memory per plugin (MB).
+  max_memory_mb: 256
+
+
+# ────────────────────────────────────────────────────────────────────
+# PERFORMANCE
+# ────────────────────────────────────────────────────────────────────
+performance:
+  #: GC threshold (Python).
+  gc_threshold: 700
+
+  #: Use uvloop (faster asyncio on Linux/macOS).
+  uvloop: true
+
+  #: Use orjson (faster JSON).
+  use_orjson: true
+
+  #: Batch size for page downloads.
+  batch_page_downloads: 8
+
+  #: Prefetch pages ahead.
+  prefetch_pages: 3
+
+  #: Streaming chunk size (KB).
+  streaming_chunk_size_kb: 64
+
+
+# ────────────────────────────────────────────────────────────────────
+# DEVELOPMENT
+# ────────────────────────────────────────────────────────────────────
+#: ⚠️  Ignored in prod (app.environment=prod).
+development:
+  #: Reload on file change.
+  reload_on_change: true
+
+  #: Enable profiler.
+  profile_enabled: false
+
+  #: Mock network (use fixtures).
+  mock_network: false
+
+  #: Enable debug endpoints (/api/v1/_debug/*).
+  debug_endpoints: false
+
+  #: Seed DB on startup with fake mangas.
+  seed_db_on_startup: false

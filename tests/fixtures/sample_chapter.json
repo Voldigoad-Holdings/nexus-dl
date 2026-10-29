@@ -1,0 +1,36 @@
+{
+  "_fixture_version": 1,
+  "_description": "Sample Chapter fixture for NexusDL tests. Represents One Piece chapter 1 (Romance Dawn) from MangaDex. All fields from core/models/chapter.py are present. Pages are 3 (representative, not the full 53). No secrets, no cookies, no tokens.",
+
+  "id": "b3e5d7a9c1f2e4d6",
+  "manga_id": "a1b2c3d4e5f6a7b8",
+  "source_id": "e5f6g7h8-i9j0-1k2l-3m4n-5o6p7q8r9s0t",
+  "title": "Romance Dawn",
+  "number": 1.0,
+  "volume": 1,
+  "language": "en",
+  "pages_count": 3,
+  "published_at": "1997-07-22T00:00:00Z",
+  "url": "https://mangadex.org/chapter/e5f6g7h8-i9j0-1k2l-3m4n-5o6p7q8r9s0t",
+
+  "pages": [
+    {
+      "index": 0,
+      "url": "https://uploads.mangadex.org/data/b3e5d7a9c1f2e4d6/001-abc123def456.png",
+      "filename": "001.png",
+      "checksum": "sha256:3a7bd3e2360a3d29a4b2e3c8b5f8e7d1c2b3a4d5e6f7a8b9c0d1e2f3a4b5c6d7"
+    },
+    {
+      "index": 1,
+      "url": "https://uploads.mangadex.org/data/b3e5d7a9c1f2e4d6/002-def456abc789.png",
+      "filename": "002.png",
+      "checksum": "sha256:4b8ce4f3471b4e30b5c3f4d9c6a9f8e2d3c4b5e6f7a8b9c0d1e2f3a4b5c6d7e8"
+    },
+    {
+      "index": 2,
+      "url": "https://uploads.mangadex.org/data/b3e5d7a9c1f2e4d6/003-ghi789def012.png",
+      "filename": "003.png",
+      "checksum": null
+    }
+  ]
+}

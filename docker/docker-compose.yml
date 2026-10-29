@@ -1,0 +1,446 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Docker Compose (PRODUCTION)
+#
+# Fichier : docker/docker-compose.yml
+#
+# Stack complète de production avec :
+#   - Caddy (reverse proxy + HTTPS auto via Let's Encrypt)
+#   - NexusDL Web (FastAPI + Next.js + Nginx)
+#   - Redis (cache partagé)
+#   - FlareSolverr (optionnel — profile flaresolverr)
+#   - Watchtower (mises à jour auto — profile auto-update)
+#   - Backups quotidiens (profile backup)
+#
+# Usage :
+#   # Prérequis
+#   cp .env.example .env
+#   # Éditer .env (secrets + URLs)
+#   chmod 600 .env
+#
+#   # Démarrer
+#   docker compose -f docker/docker-compose.yml up -d
+#
+#   # Avec FlareSolverr
+#   docker compose -f docker/docker-compose.yml --profile flaresolverr up -d
+#
+#   # Avec Watchtower (auto-update)
+#   docker compose -f docker/docker-compose.yml --profile auto-update up -d
+#
+#   # Avec backups quotidiens
+#   docker compose -f docker/docker-compose.yml --profile backup up -d
+#
+#   # Tout
+#   docker compose -f docker/docker-compose.yml \
+#       --profile flaresolverr --profile auto-update --profile backup up -d
+#
+#   # Logs
+#   docker compose -f docker/docker-compose.yml logs -f
+#
+#   # Stop
+#   docker compose -f docker/docker-compose.yml down
+#
+#   # Stop + volumes (⚠️ perte de données)
+#   docker compose -f docker/docker-compose.yml down -v
+#
+# Architecture réseau :
+#   Internet → Caddy (80/443) → nexusdl-web (8080)
+#                                   ├── Nginx → FastAPI (8000)
+#                                   ├── Nginx → Next.js (3000)
+#                                   └── Redis (6379, internal)
+#
+# Accès : https://<NEXUSDL_PUBLIC_URL>
+#
+# ⚠️  NEXUSDL_PUBLIC_URL DOIT être un domaine réel (pas localhost)
+# ⚠️  Les ports 80/443 DOIVENT être libres sur l'hôte
+# ⚠️  Caddy obtient les certs automatiquement (DNS doit pointer)
+# ════════════════════════════════════════════════════════════════════
+
+name: nexusdl
+
+# ────────────────────────────────────────────────────────────────────
+# ANCRES (DRY)
+# ────────────────────────────────────────────────────────────────────
+x-common-env: &common-env
+  TZ: UTC
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-restart: &restart-policy
+  restart: always
+
+x-healthcheck-nexusdl: &healthcheck-nexusdl
+  test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/api/v1/health"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 60s
+
+x-security: &security-opt
+  security_opt:
+    - no-new-privileges:true
+
+
+# ────────────────────────────────────────────────────────────────────
+# SERVICES
+# ────────────────────────────────────────────────────────────────────
+services:
+
+  # ════════════════════════════════════════════════════════════════
+  # CADDY — Reverse proxy + HTTPS auto (Let's Encrypt)
+  # ════════════════════════════════════════════════════════════════
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: nexusdl-caddy
+    <<: [*restart-policy, *security-opt]
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"                # HTTP/3 (QUIC)
+
+    # Caddy a besoin de bind 80/443 (< 1024) en non-root
+    cap_add:
+      - NET_BIND_SERVICE
+    cap_drop:
+      - ALL
+
+    environment:
+      <<: *common-env
+      # Domaines gérés par Caddy (comma-separated)
+      NEXUSDL_PUBLIC_URL: ${NEXUSDL_PUBLIC_URL:?NEXUSDL_PUBLIC_URL is required}
+      NEXUSDL_API_BASE_URL: ${NEXUSDL_API_BASE_URL:?NEXUSDL_API_BASE_URL is required}
+      # Email pour Let's Encrypt
+      ACME_EMAIL: ${NEXUSDL_ACME_EMAIL:?NEXUSDL_ACME_EMAIL is required}
+      # Staging (test) — mettre "false" en prod
+      ACME_STAGING: ${NEXUSDL_ACME_STAGING:-false}
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+
+    networks:
+      - public
+
+    depends_on:
+      nexusdl-web:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging: *default-logging
+
+    # Graceful shutdown (laisse les connexions finir)
+    stop_grace_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+
+  # ════════════════════════════════════════════════════════════════
+  # NEXUSDL-WEB — FastAPI + Next.js + Nginx
+  # ════════════════════════════════════════════════════════════════
+  nexusdl-web:
+    image: ghcr.io/voldigoad-holdings/nexus-dl-web:${NEXUSDL_VERSION:-latest}
+    container_name: nexusdl-web
+    <<: [*restart-policy, *security-opt]
+
+    # Port interne seulement (Caddy fait le reverse proxy)
+    expose:
+      - "8080"
+
+    environment:
+      <<: *common-env
+      # App
+      NEXUSDL_APP_ENVIRONMENT: prod
+      NEXUSDL_LOG_LEVEL: INFO
+      NEXUSDL_LOG_FORMAT: json
+      NEXUSDL_PUBLIC_URL: ${NEXUSDL_PUBLIC_URL}
+      NEXUSDL_API_BASE_URL: ${NEXUSDL_API_BASE_URL}
+      NEXUSDL_FRONTEND_URL: ${NEXUSDL_FRONTEND_URL}
+      NEXUSDL_API_CORS_ORIGINS: '["${NEXUSDL_PUBLIC_URL}"]'
+      NEXUSDL_API_ENABLE_DOCS: "false"
+      NEXUSDL_API_ALLOW_REGISTRATION: ${NEXUSDL_API_ALLOW_REGISTRATION:-false}
+      # Content
+      NEXUSDL_ALLOW_ADULT: ${NEXUSDL_ALLOW_ADULT:-false}
+      NEXUSDL_RESPECT_ROBOTS_TXT: ${NEXUSDL_RESPECT_ROBOTS_TXT:-true}
+      # Chemins
+      NEXUSDL_CONFIG_DIR: /config
+      NEXUSDL_DATA_DIR: /data
+      NEXUSDL_LOGS_DIR: /data/logs
+      NEXUSDL_DOWNLOAD_DIR: /downloads
+      NEXUSDL_TEMP_DIR: /tmp/nexusdl
+      NEXUSDL_LIBRARY_DB_PATH: /data/library.db
+      NEXUSDL_COOKIE_STORAGE_PATH: /data/cookies.enc
+      # Database
+      NEXUSDL_DATABASE_URL: sqlite+aiosqlite:////data/library.db
+      # Redis (toujours activé en prod)
+      NEXUSDL_REDIS_URL: redis://:${NEXUSDL_REDIS_PASSWORD:?NEXUSDL_REDIS_PASSWORD is required}@redis:6379/0
+      # Rate limits
+      NEXUSDL_MAX_CONCURRENT_DOWNLOADS: ${NEXUSDL_MAX_CONCURRENT_DOWNLOADS:-3}
+      NEXUSDL_MAX_CONCURRENT_PAGES_PER_CHAPTER: ${NEXUSDL_MAX_CONCURRENT_PAGES_PER_CHAPTER:-8}
+      NEXUSDL_DEFAULT_RATE_LIMIT_PER_SECOND: ${NEXUSDL_DEFAULT_RATE_LIMIT_PER_SECOND:-2.0}
+      # Playwright
+      NEXUSDL_PLAYWRIGHT_ENABLED: ${NEXUSDL_PLAYWRIGHT_ENABLED:-false}
+      # FlareSolverr (si profile activé)
+      NEXUSDL_FLARESOLVERR_URL: ${NEXUSDL_FLARESOLVERR_URL:-}
+      # Workers uvicorn
+      UVICORN_WORKERS: ${NEXUSDL_UVICORN_WORKERS:-2}
+
+    # Charge .env (secrets)
+    env_file:
+      - path: ../.env
+        required: true
+
+    volumes:
+      - nexusdl_config:/config
+      - nexusdl_data:/data
+      - nexusdl_downloads:/downloads
+      - /tmp/nexusdl
+
+    networks:
+      - public
+      - internal
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+    healthcheck: *healthcheck-nexusdl
+
+    logging: *default-logging
+
+    stop_grace_period: 60s
+
+    # Filesystem read-only (sauf volumes + tmpfs)
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ════════════════════════════════════════════════════════════════
+  # REDIS — Cache partagé + rate limiter distribué
+  # ════════════════════════════════════════════════════════════════
+  redis:
+    image: redis:7.2-alpine
+    container_name: nexusdl-redis
+    <<: [*restart-policy, *security-opt]
+
+    # Redis en interne uniquement (pas de port exposé)
+    expose:
+      - "6379"
+
+    command: >
+      redis-server
+        --requirepass ${NEXUSDL_REDIS_PASSWORD:?NEXUSDL_REDIS_PASSWORD is required}
+        --appendonly yes
+        --appendfsync everysec
+        --maxmemory ${NEXUSDL_REDIS_MAXMEMORY:-256mb}
+        --maxmemory-policy allkeys-lru
+        --save 900 1
+        --save 300 10
+        --save 60 10000
+
+    environment:
+      <<: *common-env
+
+    volumes:
+      - redis_data:/data
+
+    networks:
+      - internal
+
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "redis-cli -a \"$${NEXUSDL_REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    logging: *default-logging
+
+    stop_grace_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # ════════════════════════════════════════════════════════════════
+  # FLARESOLVERR — Cloudflare bypass (optionnel)
+  # ════════════════════════════════════════════════════════════════
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: nexusdl-flaresolverr
+    profiles: [flaresolverr]
+    <<: [*restart-policy, *security-opt]
+
+    environment:
+      LOG_LEVEL: ${NEXUSDL_FLARESOLVERR_LOG_LEVEL:-info}
+      LOG_HTML: "false"
+      CAPTCHA_SOLVER: none
+      TZ: UTC
+
+    expose:
+      - "8191"
+
+    networks:
+      - internal
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8191/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging: *default-logging
+
+    stop_grace_period: 30s
+
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ════════════════════════════════════════════════════════════════
+  # WATCHTOWER — Mises à jour automatiques (optionnel)
+  # ════════════════════════════════════════════════════════════════
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: nexusdl-watchtower
+    profiles: [auto-update]
+
+    environment:
+      <<: *common-env
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_LABEL_ENABLE: "true"        # ← update seulement les containers labellisés
+      WATCHTOWER_SCHEDULE: "0 0 4 * * *"     # 4h du matin
+      WATCHTOWER_NOTIFICATIONS: ${WATCHTOWER_NOTIFICATIONS:-}
+      WATCHTOWER_NOTIFICATION_URL: ${WATCHTOWER_NOTIFICATION_URL:-}
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    restart: unless-stopped
+
+    logging: *default-logging
+
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ════════════════════════════════════════════════════════════════
+  # BACKUP — Sauvegardes quotidiennes (optionnel)
+  # ════════════════════════════════════════════════════════════════
+  backup:
+    image: alpine:3.20
+    container_name: nexusdl-backup
+    profiles: [backup]
+
+    environment:
+      <<: *common-env
+      BACKUP_RETENTION_DAYS: ${NEXUSDL_BACKUP_RETENTION_DAYS:-7}
+      BACKUP_SCHEDULE: ${NEXUSDL_BACKUP_SCHEDULE:-0 3 * * *}
+
+    volumes:
+      - nexusdl_config:/config:ro
+      - nexusdl_data:/data:ro
+      - nexusdl_backups:/backups
+
+    # Loop : attend l'heure du backup, exécute, dors 24h
+    command: >
+      sh -c "
+        apk add --no-cache tzdata >/dev/null 2>&1;
+        while true; do
+          TS=$$(date +%Y%m%d-%H%M%S);
+          echo \"[backup] Starting backup $$TS\";
+          tar czf /backups/nexusdl-$$TS.tar.gz -C / data config;
+          echo \"[backup] Backup complete: /backups/nexusdl-$$TS.tar.gz\";
+          find /backups -name 'nexusdl-*.tar.gz' -mtime +$${BACKUP_RETENTION_DAYS} -delete;
+          echo \"[backup] Cleaned backups older than $${BACKUP_RETENTION_DAYS} days\";
+          sleep 86400;
+        done
+      "
+
+    restart: unless-stopped
+
+    logging: *default-logging
+
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+
+# ────────────────────────────────────────────────────────────────────
+# VOLUMES NOMMÉS
+# ────────────────────────────────────────────────────────────────────
+volumes:
+  # Caddy (certificats Let's Encrypt, config)
+  caddy_data:
+    name: nexusdl_caddy_data
+  caddy_config:
+    name: nexusdl_caddy_config
+  caddy_logs:
+    name: nexusdl_caddy_logs
+
+  # NexusDL (persistant)
+  nexusdl_config:
+    name: nexusdl_config
+  nexusdl_data:
+    name: nexusdl_data
+  nexusdl_downloads:
+    name: nexusdl_downloads
+
+  # Redis (AOF persistant)
+  redis_data:
+    name: nexusdl_redis_data
+
+  # Backups
+  nexusdl_backups:
+    name: nexusdl_backups
+
+
+# ────────────────────────────────────────────────────────────────────
+# RÉSEAUX
+# ────────────────────────────────────────────────────────────────────
+networks:
+  # Public : Caddy ↔ Web (exposé à Internet via Caddy)
+  public:
+    name: nexusdl_public
+    driver: bridge
+
+  # Internal : Web ↔ Redis ↔ FlareSolverr (pas d'accès Internet)
+  internal:
+    name: nexusdl_internal
+    driver: bridge
+    internal: true                      # ← pas d'accès Internet

@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Voldigoad-Holdings
+#
+# Sample site configuration for NexusDL tests.
+# Represents MangaDex (English, general audience, API-based).
+#
+# Consistency requirements:
+#   - id                == sample_manga.json: site
+#   - language          == sample_manga.json: language
+#   - adult             == sample_manga.json: content_rating != "safe"
+#   - parser_class      module:Class (importable)
+#   - domains           ≥ 1 URL with https://
+#   - capabilities      9 fields (all present)
+#   - cookies_required  names only (never values — ADR-004)
+#
+# Validated by:
+#   - tests/fixtures/test_consistency.py
+#   - tests/unit/core/test_models/test_site.py
+#   - tests/unit/core/test_registry/test_validator.py
+#
+# Schema: src/nexusdl/data/sites_schema.json
+
+_fixture_version: 1
+_description: >-
+  Sample site fixture for NexusDL tests. Represents MangaDex
+  (English, general audience, API-based). id matches sample_manga.json
+  so both fixtures form a valid parent/child pair.
+
+id: mangadex
+name: MangaDex
+
+domains:
+  - https://mangadex.org
+  - https://api.mangadex.org
+
+parser_class: "nexusdl.parsers.en.mangadex:MangaDexParser"
+
+language: en
+adult: false
+
+capabilities:
+  supports_search: true
+  supports_manga_info: true
+  supports_chapters: true
+  supports_pages: true
+  supports_download: true
+  requires_auth: false
+  requires_cloudflare_bypass: false
+  max_concurrent_downloads: 4
+  default_rate_limit_per_second: 2.0
+
+default_headers:
+  User-Agent: "NexusDL/0.1.0 (+https://github.com/Voldigoad-Holdings/nexus-dl)"
+  Accept: "application/json"
+
+cookies_required: []

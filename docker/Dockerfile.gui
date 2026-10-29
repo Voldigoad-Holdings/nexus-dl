@@ -1,0 +1,261 @@
+# syntax=docker/dockerfile:1.7-labs
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — GUI Dockerfile (CustomTkinter + X11)
+#
+# Fichier : docker/Dockerfile.gui
+#
+# Image    : ghcr.io/voldigoad-holdings/nexus-dl-gui
+# Build    : docker buildx build --platform linux/amd64,linux/arm64 \
+#              -f docker/Dockerfile.gui -t nexusdl-gui .
+#
+# ⚠️  Cette image NÉCESSITE un serveur X11 (Linux desktop, WSL2) ou
+#     un serveur VNC (headless). Elle NE FONCTIONNE PAS sur un
+#     serveur headless sans configuration supplémentaire.
+#
+# Usage (Linux desktop) :
+#   xhost +local:docker
+#   docker run -it --rm \
+#       -e DISPLAY=$DISPLAY \
+#       -v /tmp/.X11-unix:/tmp/.X11-unix:ro \
+#       -v $HOME/.Xauthority:/home/nexusdl/.Xauthority:ro \
+#       -v ~/nexusdl/config:/config \
+#       -v ~/nexusdl/data:/data \
+#       -v ~/nexusdl/downloads:/downloads \
+#       --ipc=host \
+#       nexusdl-gui
+#
+# Usage (WSL2) :
+#   # Installer VcXsrv ou X410 sur Windows
+#   export DISPLAY=$(grep nameserver /etc/resolv.conf | awk '{print $2}'):0
+#   xhost +local:docker
+#   docker run -it --rm -e DISPLAY=$DISPLAY ...
+#
+# Usage (headless + VNC) :
+#   docker run -d --rm -p 5900:5900 -p 6080:6080 ... nexusdl-gui
+#   # → VNC : localhost:5900 (mot de passe défini via VNC_PASSWORD)
+#   # → Navigateur : http://localhost:6080 (noVNC)
+#
+# Contenu  : Python 3.12 + NexusDL[cli,gui] + tk + X11 + x11vnc + noVNC
+# Exclut   : Playwright browsers, Web frontend, tests
+#
+# ⚠️  Image non-root (UID 1000, GID 1000).
+# ⚠️  Le client doit avoir accès au socket X11 (/tmp/.X11-unix).
+# ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# ARGs
+# ────────────────────────────────────────────────────────────────────
+ARG PYTHON_VERSION=3.12
+ARG DEBIAN_VERSION=bookworm
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION=0.1.0
+
+# ────────────────────────────────────────────────────────────────────
+# STAGE 1 — builder (Python deps)
+# ────────────────────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION} AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=120
+
+# Deps de compilation
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        libffi-dev \
+        libssl-dev \
+        pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+
+# Venv
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Upgrade pip + uv
+RUN pip install --upgrade pip \
+ && pip install "uv>=0.4,<1.0"
+
+# Deps Python (cache optimal)
+WORKDIR /build
+COPY pyproject.toml uv.lock README.md LICENSE ./
+
+# Install CLI + GUI extras
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/venv/bin/python \
+        -e ".[cli,gui]"
+
+# Code source
+COPY src/ ./src/
+COPY config/ ./config/
+
+# Reinstall editable
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/venv/bin/python \
+        --no-deps -e .
+
+# Vérifie que le GUI est importable
+RUN /opt/venv/bin/python -c "import customtkinter; print(customtkinter.__version__)"
+
+# ────────────────────────────────────────────────────────────────────
+# STAGE 2 — runtime (X11 + VNC + GUI)
+# ────────────────────────────────────────────────────────────────────
+FROM python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION} AS runtime
+
+ARG BUILD_DATE
+ARG VCS_REF
+ARG VERSION
+
+# ────────────────────────────────────────────────────────────────────
+# Labels OCI
+# ────────────────────────────────────────────────────────────────────
+LABEL org.opencontainers.image.title="NexusDL GUI" \
+      org.opencontainers.image.description="NexusDL desktop GUI (CustomTkinter + X11)" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="https://github.com/Voldigoad-Holdings/nexus-dl" \
+      org.opencontainers.image.url="https://github.com/Voldigoad-Holdings/nexus-dl" \
+      org.opencontainers.image.documentation="https://github.com/Voldigoad-Holdings/nexus-dl/tree/main/docs" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.authors="Voldigoad-Holdings <drxenon487@gmail.com>" \
+      org.opencontainers.image.vendor="Voldigoad-Holdings"
+
+# ────────────────────────────────────────────────────────────────────
+# Variables d'environnement
+# ────────────────────────────────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONFAULTHANDLER=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    # Chemins NexusDL
+    NEXUSDL_CONFIG_DIR=/config \
+    NEXUSDL_DATA_DIR=/data \
+    NEXUSDL_LOGS_DIR=/data/logs \
+    NEXUSDL_DOWNLOAD_DIR=/downloads \
+    NEXUSDL_TEMP_DIR=/tmp/nexusdl \
+    NEXUSDL_LIBRARY_DB_PATH=/data/library.db \
+    NEXUSDL_COOKIE_STORAGE_PATH=/data/cookies.enc \
+    # Environnement
+    NEXUSDL_APP_ENVIRONMENT=prod \
+    NEXUSDL_LOG_FORMAT=json \
+    NEXUSDL_LOG_LEVEL=INFO \
+    # X11 (overridable au runtime)
+    DISPLAY=:0 \
+    # CustomTkinter (scale factor)
+    CUSTOMTKINTER_SCALING=1.0
+
+# ────────────────────────────────────────────────────────────────────
+# Dépendances système (X11 + GUI + VNC)
+# ────────────────────────────────────────────────────────────────────
+# Groupes :
+#   - X11 runtime       : libx11, libxext, libxrender, libxrandr
+#   - Tk (CustomTkinter): tk, tk-dev (headers si Pillow compile)
+#   - Fonts             : fonts-dejavu, fonts-liberation (lisibilité)
+#   - GL                : libgl1, libglib2.0 (rendu Tk)
+#   - XAuth             : xauth (authentification X11)
+#   - VNC               : x11vnc, novnc, websockify (fallback headless)
+#   - Utils             : ca-certificates, curl, tini, tzdata
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        # X11 runtime
+        libx11-6 \
+        libxext6 \
+        libxrender1 \
+        libxrandr2 \
+        libxfixes3 \
+        libxcursor1 \
+        libxinerama1 \
+        libxi6 \
+        libxtst6 \
+        libxss1 \
+        libxcomposite1 \
+        libxdamage1 \
+        # Tk (CustomTkinter)
+        tk \
+        # Fonts
+        fonts-dejavu \
+        fonts-liberation \
+        fontconfig \
+        # GL
+        libgl1 \
+        libglib2.0-0 \
+        # XAuth
+        xauth \
+        # VNC (headless fallback)
+        x11vnc \
+        novnc \
+        websockify \
+        # Utils
+        ca-certificates \
+        curl \
+        tini \
+        tzdata \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# ────────────────────────────────────────────────────────────────────
+# Utilisateur non-root
+# ────────────────────────────────────────────────────────────────────
+ARG UID=1000
+ARG GID=1000
+
+RUN groupadd --gid "${GID}" nexusdl \
+ && useradd --uid "${UID}" --gid "${GID}" \
+            --shell /bin/bash \
+            --create-home \
+            --home-dir /home/nexusdl \
+            nexusdl
+
+# ────────────────────────────────────────────────────────────────────
+# Répertoires
+# ────────────────────────────────────────────────────────────────────
+RUN mkdir -p /app /config /data /downloads /tmp/nexusdl \
+ && chown -R nexusdl:nexusdl /app /config /data /downloads /tmp/nexusdl \
+ && chmod 755 /app /config /data /downloads \
+ && chmod 1777 /tmp
+
+WORKDIR /app
+
+# ────────────────────────────────────────────────────────────────────
+# Copie du builder
+# ────────────────────────────────────────────────────────────────────
+COPY --from=builder --chown=nexusdl:nexusdl /opt/venv /opt/venv
+COPY --from=builder --chown=nexusdl:nexusdl /build/src /app/src
+COPY --from=builder --chown=nexusdl:nexusdl /build/config /app/config
+
+# ────────────────────────────────────────────────────────────────────
+# Healthcheck (test GUI headless)
+# ────────────────────────────────────────────────────────────────────
+# Le GUI ne peut pas être testé sans X11. On teste seulement que
+# customtkinter est importable (déjà fait dans le builder) et que
+# le binaire nexusdl-gui existe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD command -v nexusdl-gui >/dev/null && python -c "import customtkinter" || exit 1
+
+# ────────────────────────────────────────────────────────────────────
+# Entrypoint
+# ────────────────────────────────────────────────────────────────────
+# entrypoint.gui.sh : vérifie X11 + lance x11vnc si HEADLESS=true
+COPY --chown=nexusdl:nexusdl docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD ["nexusdl-gui"]
+
+# Signal d'arrêt
+STOPSIGNAL SIGTERM
+
+# ────────────────────────────────────────────────────────────────────
+# Utilisateur final
+# ────────────────────────────────────────────────────────────────────
+USER nexusdl:nexusdl
+
+# ────────────────────────────────────────────────────────────────────
+# Expose VNC + noVNC (pour headless)
+# ────────────────────────────────────────────────────────────────────
+EXPOSE 5900 6080

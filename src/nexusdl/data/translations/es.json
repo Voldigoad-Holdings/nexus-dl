@@ -1,0 +1,496 @@
+{
+  "_meta": {
+    "language": "es",
+    "language_name": "Spanish",
+    "language_native": "Español",
+    "version": 1,
+    "plural_rule": "germanic",
+    "translators": ["Voldigoad-Holdings"],
+    "last_updated": "2026-10-29"
+  },
+
+  "app": {
+    "name": "NexusDL",
+    "tagline": "Descargador multisitio de manga, webtoon, cómic y doujinshi",
+    "description": "NexusDL es un descargador moderno, modular y extensible de manga, webtoons, cómics y doujinshi de más de 60 sitios.",
+    "version": "Versión {version}",
+    "loading": "Cargando...",
+    "ready": "Listo",
+    "starting": "Iniciando...",
+    "stopping": "Deteniendo...",
+    "stopped": "Detenido",
+    "error": "Error",
+    "warning": "Advertencia",
+    "info": "Información"
+  },
+
+  "common": {
+    "ok": "Aceptar",
+    "cancel": "Cancelar",
+    "close": "Cerrar",
+    "save": "Guardar",
+    "saved": "Guardado",
+    "delete": "Eliminar",
+    "deleted": "Eliminado",
+    "confirm": "Confirmar",
+    "yes": "Sí",
+    "no": "No",
+    "back": "Atrás",
+    "next": "Siguiente",
+    "previous": "Anterior",
+    "finish": "Finalizar",
+    "retry": "Reintentar",
+    "refresh": "Actualizar",
+    "reload": "Recargar",
+    "reset": "Restablecer",
+    "apply": "Aplicar",
+    "apply_all": "Aplicar todo",
+    "clear": "Limpiar",
+    "clear_all": "Limpiar todo",
+    "copy": "Copiar",
+    "copied": "Copiado",
+    "paste": "Pegar",
+    "cut": "Cortar",
+    "undo": "Deshacer",
+    "redo": "Rehacer",
+    "search": "Buscar",
+    "searching": "Buscando...",
+    "loading": "Cargando...",
+    "processing": "Procesando...",
+    "please_wait": "Por favor, espere...",
+    "optional": "opcional",
+    "required": "obligatorio",
+    "unknown": "Desconocido",
+    "none": "Ninguno",
+    "all": "Todo",
+    "other": "Otro",
+    "more": "Más",
+    "less": "Menos",
+    "show_more": "Mostrar más",
+    "show_less": "Mostrar menos",
+    "select": "Seleccionar",
+    "select_all": "Seleccionar todo",
+    "deselect_all": "Deseleccionar todo",
+    "download": "Descargar",
+    "downloading": "Descargando...",
+    "upload": "Subir",
+    "open": "Abrir",
+    "open_folder": "Abrir carpeta",
+    "reveal": "Mostrar en el explorador de archivos",
+    "edit": "Editar",
+    "add": "Añadir",
+    "remove": "Quitar",
+    "update": "Actualizar",
+    "updated": "Actualizado",
+    "enabled": "Activado",
+    "disabled": "Desactivado",
+    "enable": "Activar",
+    "disable": "Desactivar",
+    "status": "Estado",
+    "actions": "Acciones",
+    "details": "Detalles",
+    "name": "Nombre",
+    "description": "Descripción",
+    "type": "Tipo",
+    "size": "Tamaño",
+    "date": "Fecha",
+    "time": "Hora",
+    "language": "Idioma",
+    "path": "Ruta",
+    "url": "URL",
+    "id": "ID",
+    "version": "Versión"
+  },
+
+  "nav": {
+    "home": "Inicio",
+    "search": "Buscar",
+    "downloads": "Descargas",
+    "library": "Biblioteca",
+    "settings": "Ajustes",
+    "logs": "Registros",
+    "help": "Ayuda",
+    "about": "Acerca de",
+    "plugins": "Complementos",
+    "sites": "Sitios",
+    "users": "Usuarios",
+    "logout": "Cerrar sesión",
+    "login": "Iniciar sesión"
+  },
+
+  "search": {
+    "title": "Buscar",
+    "placeholder": "Buscar manga, webtoon, cómic...",
+    "button": "Buscar",
+    "no_results": "No hay resultados para «{query}».",
+    "try_shorter": "Prueba con una búsqueda más corta.",
+    "results_count": "{count} resultado(s) encontrado(s) en {sites} sitio(s).",
+    "results_count_one": "1 resultado encontrado en {sites} sitio(s).",
+    "results_count_other": "{count} resultados encontrados en {sites} sitio(s).",
+    "searching_in": "Buscando en {sites}...",
+    "all_sites": "Todos los sitios",
+    "select_sites": "Seleccionar sitios",
+    "language_filter": "Idioma",
+    "include_adult": "Incluir contenido para adultos",
+    "no_results_filtered": "Sin resultados. Prueba a cambiar los filtros.",
+    "loading_more": "Cargando más resultados...",
+    "load_more": "Cargar más",
+    "retry_failed": "Reintentar sitios fallidos",
+    "sites_failed": "{count} sitio(s) fallido(s)",
+    "site_failed": "El sitio {site} falló: {error}"
+  },
+
+  "downloads": {
+    "title": "Descargas",
+    "empty": "Aún no hay descargas.",
+    "empty_hint": "Usa la búsqueda para encontrar manga que descargar.",
+    "filter": {
+      "all": "Todas",
+      "running": "En curso",
+      "pending": "Pendientes",
+      "paused": "Pausadas",
+      "done": "Completadas",
+      "failed": "Fallidas",
+      "cancelled": "Canceladas"
+    },
+    "status": {
+      "pending": "Pendiente",
+      "running": "En curso",
+      "paused": "Pausada",
+      "done": "Completada",
+      "failed": "Fallida",
+      "cancelled": "Cancelada"
+    },
+    "actions": {
+      "pause": "Pausar",
+      "resume": "Reanudar",
+      "cancel": "Cancelar",
+      "retry": "Reintentar",
+      "remove": "Eliminar",
+      "clear_completed": "Limpiar completadas",
+      "pause_all": "Pausar todas",
+      "resume_all": "Reanudar todas",
+      "cancel_all": "Cancelar todas"
+    },
+    "progress": {
+      "pages": "{done} / {total} páginas",
+      "percent": "{percent}%",
+      "speed": "{speed} páginas/s",
+      "eta": "Restante: {eta}",
+      "elapsed": "Transcurrido: {elapsed}",
+      "bytes": "{done} / {total}",
+      "current_chapter": "Capítulo {number}",
+      "current_page": "Página {current} de {total}"
+    },
+    "toast": {
+      "completed": "{manga} · Capítulo {chapter} completado",
+      "failed": "{manga} · Capítulo {chapter} fallido",
+      "cancelled": "{manga} · Capítulo {chapter} cancelado"
+    },
+    "confirm": {
+      "cancel_task": "¿Cancelar esta descarga?",
+      "cancel_all": "¿Cancelar todas las descargas? Esto no se puede deshacer.",
+      "remove_task": "¿Quitar esta descarga de la lista?"
+    }
+  },
+
+  "library": {
+    "title": "Biblioteca",
+    "empty": "Tu biblioteca está vacía.",
+    "empty_hint": "Descarga manga para verlo aquí.",
+    "search_placeholder": "Buscar en la biblioteca...",
+    "filter": {
+      "all": "Todo",
+      "reading": "Leyendo",
+      "completed": "Completado",
+      "not_started": "Sin empezar"
+    },
+    "sort": {
+      "title": "Título",
+      "author": "Autor",
+      "chapters": "Capítulos",
+      "last_read": "Última lectura",
+      "added": "Añadido"
+    },
+    "chapters_count": "{done} / {total} capítulos",
+    "last_read": "Última lectura: capítulo {chapter}, página {page}",
+    "not_started": "Sin empezar",
+    "completed": "Completado",
+    "actions": {
+      "open": "Abrir",
+      "read": "Leer",
+      "continue_reading": "Continuar leyendo",
+      "update": "Buscar nuevos capítulos",
+      "remove": "Quitar de la biblioteca",
+      "open_folder": "Abrir carpeta",
+      "reveal": "Mostrar en el explorador de archivos"
+    },
+    "confirm": {
+      "remove": "¿Quitar «{title}» de la biblioteca?",
+      "remove_files": "¿Eliminar también los archivos descargados?",
+      "keep_files": "Conservar archivos descargados"
+    }
+  },
+
+  "settings": {
+    "title": "Ajustes",
+    "sections": {
+      "general": "General",
+      "downloads": "Descargas",
+      "appearance": "Apariencia",
+      "content": "Contenido",
+      "network": "Red",
+      "advanced": "Avanzado",
+      "users": "Usuarios"
+    },
+    "general": {
+      "language": "Idioma",
+      "theme": "Tema",
+      "start_minimized": "Iniciar minimizado",
+      "check_updates": "Buscar actualizaciones",
+      "auto_update": "Actualización automática"
+    },
+    "downloads": {
+      "directory": "Directorio de descargas",
+      "default_format": "Formato predeterminado",
+      "max_concurrent": "Máx. descargas simultáneas",
+      "max_pages_per_chapter": "Máx. páginas por capítulo",
+      "skip_existing": "Omitir existentes",
+      "verify_checksums": "Verificar sumas de comprobación"
+    },
+    "appearance": {
+      "theme": "Tema",
+      "theme_dark": "Oscuro",
+      "theme_light": "Claro",
+      "theme_system": "Sistema",
+      "accent_color": "Color de acento",
+      "font_scale": "Tamaño de fuente"
+    },
+    "content": {
+      "allow_adult": "Permitir contenido para adultos (18+)",
+      "respect_robots": "Respetar robots.txt",
+      "content_filter_strict": "Filtro de contenido estricto",
+      "preferred_language": "Idioma preferido"
+    },
+    "network": {
+      "http_timeout": "Tiempo de espera HTTP (segundos)",
+      "max_retries": "Máx. reintentos",
+      "enable_playwright": "Activar Playwright",
+      "flaresolverr_url": "URL de FlareSolverr",
+      "proxy_url": "URL del proxy"
+    },
+    "advanced": {
+      "log_level": "Nivel de registro",
+      "log_format": "Formato de registro",
+      "open_config": "Abrir carpeta de configuración",
+      "open_logs": "Abrir carpeta de registros",
+      "reset_settings": "Restablecer ajustes",
+      "restart_required": "Reinicio necesario",
+      "restart_now": "Reiniciar ahora"
+    },
+    "confirm": {
+      "reset": "¿Restablecer todos los ajustes? Esto no se puede deshacer.",
+      "restart": "¿Reiniciar ahora? Todas las descargas en curso se interrumpirán."
+    }
+  },
+
+  "formats": {
+    "folder": "Carpeta",
+    "zip": "Archivo ZIP",
+    "cbz": "CBZ (Comic Book ZIP)",
+    "cb7": "CB7 (Comic Book 7z)",
+    "pdf": "Documento PDF",
+    "cbt": "CBT (Comic Book TAR)",
+    "cbr": "CBR (no compatible)",
+    "cbr_reason": "RAR es propietario y no es compatible con GPL-3.0.",
+    "select_format": "Seleccionar formato",
+    "recommended": "Recomendado"
+  },
+
+  "errors": {
+    "generic": "Ha ocurrido un error.",
+    "unknown": "Error desconocido.",
+    "network": "Error de red.",
+    "timeout": "Tiempo de espera agotado.",
+    "rate_limited": "Demasiadas solicitudes. Inténtalo más tarde.",
+    "cloudflare": "Cloudflare está bloqueando la solicitud.",
+    "not_found": "No encontrado.",
+    "unauthorized": "No autorizado.",
+    "forbidden": "Acceso denegado.",
+    "validation": "Entrada no válida.",
+    "config": "Error de configuración.",
+    "parser": "Error del analizador.",
+    "parser_not_found": "Analizador del sitio {site} no encontrado.",
+    "parser_response": "El sitio {site} respondió con estado {status}.",
+    "parser_parse": "Error al analizar el HTML de {site}.",
+    "download": "Error de descarga.",
+    "download_failed": "La descarga de {chapter} falló: {error}",
+    "packaging": "Error de empaquetado.",
+    "library": "Error de biblioteca.",
+    "compliance": "Error de cumplimiento (robots.txt).",
+    "session": "Error de sesión.",
+    "cookie": "Error de cifrado de cookies.",
+    "plugin": "Error de complemento.",
+    "image": "Error de imagen.",
+    "invalid_state": "Transición de estado no válida de {from_state} a {to_state}.",
+    "empty_chapter": "El capítulo {chapter} no tiene páginas.",
+    "file_not_found": "Archivo no encontrado: {path}",
+    "permission_denied": "Permiso denegado: {path}",
+    "disk_full": "Espacio en disco insuficiente.",
+    "retry_exhausted": "Los {attempts} intentos fallaron.",
+    "cancelled": "Operación cancelada."
+  },
+
+  "auth": {
+    "login": "Iniciar sesión",
+    "logout": "Cerrar sesión",
+    "register": "Registrarse",
+    "username": "Nombre de usuario",
+    "email": "Correo electrónico",
+    "password": "Contraseña",
+    "confirm_password": "Confirmar contraseña",
+    "remember_me": "Recordarme",
+    "forgot_password": "¿Olvidaste tu contraseña?",
+    "reset_password": "Restablecer contraseña",
+    "login_success": "Sesión iniciada correctamente",
+    "login_failed": "Error al iniciar sesión",
+    "invalid_credentials": "Nombre de usuario o contraseña incorrectos",
+    "logout_success": "Sesión cerrada correctamente",
+    "session_expired": "Sesión expirada. Inicia sesión de nuevo.",
+    "register_success": "Cuenta creada correctamente",
+    "password_mismatch": "Las contraseñas no coinciden",
+    "password_too_short": "La contraseña debe tener al menos {min} caracteres",
+    "email_invalid": "Correo electrónico no válido",
+    "username_taken": "Nombre de usuario ya en uso",
+    "email_taken": "Correo electrónico ya registrado"
+  },
+
+  "site": {
+    "capabilities": {
+      "supports_search": "Admite búsqueda",
+      "supports_manga_info": "Admite información del manga",
+      "supports_chapters": "Admite capítulos",
+      "supports_pages": "Admite páginas",
+      "supports_download": "Admite descarga",
+      "requires_auth": "Requiere inicio de sesión",
+      "requires_cloudflare_bypass": "Requiere omisión de Cloudflare",
+      "max_concurrent_downloads": "Máx. descargas simultáneas",
+      "rate_limit": "Límite de velocidad"
+    },
+    "health": {
+      "healthy": "Operativo",
+      "degraded": "Degradado",
+      "down": "Caído",
+      "unknown": "Desconocido"
+    },
+    "adult": "Contenido para adultos",
+    "general": "Contenido general"
+  },
+
+  "plugins": {
+    "title": "Complementos",
+    "empty": "No hay complementos instalados.",
+    "install": "Instalar complemento",
+    "uninstall": "Desinstalar complemento",
+    "enable": "Activar complemento",
+    "disable": "Desactivar complemento",
+    "reload": "Recargar complemento",
+    "version": "Versión {version}",
+    "author": "Por {author}",
+    "hooks": "Hooks: {hooks}",
+    "status_enabled": "Activado",
+    "status_disabled": "Desactivado",
+    "status_error": "Error",
+    "confirm": {
+      "uninstall": "¿Desinstalar el complemento «{name}»?"
+    }
+  },
+
+  "cli": {
+    "searching": "Buscando «{query}»...",
+    "found_results": "{count} resultado(s) encontrado(s).",
+    "downloading": "Descargando {manga} · Capítulo {chapter}...",
+    "download_complete": "Descarga completada: {path}",
+    "download_failed": "Descarga fallida: {error}",
+    "sites_listed": "{count} sitio(s) listado(s).",
+    "config_valid": "Configuración válida.",
+    "config_invalid": "Configuración no válida: {error}",
+    "version": "NexusDL versión {version}",
+    "help_footer": "Usa --help para más información.",
+    "interrupted": "Operación interrumpida."
+  },
+
+  "tui": {
+    "title": "NexusDL",
+    "search_hint": "Pulsa / para buscar",
+    "downloads_hint": "Pulsa d para las descargas",
+    "library_hint": "Pulsa l para la biblioteca",
+    "quit_hint": "Pulsa q para salir",
+    "help_hint": "Pulsa ? para ayuda",
+    "loading": "Cargando...",
+    "ready": "Listo",
+    "quitting": "Saliendo..."
+  },
+
+  "gui": {
+    "window_title": "NexusDL",
+    "minimize_to_tray": "Minimizar a la bandeja",
+    "restore": "Restaurar",
+    "quit": "Salir",
+    "tray": {
+      "open": "Abrir NexusDL",
+      "pause_all": "Pausar todas las descargas",
+      "resume_all": "Reanudar todas las descargas",
+      "quit": "Salir"
+    }
+  },
+
+  "web": {
+    "title": "NexusDL",
+    "login_title": "Iniciar sesión en NexusDL",
+    "register_title": "Crear cuenta",
+    "dashboard_title": "Panel",
+    "search_title": "Buscar",
+    "downloads_title": "Descargas",
+    "library_title": "Biblioteca",
+    "settings_title": "Ajustes",
+    "pwa_install": "Instalar NexusDL",
+    "pwa_installed": "NexusDL está instalado",
+    "connection_lost": "Conexión perdida",
+    "reconnecting": "Reconectando...",
+    "connected": "Conectado"
+  },
+
+  "notifications": {
+    "download_complete": "Descarga completada",
+    "download_failed": "Descarga fallida",
+    "chapters_available": "{count} nuevo(s) capítulo(s) disponible(s)",
+    "chapters_available_one": "1 nuevo capítulo disponible",
+    "chapters_available_other": "{count} nuevos capítulos disponibles",
+    "update_available": "Actualización disponible",
+    "site_down": "El sitio {site} está caído",
+    "site_back": "El sitio {site} vuelve a estar operativo",
+    "welcome": "Bienvenido a NexusDL",
+    "goodbye": "Hasta luego"
+  },
+
+  "validation": {
+    "required": "Este campo es obligatorio.",
+    "min_length": "Debe tener al menos {min} caracteres.",
+    "max_length": "Debe tener como máximo {max} caracteres.",
+    "min_value": "Debe ser al menos {min}.",
+    "max_value": "Debe ser como máximo {max}.",
+    "pattern": "Formato no válido.",
+    "email": "Correo electrónico no válido.",
+    "url": "URL no válida.",
+    "path": "Ruta no válida.",
+    "integer": "Debe ser un número entero.",
+    "number": "Debe ser un número.",
+    "boolean": "Debe ser verdadero o falso.",
+    "date": "Fecha no válida.",
+    "datetime": "Fecha y hora no válidas.",
+    "enum": "Debe ser uno de: {values}.",
+    "unique": "Este valor ya está en uso.",
+    "not_found": "Valor no encontrado."
+  }
+}

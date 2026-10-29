@@ -1,0 +1,920 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — Supported sites (single source of truth)
+#
+# File: src/nexusdl/data/sites.yaml
+#
+# This file lists all supported sites. Each entry:
+#   - is validated against sites_schema.json (CI)
+#   - is loaded by SiteRegistry at startup
+#   - instantiates a parser via DefaultParserFactory (ADR-003)
+#
+# ⚠️  NEVER put secrets here (cookies values, passwords, tokens).
+#     Values live in .env (see ADR-004).
+#
+# ⚠️  NEVER put production app URLs here (nexusdl.dev, etc.).
+#     Those live in .env.
+#
+# ⚠️  CBR format is NOT supported (see ADR-002).
+#
+# ⚠️  Domains MUST be HTTPS only.
+#
+# Naming convention:
+#   - id: snake_case, matches parser.site_id and module name
+#   - parser_class: "nexusdl.parsers.<lang>.<site>:<Class>Parser"
+#
+# Categories: fr, en, kr, adult
+#   - The "adult" category is filtered by NEXUSDL_ALLOW_ADULT.
+#   - The category is metadata, not policy.
+# ════════════════════════════════════════════════════════════════════
+
+sites:
+
+  # ════════════════════════════════════════════════════════════════
+  # FRENCH SITES (parsers/fr/)
+  # ════════════════════════════════════════════════════════════════
+
+  - id: anime_scans
+    name: Anime-Scans
+    domains:
+      - https://anime-scan.fr
+    parser_class: "nexusdl.parsers.fr.anime_scans:AnimeScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers:
+      User-Agent: "NexusDL/0.1.0 (+https://github.com/Voldigoad-Holdings/nexus-dl)"
+    cookies_required: []
+
+  - id: blossom_scans
+    name: Blossom Scans
+    domains:
+      - https://blossom-scans.com
+    parser_class: "nexusdl.parsers.fr.blossom_scans:BlossomScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: crunchyscan_fr
+    name: CrunchyScan (FR)
+    domains:
+      - https://crunchyscan.fr
+    parser_class: "nexusdl.parsers.fr.crunchyscan_fr:CrunchyScanFrParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: epsilonscan
+    name: EpsilonScan
+    domains:
+      - https://epsilonscan.fr
+    parser_class: "nexusdl.parsers.fr.epsilonscan:EpsilonScanParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: genkan_scans
+    name: Genkan Scans
+    domains:
+      - https://genkan-scans.fr
+    parser_class: "nexusdl.parsers.fr.genkan_scans:GenkanScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: hentai_origines
+    name: Hentai-Origines
+    domains:
+      - https://hentai-origines.fr
+    parser_class: "nexusdl.parsers.fr.hentai_origines:HentaiOriginesParser"
+    language: fr
+    adult: true
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 2
+      default_rate_limit_per_second: 1.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: karma_scans
+    name: Karma Scans
+    domains:
+      - https://karma-scans.com
+    parser_class: "nexusdl.parsers.fr.karma_scans:KarmaScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: mangas_origines
+    name: Mangas-Origines
+    domains:
+      - https://mangas-origines.fr
+    parser_class: "nexusdl.parsers.fr.mangas_origines:MangasOriginesParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: nekohouse
+    name: NekoHouse
+    domains:
+      - https://nekohouse.su
+    parser_class: "nexusdl.parsers.fr.nekohouse:NekoHouseParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: ortegascans
+    name: OrtegaScans
+    domains:
+      - https://ortegascans.fr
+    parser_class: "nexusdl.parsers.fr.ortegascans:OrtegaScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: phenix_scans
+    name: Phenix Scans
+    domains:
+      - https://phenix-scans.com
+    parser_class: "nexusdl.parsers.fr.phenix_scans:PhenixScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: poseidon_scans
+    name: Poseidon Scans
+    domains:
+      - https://poseidon-scans.net
+    parser_class: "nexusdl.parsers.fr.poseidon_scans:PoseidonScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: raijin_scans
+    name: Raijin Scans
+    domains:
+      - https://raijinscans.fr
+    parser_class: "nexusdl.parsers.fr.raijin_scans:RaijinScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: rimuscan
+    name: RimuScans
+    domains:
+      - https://rimuscan.fr
+    parser_class: "nexusdl.parsers.fr.rimuscan:RimuScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: scan_manga
+    name: Scan-Manga
+    domains:
+      - https://scan-manga.com
+      - https://www.scan-manga.com
+    parser_class: "nexusdl.parsers.fr.scan_manga:ScanMangaParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: true
+      max_concurrent_downloads: 2
+      default_rate_limit_per_second: 1.0
+    default_headers: {}
+    cookies_required:
+      - cf_clearance
+
+  - id: shinra_scans
+    name: Shinra Scans
+    domains:
+      - https://shinra-scans.com
+    parser_class: "nexusdl.parsers.fr.shinra_scans:ShinraScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: sushiscan
+    name: SushiScan
+    domains:
+      - https://sushiscan.net
+      - https://sushiscan.fr
+    parser_class: "nexusdl.parsers.fr.sushiscan:SushiScanParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: taisei_scans
+    name: Taisei Scans
+    domains:
+      - https://taisei-scans.com
+    parser_class: "nexusdl.parsers.fr.taisei_scans:TaiseiScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: toonfr
+    name: ToonFR
+    domains:
+      - https://toonfr.com
+    parser_class: "nexusdl.parsers.fr.toonfr:ToonFRParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: urano_scans
+    name: Urano Scans
+    domains:
+      - https://urano-scans.com
+    parser_class: "nexusdl.parsers.fr.urano_scans:UranoScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: xanadu_scans
+    name: Xanadu Scans
+    domains:
+      - https://xanadu-scans.com
+    parser_class: "nexusdl.parsers.fr.xanadu_scans:XanaduScansParser"
+    language: fr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+
+  # ════════════════════════════════════════════════════════════════
+  # ENGLISH SITES (parsers/en/)
+  # ════════════════════════════════════════════════════════════════
+
+  - id: asurascans
+    name: Asura Scans
+    domains:
+      - https://asuracomic.net
+      - https://asurascans.com
+    parser_class: "nexusdl.parsers.en.asurascans:AsuraScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: batoto
+    name: Bato.to
+    domains:
+      - https://bato.to
+    parser_class: "nexusdl.parsers.en.batoto:BatotoParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: true
+      max_concurrent_downloads: 2
+      default_rate_limit_per_second: 1.0
+    default_headers: {}
+    cookies_required:
+      - cf_clearance
+
+  - id: comick
+    name: Comick
+    domains:
+      - https://comick.io
+    parser_class: "nexusdl.parsers.en.comick:ComickParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 4.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: disasterscans
+    name: Disaster Scans
+    domains:
+      - https://disasterscans.com
+    parser_class: "nexusdl.parsers.en.disasterscans:DisasterScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: flamescans
+    name: Flame Comics
+    domains:
+      - https://flamecomics.xyz
+    parser_class: "nexusdl.parsers.en.flamescans:FlameScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: galaxy_scans
+    name: Galaxy Scans
+    domains:
+      - https://galaxy-scans.com
+    parser_class: "nexusdl.parsers.en.galaxy_scans:GalaxyScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: kireicake
+    name: Kirei Cake
+    domains:
+      - https://kireicake.com
+    parser_class: "nexusdl.parsers.en.kireicake:KireiCakeParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: leviathanscans
+    name: Leviathan Scans
+    domains:
+      - https://leviathan-scans.com
+    parser_class: "nexusdl.parsers.en.leviathanscans:LeviathanScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: luminousscans
+    name: Luminous Scans
+    domains:
+      - https://luminousscans.com
+    parser_class: "nexusdl.parsers.en.luminousscans:LuminousScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: mangabuddy
+    name: MangaBuddy
+    domains:
+      - https://mangabuddy.com
+    parser_class: "nexusdl.parsers.en.mangabuddy:MangaBuddyParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: mangadex
+    name: MangaDex
+    domains:
+      - https://mangadex.org
+      - https://api.mangadex.org
+    parser_class: "nexusdl.parsers.en.mangadex:MangaDexParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 4.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: mangafire
+    name: MangaFire
+    domains:
+      - https://mangafire.to
+    parser_class: "nexusdl.parsers.en.mangafire:MangaFireParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: true
+      max_concurrent_downloads: 2
+      default_rate_limit_per_second: 1.0
+    default_headers: {}
+    cookies_required:
+      - cf_clearance
+
+  - id: mangakakalot
+    name: MangaKakalot
+    domains:
+      - https://mangakakalot.com
+    parser_class: "nexusdl.parsers.en.mangakakalot:MangaKakalotParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: mangasee123
+    name: MangaSee123
+    domains:
+      - https://mangasee123.com
+    parser_class: "nexusdl.parsers.en.mangasee123:MangaSee123Parser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: reaperscans
+    name: Reaper Scans
+    domains:
+      - https://reaperscans.com
+    parser_class: "nexusdl.parsers.en.reaperscans:ReaperScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: scyllascans
+    name: Scylla Scans
+    domains:
+      - https://scyllascans.com
+    parser_class: "nexusdl.parsers.en.scyllascans:ScyllaScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: tcbscans
+    name: TCB Scans
+    domains:
+      - https://tcbscans.com
+    parser_class: "nexusdl.parsers.en.tcbscans:TCBScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: toongod
+    name: ToonGod
+    domains:
+      - https://toongod.org
+    parser_class: "nexusdl.parsers.en.toongod:ToonGodParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: toonily
+    name: Toonily
+    domains:
+      - https://toonily.com
+    parser_class: "nexusdl.parsers.en.toonily:ToonilyParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: void_scans
+    name: Void Scans
+    domains:
+      - https://void-scans.com
+    parser_class: "nexusdl.parsers.en.void_scans:VoidScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: zenith_scans
+    name: Zenith Scans
+    domains:
+      - https://zenith-scans.com
+    parser_class: "nexusdl.parsers.en.zenith_scans:ZenithScansParser"
+    language: en
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+
+  # ════════════════════════════════════════════════════════════════
+  # KOREAN SITES (parsers/kr/)
+  # ════════════════════════════════════════════════════════════════
+
+  - id: asura_scans_kr
+    name: Asura Scans (KR)
+    domains:
+      - https://asuracomic.net/kr
+    parser_class: "nexusdl.parsers.kr.asura_scans_kr:AsuraScansKrParser"
+    language: kr
+    adult: false
+    capabilities:
+      supports_search: true
+      supports_manga_info: true
+      supports_chapters: true
+      supports_pages: true
+      supports_download: true
+      requires_auth: false
+      requires_cloudflare_bypass: false
+      max_concurrent_downloads: 4
+      default_rate_limit_per_second: 2.0
+    default_headers: {}
+    cookies_required: []
+
+  - id: manhwa_raw
+    name: Manhwa Raw
+    domains:
+      - https://manhwa-raw.com
+    parser_class: "nexusdl.parsers.kr.manhwa_raw:ManhwaRawParser"
+    language: kr
+    adult: false

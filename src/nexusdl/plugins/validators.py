@@ -1,35 +1,55 @@
 """Validation utilities for NexusDL plugin manifests and plugin classes.
 
-Three layers, all synchronous and side-effect-free:
+Three layers, all synchronous and side-effect-free (apart from the single
+file read in :func:`load_manifest`):
 
 1. **Structural** — :func:`load_manifest` parses ``nexus.plugin.yaml`` into a
-   :class:`PluginManifest` (Pydantic v2, ``extra="forbid"``). The Pydantic
-   model *is* the source of truth: it supersedes the ``plugin_schema.json``
-   referenced by the manifest's header comment (which may be regenerated at
-   any time via :func:`export_json_schema`).
+   :class:`PluginManifest` (Pydantic v2, ``extra="forbid"``, ``frozen=True``,
+   every field immutable). The Pydantic model *is* the schema:
+   :func:`export_json_schema` lets CI and editors regenerate a JSON Schema
+   from it on demand, so no hand-maintained schema file can ever drift.
+
 2. **Compatibility** — :func:`validate_manifest_compatibility` checks the
    manifest against the running host version and interpreter, using
    ``packaging`` for PEP 440 / semver comparisons.
+
 3. **Conformance** — :func:`validate_class_matches_manifest` checks that the
    plugin class's ``name`` / ``version`` attributes match the manifest and
-   that every declared hook is actually implemented, with the correct
+   that every declared hook is actually implemented with the correct
    sync/async flavour.
 
 :func:`validate_plugin` runs all three in order and returns the parsed
 manifest for the loader to consume.
 
-Only :mod:`nexusdl.plugins.loader` is expected to import these functions.
-Every failure is raised as :class:`~nexusdl.core.exceptions.PluginError` with
-a message that points at the offending file, field, and plugin.
+Hook names and their sync/async flavour come **exclusively** from
+:mod:`nexusdl.plugins.hooks` — this module never hardcodes a hook string, and
+never inspects :class:`~nexusdl.plugins.api.NexusPlugin` directly. Adding,
+renaming, or changing the flavour of a hook requires editing only
+:mod:`nexusdl.plugins.hooks` and :mod:`nexusdl.plugins.api`; every consumer
+of this module adapts automatically.
+
+Dependency graph (no cycles)::
+
+    core.exceptions.PluginError
+                  ▲
+                  │
+              hooks.py            ← canonical hook names + flavours
+                  ▲
+                  │
+          validators.py  ─►  loader.py  ─►  interfaces/*
+
+Only :mod:`nexusdl.plugins.loader` and interface modules are expected to
+import the public API of this module. Every failure is raised as
+:class:`~nexusdl.core.exceptions.PluginError` with a message that points at
+the offending file, field, and plugin.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
@@ -38,29 +58,21 @@ from packaging.version import InvalidVersion, Version
 from pydantic import (
     BaseModel,
     ConfigDict,
-    Field,
     ValidationError,
     field_validator,
     model_validator,
 )
 
 from nexusdl.core.exceptions import PluginError
+from nexusdl.plugins.hooks import HookName, check_hook_flavour
 from nexusdl.version import __version__ as _HOST_VERSION_STR
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
 
 
 __all__ = [
-    "ASYNC_HOOKS",
-    "HOOK_NAMES",
     "HOST_VERSION",
     "MANIFEST_FILENAME",
     "PluginManifest",
-    "SYNC_HOOKS",
     "export_json_schema",
-    "get_declared_hooks",
-    "get_implemented_hooks",
     "load_manifest",
     "validate_class_matches_manifest",
     "validate_manifest_compatibility",
@@ -72,54 +84,16 @@ __all__ = [
 # Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
-#: Manifest filename expected alongside ``plugin.py``.
+#: Manifest filename expected alongside ``plugin.py`` in a plugin directory.
 MANIFEST_FILENAME: Final[str] = "nexus.plugin.yaml"
 
-#: Plugin identifier pattern — lowercase, kebab/snake, must start with a letter.
-_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]*$")
-
-#: Hook names that must be *synchronous* per the :class:`NexusPlugin` protocol.
-SYNC_HOOKS: Final[frozenset[str]] = frozenset({"on_load", "on_unload"})
-
-#: Host version parsed once, used as the default in compatibility checks.
+#: Host NexusDL version, parsed once at import for use as the default in
+#: compatibility checks. Injected overridable in tests via the ``host_version``
+#: argument of :func:`validate_manifest_compatibility`.
 HOST_VERSION: Final[Version] = Version(_HOST_VERSION_STR)
 
-
-def _discover_hook_names() -> frozenset[str]:
-    """Return the set of hook names declared by :class:`NexusPlugin`.
-
-    Derived from the protocol itself so this module never drifts if the
-    protocol gains a hook. Falls back to a static list when
-    :mod:`nexusdl.plugins.api` cannot be imported (e.g. during a partial
-    bootstrap of the package).
-    """
-    try:
-        from nexusdl.plugins.api import NexusPlugin  # noqa: PLC0415
-    except ImportError:
-        return frozenset(
-            {
-                "on_load",
-                "on_unload",
-                "on_before_download",
-                "on_after_download",
-                "on_page_downloaded",
-                "on_error",
-            }
-        )
-    return frozenset(
-        name
-        for name in dir(NexusPlugin)
-        if name.startswith("on_")
-        and not name.startswith("_")
-        and callable(getattr(NexusPlugin, name, None))
-    )
-
-
-#: All hook names a plugin manifest may declare.
-HOOK_NAMES: Final[frozenset[str]] = _discover_hook_names()
-
-#: Hooks that must be declared ``async def`` on the plugin class.
-ASYNC_HOOKS: Final[frozenset[str]] = HOOK_NAMES - SYNC_HOOKS
+#: Plugin identifier pattern — lowercase start, then lowercase/digit/`_`/`-`.
+_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 # --------------------------------------------------------------------------- #
@@ -131,25 +105,29 @@ class PluginManifest(BaseModel):
     """Validated representation of a ``nexus.plugin.yaml`` file.
 
     Pydantic is the schema: ``extra="forbid"`` rejects typos in field names,
-    every string is stripped of surrounding whitespace, and the model is
-    frozen so the loader can safely cache manifests across reloads.
+    strings are stripped of surrounding whitespace, and the model is frozen so
+    the loader can safely cache manifests across reloads. Collection fields
+    are ``tuple`` (not ``list``) so ``frozen=True`` is genuinely airtight — a
+    caller cannot mutate a manifest's hook list behind the loader's back.
 
     Attributes:
         name: Plugin identifier, matching ``^[a-z][a-z0-9_-]*$``.
-        version: Semver-like version string (PEP 440 compatible).
+        version: Plugin version (PEP 440 compatible string).
         author: Human author name.
         email: Optional contact address (free-form, not validated).
         homepage: Optional project URL (free-form, not validated).
         description: One-paragraph summary, rendered in CLI/UI listings.
-        license: SPDX identifier.
-        min_nexusdl_version: Inclusive lower bound on the host version.
-        max_nexusdl_version: Exclusive upper bound on the host version,
+        license: SPDX identifier (e.g. ``GPL-3.0-or-later``).
+        min_nexusdl_version: **Inclusive** lower bound on the host version.
+        max_nexusdl_version: **Exclusive** upper bound on the host version,
             or ``None`` for "no upper bound".
         python_requires: PEP 440 specifier against the interpreter, or
             ``None`` for "no constraint".
-        hooks: Subset of :data:`HOOK_NAMES` that the plugin opts into.
-        dependencies: PEP 508 requirement strings the loader must find
-            satisfied before activating the plugin.
+        hooks: Subset of :data:`nexusdl.plugins.hooks.ALL_HOOK_NAMES` that
+            the plugin opts into. Validated against the :data:`HookName`
+            ``Literal`` so a typo fails at load, not at dispatch time.
+        dependencies: PEP 508 requirement strings. The loader verifies these
+            are satisfied before activating the plugin; it never auto-installs.
     """
 
     model_config = ConfigDict(
@@ -158,27 +136,39 @@ class PluginManifest(BaseModel):
         str_strip_whitespace=True,
     )
 
+    # --- Identity -------------------------------------------------------- #
+
     name: str
     version: str
+
+    # --- Metadata (all free-form, none validated as a URL or email) ------ #
+
     author: str
     email: str | None = None
     homepage: str | None = None
     description: str
     license: str
+
+    # --- Compatibility bounds ------------------------------------------- #
+
     min_nexusdl_version: str
     max_nexusdl_version: str | None = None
     python_requires: str | None = None
-    hooks: list[str] = Field(default_factory=list)
-    dependencies: list[str] = Field(default_factory=list)
 
-    # --- Field validators ------------------------------------------------- #
+    # --- Declared hooks and dependencies -------------------------------- #
+
+    hooks: tuple[HookName, ...] = ()
+    dependencies: tuple[str, ...] = ()
+
+    # --- Field validators ------------------------------------------------ #
 
     @field_validator("name")
     @classmethod
     def _validate_name(cls, value: str) -> str:
         if not _NAME_PATTERN.match(value):
             raise ValueError(
-                f"plugin name must match {_NAME_PATTERN.pattern!r}, got {value!r}"
+                f"plugin name must match {_NAME_PATTERN.pattern!r}, "
+                f"got {value!r}"
             )
         return value
 
@@ -215,23 +205,36 @@ class PluginManifest(BaseModel):
             ) from exc
         return value
 
+    @field_validator("hooks", "dependencies", mode="before")
+    @classmethod
+    def _none_to_empty_tuple(cls, value: Any) -> Any:
+        # A YAML key with no value (e.g. ``hooks:``) parses to ``None``.
+        # Treat that as an empty collection rather than a validation error.
+        return () if value is None else value
+
     @field_validator("hooks")
     @classmethod
-    def _validate_hooks(cls, value: list[str]) -> list[str]:
+    def _validate_hooks_no_duplicates(
+        cls, value: tuple[HookName, ...]
+    ) -> tuple[HookName, ...]:
         if len(value) != len(set(value)):
-            duplicates = sorted({h for h in value if value.count(h) > 1})
-            raise ValueError(f"hooks list contains duplicates: {duplicates}")
-        unknown = set(value) - HOOK_NAMES
-        if unknown:
+            seen: set[str] = set()
+            duplicates: list[str] = []
+            for hook in value:
+                if hook in seen and hook not in duplicates:
+                    duplicates.append(hook)
+                else:
+                    seen.add(hook)
             raise ValueError(
-                f"unknown hook(s) {sorted(unknown)}; valid hooks are "
-                f"{sorted(HOOK_NAMES)}"
+                f"hooks contains duplicate entries: {sorted(duplicates)}"
             )
         return value
 
     @field_validator("dependencies")
     @classmethod
-    def _validate_dependencies(cls, value: list[str]) -> list[str]:
+    def _validate_dependencies(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
         for dep in value:
             try:
                 Requirement(dep)
@@ -241,7 +244,7 @@ class PluginManifest(BaseModel):
                 ) from exc
         return value
 
-    # --- Model validator -------------------------------------------------- #
+    # --- Model-level validators ----------------------------------------- #
 
     @model_validator(mode="after")
     def _validate_version_range(self) -> PluginManifest:
@@ -265,17 +268,17 @@ def load_manifest(path: Path) -> PluginManifest:
     """Parse and validate a ``nexus.plugin.yaml`` file.
 
     Args:
-        path: Path to the manifest. May be either the manifest itself or the
-            directory containing it (in which case ``nexus.plugin.yaml`` is
-            appended).
+        path: Path to the manifest, or to the directory containing it (in
+            which case :data:`MANIFEST_FILENAME` is appended).
 
     Returns:
-        The validated manifest.
+        The validated, immutable manifest.
 
     Raises:
-        PluginError: If the file is missing, cannot be parsed as YAML, does
-            not contain a mapping, or fails schema validation. The error
-            message includes the offending field and value.
+        PluginError: If the file is missing, cannot be read, is not valid
+            YAML, does not contain a mapping, or fails schema validation.
+            The message includes the offending field and value, so a CI
+            failure is actionable without opening a debugger.
     """
     if path.is_dir():
         path = path / MANIFEST_FILENAME
@@ -285,7 +288,9 @@ def load_manifest(path: Path) -> PluginManifest:
     try:
         raw_text = path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise PluginError(f"cannot read plugin manifest {path}: {exc}") from exc
+        raise PluginError(
+            f"cannot read plugin manifest {path}: {exc}"
+        ) from exc
 
     try:
         parsed: Any = yaml.safe_load(raw_text)
@@ -312,7 +317,11 @@ def load_manifest(path: Path) -> PluginManifest:
 
 
 def _running_python_version() -> Version:
-    """Return the running interpreter version as a ``packaging.Version``."""
+    """Return the running interpreter version as a :class:`packaging.version.Version`.
+
+    Returns:
+        E.g. ``Version("3.12.5")``.
+    """
     info = sys.version_info
     return Version(f"{info.major}.{info.minor}.{info.micro}")
 
@@ -327,7 +336,8 @@ def validate_manifest_compatibility(
 
     The upper bound is **exclusive**: a manifest declaring
     ``max_nexusdl_version: "4.0.0"`` accepts hosts up to (but not including)
-    ``4.0.0``.
+    ``4.0.0``. This matches the semantics documented in the manifest template
+    and in ``docs/source/development/plugins.md``.
 
     Args:
         manifest: Manifest returned by :func:`load_manifest`.
@@ -374,38 +384,6 @@ def validate_manifest_compatibility(
 # --------------------------------------------------------------------------- #
 
 
-def get_declared_hooks(manifest: PluginManifest) -> frozenset[str]:
-    """Return the set of hooks the manifest opts into.
-
-    Args:
-        manifest: A validated manifest.
-
-    Returns:
-        A frozen set of hook names (possibly empty).
-    """
-    return frozenset(manifest.hooks)
-
-
-def get_implemented_hooks(plugin_cls: type) -> frozenset[str]:
-    """Return the set of hooks the plugin class actually implements.
-
-    A hook is considered *implemented* when the class exposes a callable
-    attribute with that exact name — whether the method is declared
-    explicitly or inherited from a mixin.
-
-    Args:
-        plugin_cls: The plugin class to inspect.
-
-    Returns:
-        A frozen set of hook names, subset of :data:`HOOK_NAMES`.
-    """
-    return frozenset(
-        hook
-        for hook in HOOK_NAMES
-        if callable(getattr(plugin_cls, hook, None))
-    )
-
-
 def validate_class_matches_manifest(
     plugin_cls: type,
     manifest: PluginManifest,
@@ -416,11 +394,13 @@ def validate_class_matches_manifest(
 
     1. The class declares ``name`` equal to ``manifest.name``.
     2. The class declares ``version`` equal to ``manifest.version``.
-    3. Every hook listed in ``manifest.hooks`` exists on the class, and its
-       sync/async flavour matches :data:`SYNC_HOOKS` / :data:`ASYNC_HOOKS`.
+    3. Every hook listed in ``manifest.hooks`` is implemented on the class
+       with the correct sync/async flavour. The flavour check is delegated to
+       :func:`nexusdl.plugins.hooks.check_hook_flavour` so this module never
+       duplicates the sync/async knowledge.
 
     Hooks present on the class but absent from the manifest are *not* an
-    error — the loader simply will not dispatch them.
+    error: the loader will simply not dispatch them.
 
     Args:
         plugin_cls: The plugin class to validate.
@@ -432,7 +412,8 @@ def validate_class_matches_manifest(
     """
     if not isinstance(plugin_cls, type):
         raise PluginError(
-            f"expected a class, got {type(plugin_cls).__name__}: {plugin_cls!r}"
+            f"expected a class, got {type(plugin_cls).__name__}: "
+            f"{plugin_cls!r}"
         )
 
     qualname = f"{plugin_cls.__module__}.{plugin_cls.__qualname__}"
@@ -452,23 +433,7 @@ def validate_class_matches_manifest(
         )
 
     for hook in manifest.hooks:
-        attr = getattr(plugin_cls, hook, None)
-        if not callable(attr):
-            raise PluginError(
-                f"manifest declares hook {hook!r} but {qualname} "
-                f"does not implement it"
-            )
-        is_async = asyncio.iscoroutinefunction(attr)
-        if hook in SYNC_HOOKS and is_async:
-            raise PluginError(
-                f"{qualname}.{hook} must be a regular ``def`` "
-                f"(got ``async def``)"
-            )
-        if hook in ASYNC_HOOKS and not is_async:
-            raise PluginError(
-                f"{qualname}.{hook} must be declared ``async def`` "
-                f"(got a regular function)"
-            )
+        check_hook_flavour(plugin_cls, hook)
 
 
 # --------------------------------------------------------------------------- #
@@ -487,7 +452,7 @@ def validate_plugin(
 
     Convenience wrapper combining :func:`load_manifest`,
     :func:`validate_manifest_compatibility`, and
-    :func:`validate_class_matches_manifest`.
+    :func:`validate_class_matches_manifest`, in that order.
 
     Args:
         manifest_path: Path to ``nexus.plugin.yaml`` (or the directory
@@ -502,8 +467,7 @@ def validate_plugin(
         for ``name``, ``version``, and the set of hooks to dispatch.
 
     Raises:
-        PluginError: On any structural, compatibility, or conformance
-            failure.
+        PluginError: On any structural, compatibility, or conformance failure.
     """
     manifest = load_manifest(manifest_path)
     validate_manifest_compatibility(
@@ -524,26 +488,13 @@ def export_json_schema() -> dict[str, Any]:
     """Return the JSON Schema for :class:`PluginManifest`.
 
     Intended for tooling: editors, ``scripts/validate_sites.py``-style
-    helpers, and CI can consume it to validate manifests without importing
-    the full framework. The output is deterministic for a given Pydantic
-    version.
+    helpers, and CI can consume the output to validate manifests without
+    importing the full framework. The output is deterministic for a given
+    Pydantic version, so it can be committed to ``data/plugin_schema.json``
+    and regenerated by a ``make schema`` target without spurious diffs.
 
     Returns:
-        A JSON-schema-compatible dictionary.
+        A JSON-schema-compatible dictionary (draft 2020-12, as emitted by
+        Pydantic v2).
     """
     return PluginManifest.model_json_schema()
-
-
-# --------------------------------------------------------------------------- #
-# Internal helpers — re-exported only for tests                               #
-# --------------------------------------------------------------------------- #
-
-
-def _iter_manifest_fields() -> Iterable[str]:
-    """Yield the name of every declared manifest field.
-
-    Kept private; used by tests to assert the manifest field set matches
-    the documentation. Exposed via ``__all__`` only for the constant
-    ``MANIFEST_FILENAME``, not this helper.
-    """
-    yield from PluginManifest.model_fields

@@ -1,31 +1,52 @@
 # =============================================================================
 # nexus.plugin.yaml — NexusDL plugin manifest (reference example)
 # =============================================================================
-# Schema : src/nexusdl/data/plugin_schema.json
-#          (validated by nexusdl/plugins/validators.py before the loader
-#           imports plugin.py; a manifest that fails validation aborts the
-#           load with PluginError — it is never silently disabled).
+# Schema : pydantic model ``nexusdl.plugins.validators.PluginManifest``
+#          (``extra="forbid"``, ``frozen=True``, strings stripped). This file
+#          is parsed and validated by ``load_manifest()`` *before* plugin.py
+#          is imported; any schema violation aborts the load with
+#          ``PluginError`` and the offending field is named in the message.
+#          A JSON Schema can be generated on demand from the Pydantic model
+#          via ``nexusdl.plugins.validators.export_json_schema()`` — there is
+#          no hand-maintained schema file to drift.
 # Docs   : docs/source/development/plugins.md
 # -----------------------------------------------------------------------------
-# This manifest MUST live side-by-side with the plugin.py it describes.
+# This manifest MUST live side-by-side with the ``plugin.py`` it describes.
 # It is NEVER a secret store: authentication tokens, API keys, and site
-# credentials belong in .env (see docs/usage/configuration.md), never here.
+# credentials belong in ``.env`` (see docs/usage/configuration.md), never here.
+# -----------------------------------------------------------------------------
+# Naming note: this directory is ``_example/``. The loader skips every
+# directory whose name starts with an underscore (see
+# ``PluginLoader._iter_plugin_dirs``), so this reference plugin is never
+# loaded automatically. To use it as a template:
+#
+#   1. Copy the whole ``_example/`` directory to your plugin directory.
+#   2. Rename the copy so it no longer starts with ``_``.
+#   3. Update ``name`` and ``version`` below AND the matching class
+#      attributes in plugin.py — the loader cross-checks both.
+#   4. Replace the hook bodies with your own logic.
 # =============================================================================
 
 # --- Identity ---------------------------------------------------------------
-# ``name`` and ``version`` must match the ``name`` / ``version`` class
-# attributes on the plugin class in plugin.py — the loader cross-checks both
-# and raises PluginError on mismatch.
+# ``name`` and ``version`` MUST match the corresponding class attributes on
+# the plugin class in plugin.py. Cross-checked by
+# ``validate_class_matches_manifest``; a mismatch aborts the load with
+# PluginError. ``name`` must match ``^[a-z][a-z0-9_-]*$``.
 name: example
-version: 1.0.0
+version: "1.0.0"
 
 # --- Authorship -------------------------------------------------------------
+# ``email`` and ``homepage`` are optional and free-form: they are surfaced
+# in ``nexusdl plugins info`` but not validated as URL/email, since a plugin
+# may legitimately point at a self-hosted forge, a git mirror, or no URL at
+# all.
 author: Voldigoad-Holdings
 email: voldigoad-holdings@users.noreply.github.com
 homepage: https://github.com/Voldigoad-Holdings/nexus-dl
 
 # --- Description ------------------------------------------------------------
-# Rendered verbatim in `nexusdl plugins list` and in the web UI.
+# Rendered verbatim in ``nexusdl plugins list`` and in the web UI. One short
+# paragraph is the norm. Folding (``>-``) collapses newlines into spaces.
 description: >-
   Reference NexusDL plugin. Exercises every hook of the NexusPlugin protocol
   as a strictly-transparent passthrough and persists a small statistics file
@@ -33,33 +54,55 @@ description: >-
   never modifies the download pipeline.
 
 # --- Licensing --------------------------------------------------------------
-# Must be an SPDX identifier. GPL-3.0-or-later is required for plugins that
-# link against nexusdl core at runtime, per LICENSE (see docs/development/
-# contributing.md).
+# SPDX identifier. GPL-3.0-or-later is required for plugins that link against
+# nexusdl core at runtime (see docs/source/development/contributing.md).
 license: GPL-3.0-or-later
 
 # --- Compatibility ----------------------------------------------------------
-# Semver bounds against the *host* NexusDL version.
-#   * min_nexusdl_version is INCLUSIVE  (>= 3.0.0)
-#   * max_nexusdl_version is EXCLUSIVE  (<  4.0.0)
-# Pre-release identifiers (e.g. "3.0.0-rc1") follow the same rules.
+# Both version strings are parsed with ``packaging.version.Version``.
+#
+#   * ``min_nexusdl_version`` is INCLUSIVE  (host >= 3.0.0)
+#   * ``max_nexusdl_version`` is EXCLUSIVE  (host <  4.0.0)
+#   * Omit ``max_nexusdl_version`` (or set it to ``null``) for "no upper
+#     bound". A manifest whose ``max`` is not strictly greater than ``min``
+#     is rejected at parse time.
 min_nexusdl_version: "3.0.0"
 max_nexusdl_version: "4.0.0"
 
-# PEP 440 specifier against the *interpreter* running NexusDL.
-# The project itself requires Python >= 3.12 (see pyproject.toml), so a
-# plugin cannot declare anything narrower without failing on load.
+# PEP 440 specifier against the interpreter running NexusDL. Parsed with
+# ``packaging.specifiers.SpecifierSet``. The host project itself requires
+# Python >= 3.12 (see pyproject.toml), so a plugin cannot meaningfully
+# declare anything narrower. Omit the key for "no constraint".
 python_requires: ">=3.12"
 
 # --- Declared hooks ---------------------------------------------------------
-# Must be an exact subset of the NexusPlugin protocol's method names
-# (see nexusdl/plugins/api.py). Listing a hook here does NOT oblige the
-# plugin to override it — the loader only instantiates the hooks you declare,
-# which keeps dispatch cheap. Declaring a hook that the class does not
-# implement raises PluginError at load time.
+# Every entry MUST be a known hook name — see ``nexusdl.plugins.hooks`` for
+# the canonical list and each hook's sync/async flavour:
 #
-# All six hooks are declared here because ExamplePlugin (plugin.py)
-# implements every one of them explicitly.
+#   on_load              sync    mandatory (declared on NexusPlugin)
+#   on_unload            sync    mandatory (declared on NexusPlugin)
+#   on_before_download   async   optional
+#   on_after_download    async   optional
+#   on_page_downloaded   async   optional
+#   on_error             async   optional
+#
+# Unknown names and duplicate entries are rejected at parse time
+# (``PluginManifest._validate_hooks_no_duplicates`` + the ``HookName``
+# Literal). For each name listed here, ``validate_class_matches_manifest``
+# checks that the plugin class actually implements it with the correct
+# flavour — a declared-but-missing hook is a load error, not a silent no-op.
+#
+# Two directions are independent:
+#
+#   * Declaring a hook does NOT make it mandatory. A plugin may list only
+#     the subset it actually implements; the loader dispatches only to what
+#     is declared here.
+#   * Implementing a hook without declaring it here is NOT an error — the
+#     loader simply never calls it. This lets a plugin reuse a shared base
+#     class that carries no-op defaults without paying for dispatch it does
+#     not need.
+#
+# ExamplePlugin (plugin.py) implements all six, so all six are declared.
 hooks:
   - on_load
   - on_unload
@@ -69,33 +112,13 @@ hooks:
   - on_error
 
 # --- Dependencies -----------------------------------------------------------
-# Python packages installed in the same interpreter that this plugin requires.
-# Uses PEP 440 specifiers. The loader refuses to activate a plugin whose
-# dependencies are unsatisfied (it does NOT auto-install them).
+# PEP 508 requirement strings (``packaging.requirements.Requirement``).
+# The loader checks these are satisfied in the current interpreter before
+# activating the plugin; it never installs anything. This example uses only
+# the standard library and nexusdl itself, so the list is empty.
 #
-# This example is pure stdlib, so the list is empty. The key must still be
-# present (schema requires it) so authors are forced to make the "no deps"
-# choice explicit rather than implicit.
+# The key is optional (Pydantic default: empty tuple), but keeping it
+# explicit — even when empty — documents the author's intent. An empty
+# value (``dependencies:`` with no list) is also accepted and treated as
+# an empty collection.
 dependencies: []
-
-# =============================================================================
-# Entry-point convention (informative — not a manifest field)
-# -----------------------------------------------------------------------------
-# The loader locates the implementation as follows:
-#
-#   1. Import the sibling ``plugin.py`` module.
-#   2. Scan for exactly ONE public top-level class that structurally
-#      conforms to ``nexusdl.plugins.api.NexusPlugin``
-#      (checked via ``isinstance(x, NexusPlugin)`` — the Protocol is
-#      ``@runtime_checkable``).
-#   3. If zero candidates are found  → PluginError("no NexusPlugin class").
-#   4. If two or more candidates     → PluginError("ambiguous entry point").
-#
-# Consequence for authors: keep the conforming class unique. Helper classes
-# are fine as long as they do not accidentally satisfy the protocol (which
-# requires ``name``, ``version``, ``on_load``, ``on_unload``, and the four
-# async hooks — helper classes typically miss at least one).
-#
-# If a future ADR introduces an explicit ``entry_point: module:Class`` field,
-# it will be added here and remain optional for backward compatibility.
-# =============================================================================

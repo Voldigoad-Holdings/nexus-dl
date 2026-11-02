@@ -1,84 +1,87 @@
 """Canonical definitions and introspection helpers for NexusDL plugin hooks.
 
-This module is the **single source of truth** for the set of hooks that make
-up the :class:`~nexusdl.plugins.api.NexusPlugin` protocol. Everything that
-needs to know "which hooks exist, what flavour (sync/async) each one is, and
-what the plugin class actually implements" imports from here:
+This module is the **single source of truth** for every hook that makes up
+the :class:`~nexusdl.plugins.api.NexusPlugin` protocol. The name of every
+hook, its sync/async flavour, and its one-line summary live here and here
+only. Anywhere else that needs to reference a hook imports from this module
+— never a string literal, never a duplicate constant.
 
-* :mod:`nexusdl.plugins.validators` — validates ``manifest.hooks`` against
-  :data:`ALL_HOOK_NAMES` and checks each declared hook's sync/async flavour
-  against :data:`SYNC_HOOK_NAMES` / :data:`ASYNC_HOOK_NAMES`.
-* :mod:`nexusdl.plugins.loader` — uses :func:`collect_implemented_hooks` in
-  error messages and :func:`check_hook_flavour` for conformance.
-* :mod:`nexusdl.interfaces.cli.commands` — uses :data:`HOOK_SPECS` to render
-  ``nexusdl plugins list`` and ``nexusdl plugins info``.
-* Tests — :func:`verify_protocol_consistency` catches drift between this
-  module and :class:`~nexusdl.plugins.api.NexusPlugin`.
+Consumers
+---------
+* :mod:`nexusdl.plugins.validators` — uses :data:`HookName` to type
+  ``manifest.hooks`` and :func:`check_hook_flavour` to validate each declared
+  hook against the plugin class.
+* :mod:`nexusdl.plugins.loader` — imports the six ``HOOK_ON_*`` constants and
+  uses them everywhere it dispatches.
+* CLI / docs (future) — use :data:`HOOK_SPECS` and its helpers to render
+  ``nexusdl plugins list`` / ``nexusdl plugins info`` and the generated
+  "Plugin hooks" section of ``docs/source/development/plugins.md``.
+* Tests — call :func:`verify_protocol_consistency` to catch drift between
+  this module and :mod:`nexusdl.plugins.api`.
 
-If you add, rename, or change the flavour of a hook, the only correct place
-to start is **here** — then mirror the change in ``api.py`` and run
-``verify_protocol_consistency`` (exposed as a test).
+Contract
+--------
+Two hooks are **mandatory** for every plugin: :data:`HOOK_ON_LOAD` and
+:data:`HOOK_ON_UNLOAD`. Both are synchronous. They are the only hooks
+declared on :class:`~nexusdl.plugins.api.NexusPlugin` itself, because a
+``Protocol`` cannot express "optional method".
 
-Dependency graph::
+The remaining four hooks are **optional** and asynchronous. A plugin opts
+into them by listing them in the ``hooks:`` field of its
+``nexus.plugin.yaml``; the loader dispatches only to plugins that opted in.
+
+Adding, renaming, or changing the flavour of a hook requires editing exactly
+two files: this one and :mod:`nexusdl.plugins.api`. Every other module in
+the package adapts automatically, and :func:`verify_protocol_consistency`
+guarantees the two stay in sync.
+
+Dependency graph (no cycles)::
 
     core.exceptions.PluginError
                   ▲
                   │
-              hooks.py            ← you are here (no plugins.* imports)
+              hooks.py              ← you are here
                   ▲
                   │
           validators.py  ─►  loader.py  ─►  interfaces/*
-
-No module in this package may import from :mod:`nexusdl.plugins.hooks` at
-import time except :mod:`validators`, :mod:`loader`, and interface modules —
-:mod:`api` and :mod:`_example.*` must remain independent so ``hooks.py`` can
-be imported without pulling in the concrete plugin protocol.
 """
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Mapping
+import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 from nexusdl.core.exceptions import PluginError
 
-if TYPE_CHECKING:
-    from nexusdl.core.models.download import DownloadResult, DownloadTask
-    from nexusdl.core.models.page import Page
-    from nexusdl.plugins.api import PluginContext
-
 
 __all__ = [
-    # Canonical hook names (constants)
+    # Canonical hook names
     "HOOK_ON_LOAD",
     "HOOK_ON_UNLOAD",
     "HOOK_ON_BEFORE_DOWNLOAD",
     "HOOK_ON_AFTER_DOWNLOAD",
     "HOOK_ON_PAGE_DOWNLOADED",
     "HOOK_ON_ERROR",
-    # Aggregated views
-    "ALL_HOOK_NAMES",
-    "ASYNC_HOOK_NAMES",
-    "SYNC_HOOK_NAMES",
-    "HOOK_SPECS",
-    "HOOK_SPECS_BY_NAME",
-    # Type aliases
+    # Types
     "HookFlavour",
     "HookName",
     "HookSpec",
-    # Introspection — static (name-based)
+    # Aggregated views
+    "ALL_HOOK_NAMES",
+    "ASYNC_HOOK_NAMES",
+    "HOOK_SPECS",
+    "HOOK_SPECS_BY_NAME",
+    "SYNC_HOOK_NAMES",
+    # Introspection
+    "check_hook_flavour",
     "get_hook_flavour",
     "get_hook_spec",
     "is_async_hook",
     "is_known_hook",
     "is_sync_hook",
-    # Introspection — dynamic (class-based)
-    "check_hook_flavour",
-    "collect_implemented_hooks",
-    "implements_hook",
     # Test helper
     "verify_protocol_consistency",
 ]
@@ -87,9 +90,9 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # Canonical hook names                                                        #
 # --------------------------------------------------------------------------- #
-# These literals are the source of truth. Do not stringify them elsewhere —
-# always reference the constant. ``HookName`` below is a ``Literal`` of the
-# *values*, so a typo in a caller triggers ``mypy --strict`` immediately.
+# These literals are the source of truth. Never write "on_load" (or any other
+# hook name) as a string literal elsewhere in the codebase — import the
+# constant instead.
 # --------------------------------------------------------------------------- #
 
 HOOK_ON_LOAD: Final = "on_load"
@@ -100,8 +103,11 @@ HOOK_ON_PAGE_DOWNLOADED: Final = "on_page_downloaded"
 HOOK_ON_ERROR: Final = "on_error"
 
 
-#: Closed union of every hook name. Use this type wherever a function takes
-#: or returns "a hook" — it makes ``mypy --strict`` catch typos.
+#: Closed union of every hook name. Used wherever a function takes or returns
+#: "a hook" so ``mypy --strict`` catches typos at compile time. It mirrors the
+#: six constants above; :func:`verify_protocol_consistency` does **not** check
+#: this alias directly, but the fact that :data:`HOOK_SPECS` uses ``HookName``
+#: as its ``name`` field type means a mismatch is caught by mypy.
 HookName: TypeAlias = Literal[
     "on_load",
     "on_unload",
@@ -111,7 +117,7 @@ HookName: TypeAlias = Literal[
     "on_error",
 ]
 
-#: Whether a hook must be declared ``def`` or ``async def`` on the plugin class.
+#: Whether a hook must be declared as a regular ``def`` or an ``async def``.
 HookFlavour: TypeAlias = Literal["sync", "async"]
 
 
@@ -124,74 +130,87 @@ HookFlavour: TypeAlias = Literal["sync", "async"]
 class HookSpec:
     """Static description of a single plugin hook.
 
-    Rendered verbatim by ``nexusdl plugins list`` / ``nexusdl plugins info``
-    and by ``docs/source/development/plugins.md`` (generated section). The
-    ``summary`` is user-facing: keep it one sentence, imperative, no trailing
-    period.
+    ``summary`` is user-facing: it is rendered verbatim by the CLI
+    (``nexusdl plugins info``) and by the generated "Plugin hooks" section of
+    the developer documentation. Keep it one sentence, imperative, no
+    trailing period, no code formatting.
 
     Attributes:
         name: The hook's method name on the plugin class.
         flavour: ``"sync"`` for :data:`HOOK_ON_LOAD` / :data:`HOOK_ON_UNLOAD`,
-            ``"async"`` for the four pipeline hooks.
+            ``"async"`` for the four optional pipeline hooks.
         summary: One-line description shown in CLI output and docs.
+        mandatory: ``True`` for hooks every plugin must implement. Mandatory
+            hooks are also declared on
+            :class:`~nexusdl.plugins.api.NexusPlugin`; optional hooks are not.
     """
 
     name: HookName
     flavour: HookFlavour
     summary: str
+    mandatory: bool
 
 
-#: Ordered tuple of every hook, in lifecycle order: load → pipeline → unload.
-#: Order matters for the CLI listing (``nexusdl plugins info`` renders them
-#: in this order) but is otherwise not significant.
+#: Every hook, in lifecycle order: load → pipeline → unload. Order matters for
+#: the CLI listing but is otherwise not significant.
 HOOK_SPECS: Final[tuple[HookSpec, ...]] = (
     HookSpec(
         name="on_load",
         flavour="sync",
         summary="Receive the plugin context and initialize state",
+        mandatory=True,
     ),
     HookSpec(
         name="on_before_download",
         flavour="async",
         summary="Inspect or transform a task before it starts downloading",
+        mandatory=False,
     ),
     HookSpec(
         name="on_after_download",
         flavour="async",
         summary="Observe or transform a completed download result",
+        mandatory=False,
     ),
     HookSpec(
         name="on_page_downloaded",
         flavour="async",
         summary="Be notified of each page written to disk",
+        mandatory=False,
     ),
     HookSpec(
         name="on_error",
         flavour="async",
         summary="Be notified when a download task fails",
+        mandatory=False,
     ),
     HookSpec(
         name="on_unload",
         flavour="sync",
         summary="Persist state and release resources before shutdown",
+        mandatory=True,
     ),
 )
 
-#: Immutable name→spec lookup, computed once at import.
-HOOK_SPECS_BY_NAME: Final[Mapping[HookName, HookSpec]] = MappingProxyType(
+#: Immutable name→spec lookup. Typed as ``Mapping[str, HookSpec]`` (rather
+#: than ``Mapping[HookName, HookSpec]``) so callers can look up an arbitrary
+#: string and get ``None`` on miss; callers who *know* the value is a
+#: ``HookName`` lose nothing. The keys are guaranteed to be ``HookName``
+#: because ``HOOK_SPECS`` types its ``name`` field as ``HookName``.
+HOOK_SPECS_BY_NAME: Final[Mapping[str, HookSpec]] = MappingProxyType(
     {spec.name: spec for spec in HOOK_SPECS}
 )
 
-#: Every hook name, as a frozen set. Used by :mod:`validators` to reject
-#: unknown names in ``manifest.hooks``.
+#: Every hook name, as a frozen set of ``str``. Used by callers that need to
+#: validate arbitrary strings (e.g. ``manifest.hooks`` cross-checks).
 ALL_HOOK_NAMES: Final[frozenset[str]] = frozenset(HOOK_SPECS_BY_NAME)
 
-#: Hooks that must be declared ``def`` (not ``async def``).
+#: Hooks that must be declared as a regular ``def``.
 SYNC_HOOK_NAMES: Final[frozenset[str]] = frozenset(
     spec.name for spec in HOOK_SPECS if spec.flavour == "sync"
 )
 
-#: Hooks that must be declared ``async def``.
+#: Hooks that must be declared as an ``async def``.
 ASYNC_HOOK_NAMES: Final[frozenset[str]] = frozenset(
     spec.name for spec in HOOK_SPECS if spec.flavour == "async"
 )
@@ -206,11 +225,11 @@ def is_known_hook(name: str) -> bool:
     """Return ``True`` iff *name* is a hook declared in :data:`HOOK_SPECS`.
 
     Args:
-        name: Candidate hook name.
+        name: Candidate hook name (arbitrary string).
 
     Returns:
         ``True`` for the six canonical hooks, ``False`` for anything else
-        (including names that look like hooks, e.g. ``"on_startup"``).
+        (including names that *look* like hooks, e.g. ``"on_startup"``).
     """
     return name in HOOK_SPECS_BY_NAME
 
@@ -226,10 +245,10 @@ def get_hook_spec(name: str) -> HookSpec:
 
     Raises:
         PluginError: If *name* is not a known hook. The message lists every
-            valid name so callers can fix their typo without consulting
-            another file.
+            valid name so callers can fix the typo without opening another
+            file.
     """
-    spec = HOOK_SPECS_BY_NAME.get(name)  # type: ignore[arg-type]
+    spec = HOOK_SPECS_BY_NAME.get(name)
     if spec is None:
         raise PluginError(
             f"unknown plugin hook {name!r}; valid hooks are "
@@ -259,7 +278,7 @@ def is_sync_hook(name: str) -> bool:
     Args:
         name: Candidate hook name. Unknown names return ``False``.
     """
-    spec = HOOK_SPECS_BY_NAME.get(name)  # type: ignore[arg-type]
+    spec = HOOK_SPECS_BY_NAME.get(name)
     return spec is not None and spec.flavour == "sync"
 
 
@@ -269,7 +288,7 @@ def is_async_hook(name: str) -> bool:
     Args:
         name: Candidate hook name. Unknown names return ``False``.
     """
-    spec = HOOK_SPECS_BY_NAME.get(name)  # type: ignore[arg-type]
+    spec = HOOK_SPECS_BY_NAME.get(name)
     return spec is not None and spec.flavour == "async"
 
 
@@ -278,64 +297,24 @@ def is_async_hook(name: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def implements_hook(cls: type, name: str) -> bool:
-    """Return ``True`` iff *cls* exposes a callable attribute named *name*.
-
-    "Implemented" is defined structurally: the attribute exists on the class
-    (whether declared explicitly or inherited from a mixin) and is callable.
-    This matches how :mod:`loader` decides whether to dispatch.
-
-    Args:
-        cls: The plugin class to inspect.
-        name: A known hook name.
-
-    Returns:
-        ``True`` iff the attribute exists and is callable. Unknown hook names
-        return ``False`` (they are never implemented by a well-formed class).
-    """
-    if not is_known_hook(name):
-        return False
-    return callable(getattr(cls, name, None))
-
-
-def collect_implemented_hooks(cls: type) -> dict[HookName, Callable[..., Any]]:
-    """Return every hook implemented by *cls*, keyed by hook name.
-
-    Iterates :data:`HOOK_SPECS` in canonical order, so the resulting dict is
-    deterministic. Used by :mod:`loader` for diagnostic messages and by tests
-    to assert conformance.
-
-    Args:
-        cls: The plugin class to inspect.
-
-    Returns:
-        A mapping ``hook_name -> callable`` for every implemented hook. The
-        returned callables are the raw attributes (unbound functions for
-        regular methods; the class attribute itself for ``staticmethod`` /
-        ``classmethod``). Bind them on the instance if you need ``self``.
-    """
-    return {
-        spec.name: getattr(cls, spec.name)
-        for spec in HOOK_SPECS
-        if implements_hook(cls, spec.name)
-    }
-
-
-def check_hook_flavour(cls: type, name: str) -> None:
+def check_hook_flavour(cls: type, name: HookName) -> None:
     """Validate the sync/async flavour of *cls*'s implementation of *name*.
 
-    Split out from :func:`~nexusdl.plugins.validators.validate_class_matches_manifest`
-    so the same check can be reused from other call sites (e.g. plugin-author
-    test helpers, ``nexusdl plugins check``).
+    Called by :func:`nexusdl.plugins.validators.validate_class_matches_manifest`
+    for every hook declared in the plugin's manifest, and reusable from any
+    other site that wants the same guarantee (e.g. a plugin-author test
+    helper).
 
     Args:
         cls: The plugin class to inspect.
-        name: A known hook name that *cls* is expected to implement.
+        name: A known hook name (typed ``HookName`` so a caller passing an
+            unknown literal fails under ``mypy --strict``; a caller passing a
+            dynamic string should call :func:`is_known_hook` first).
 
     Raises:
-        PluginError: If *name* is unknown; if *cls* does not implement it; or
-            if the implementation's flavour (``def`` vs ``async def``) does
-            not match :data:`HOOK_SPECS_BY_NAME`.
+        PluginError: If *cls* does not implement *name*, or if the
+            implementation's flavour (``def`` vs ``async def``) does not
+            match :data:`HOOK_SPECS_BY_NAME`.
     """
     spec = get_hook_spec(name)
     attr = getattr(cls, spec.name, None)
@@ -346,61 +325,81 @@ def check_hook_flavour(cls: type, name: str) -> None:
             f"{qualname} must be implemented (declared in manifest hooks)"
         )
 
-    is_async = asyncio.iscoroutinefunction(attr)
+    is_async = inspect.iscoroutinefunction(attr)
     if spec.flavour == "sync" and is_async:
         raise PluginError(
             f"{qualname} must be a regular ``def`` (got ``async def``)"
         )
     if spec.flavour == "async" and not is_async:
         raise PluginError(
-            f"{qualname} must be declared ``async def`` (got a regular function)"
+            f"{qualname} must be declared ``async def`` "
+            f"(got a regular function)"
         )
 
 
 # --------------------------------------------------------------------------- #
-# Drift detection — used by the test suite only                              #
+# Drift detection — used by the test suite only                               #
 # --------------------------------------------------------------------------- #
 
 
 def verify_protocol_consistency() -> None:
     """Assert that :class:`~nexusdl.plugins.api.NexusPlugin` matches this module.
 
-    Compares the protocol's public ``on_*`` members (methods and attributes)
-    against :data:`ALL_HOOK_NAMES`. Intended to be called from a single test
-    (``tests/unit/plugins/test_hooks.py::test_protocol_consistency``) so
-    that adding a hook to one module without the other fails CI with a
-    precise message rather than surfacing later as a mysterious dispatch bug.
+    Three things are verified:
 
-    Not called from production code — kept side-effect-free so import order
-    cannot accidentally trigger it.
+    1. Every hook declared on ``NexusPlugin`` is a known hook in
+       :data:`ALL_HOOK_NAMES` (no typo or stale name in the protocol).
+    2. Every **mandatory** sync hook (:data:`SYNC_HOOK_NAMES`) is declared on
+       ``NexusPlugin``. Optional async hooks are allowed to be absent.
+    3. Every hook declared on ``NexusPlugin`` has the same sync/async flavour
+       as its :data:`HookSpec`.
+
+    Intended to be called from a single test
+    (``tests/unit/plugins/test_hooks.py::test_protocol_consistency``) so that
+    editing ``api.py`` without mirroring the change here — or vice versa —
+    fails CI with a precise message instead of surfacing later as a
+    mysterious dispatch bug.
+
+    Import of :mod:`nexusdl.plugins.api` is deferred so this module can be
+    imported during partial bootstrapping.
 
     Raises:
-        AssertionError: If the protocol and :data:`ALL_HOOK_NAMES` disagree.
-            The message lists the symmetric difference.
+        AssertionError: On any drift. The message names the offending hook
+            and, where relevant, its two conflicting flavours.
     """
-    # Imported lazily to keep ``hooks.py`` importable standalone (e.g. during
-    # partial bootstrapping of ``nexusdl.plugins``).
     from nexusdl.plugins.api import NexusPlugin  # noqa: PLC0415
 
-    protocol_hooks = frozenset(
-        name
-        for name in dir(NexusPlugin)
-        if name.startswith("on_")
-        and not name.startswith("_")
-        and name in ALL_HOOK_NAMES | frozenset(dir(NexusPlugin))
-    )
-    # The dir() of a Protocol includes inherited ``object`` attributes, so
-    # filter to names that *look* like hooks (``on_*`` and not dunder).
-    protocol_hooks = frozenset(
+    protocol_hooks: frozenset[str] = frozenset(
         name for name in dir(NexusPlugin) if name.startswith("on_")
     )
 
-    missing_in_hooks = protocol_hooks - ALL_HOOK_NAMES
-    missing_in_protocol = ALL_HOOK_NAMES - protocol_hooks
-
-    if missing_in_hooks or missing_in_protocol:
+    # 1. No unknown hook in the protocol.
+    unknown_in_protocol = protocol_hooks - ALL_HOOK_NAMES
+    if unknown_in_protocol:
         raise AssertionError(
-            "NexusPlugin protocol and plugins.hooks are out of sync. "
-            f"Hooks in NexusPlugin but not in hooks.py: {sorted(missing_in_hooks)}. "
-            f"Hooks in hooks.py but not in NexusPlugin: {sorted(missing_in_protocol)}."
+            f"NexusPlugin declares hook(s) not present in hooks.py: "
+            f"{sorted(unknown_in_protocol)}. "
+            f"Known hooks: {sorted(ALL_HOOK_NAMES)}."
         )
+
+    # 2. Every mandatory hook is declared on the protocol.
+    missing_mandatory = SYNC_HOOK_NAMES - protocol_hooks
+    if missing_mandatory:
+        raise AssertionError(
+            f"Mandatory hook(s) declared in hooks.py but missing from "
+            f"NexusPlugin: {sorted(missing_mandatory)}."
+        )
+
+    # 3. Flavour matches between api.py and hooks.py.
+    for hook_name in protocol_hooks:
+        attr = getattr(NexusPlugin, hook_name)
+        proto_is_async = inspect.iscoroutinefunction(attr)
+        spec_is_async = is_async_hook(hook_name)
+        if proto_is_async != spec_is_async:
+            raise AssertionError(
+                f"Flavour mismatch for hook {hook_name!r}: "
+                f"NexusPlugin declares "
+                f"{'async' if proto_is_async else 'sync'}, "
+                f"hooks.py declares "
+                f"{'async' if spec_is_async else 'sync'}."
+            )

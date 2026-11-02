@@ -2,17 +2,16 @@
 
 The worker is the innermost layer of the download pipeline. It knows how to
 take one chapter from "pending" to "packaged file on disk", and nothing
-else: it does not manage queues, retries across chapters, pause/resume, or
-task-lifecycle events. Those are the manager's responsibility
-(``core/downloader/manager.py``). Keeping the worker focused on a single
-task makes it trivial to test with a mock parser and a real (in-memory)
-packager.
+else: it does not manage queues, cross-chapter retries, pause/resume, or
+task-lifecycle events. Those are the manager's responsibility. Keeping the
+worker focused on a single task makes it trivial to test with a mock parser
+and an in-memory packager.
 
 Dependency inversion
 --------------------
 Two dependencies live outside ``core/`` and are therefore accessed through
 **structural protocols** defined in this module, not through concrete
-imports (see ADR-003 and PROMPT MASTER rule R1):
+imports (PROMPT MASTER rules R1 and R6, ADR-003):
 
 * :class:`ParserProtocol` — satisfied by
   :class:`nexusdl.parsers.base.BaseParser`.
@@ -20,16 +19,63 @@ imports (see ADR-003 and PROMPT MASTER rule R1):
   :class:`nexusdl.plugins.loader.PluginLoader`.
 
 Everything else lives in ``core/`` and is imported directly. In particular,
-``BasePackager`` and ``PackagerFactory`` are already part of the core.
+:class:`~nexusdl.core.packaging.factory.PackagerFactory`,
+:class:`~nexusdl.core.packaging.comic_info.ComicInfo`, and the retry
+controller from :mod:`nexusdl.core.downloader.retry` are all core modules.
+
+Integration contracts (fixed — do not change without updating the worker)
+--------------------------------------------------------------------------
+The worker is built by a ``worker_factory`` created in the composition root
+(CLI/TUI/GUI/Web). That factory closes over the plugin dispatcher and passes
+it to the worker. Concretely, every one of the following is a *stable*
+interface the worker depends on:
+
+* ``Settings.downloader.max_concurrent_pages: int`` — page concurrency
+* ``Settings.downloader.retry`` — duck-typed, passed to
+  :func:`nexusdl.core.downloader.retry.policy_from_settings`
+* ``Settings.storage.downloads_dir: Path | str`` — base output directory
+* ``Settings.packaging.compression_level: int | None`` — optional pass-through
+* ``PackagerFactory.create(fmt) -> BasePackager`` — the packager factory
+* ``BasePackager.package(pages, output, *, metadata=None, compression_level=None) -> Path``
+  where ``pages`` is ``Sequence[tuple[Page, Path]]`` in reading order.
+* ``validate_file(path) -> ValidationResult`` with ``.is_valid: bool`` and
+  ``.error: str | None`` — from :mod:`nexusdl.core.image.validator`
+* ``ComicInfo(...)`` accepts ``title, series, number, language_iso,
+  page_count, summary, year, manga, web, scan_information`` — from
+  :mod:`nexusdl.core.packaging.comic_info`
+* ``EventBus.publish(Event(type=, timestamp=, payload=, id=))`` — from
+  :mod:`nexusdl.core.events`
+* ``slugify(text) -> str`` — from the ``python-slugify`` package
+* ``DownloadStatus.DONE`` / ``DownloadStatus.FAILED``,
+  ``PackagingFormat.{FOLDER,ZIP,CBZ,CB7,PDF,CBT}``, ``Language.*`` — enums
+* ``DownloadTask.id, .chapter, .manga, .format`` — read-only
+* ``DownloadResult(task_id, status, output_path, pages_downloaded,
+  bytes_downloaded, duration_seconds, error, completed_at)`` — construction
+* ``Chapter.id, .title, .number, .url`` — read-only
+* ``Manga.id, .title, .language, .description, .year, .is_manga`` — read-only
+* ``Page.index, .url, .filename`` — read-only
+* Exceptions: ``PageDownloadError``, ``ChapterDownloadError``,
+  ``EmptyChapterError`` — from :mod:`nexusdl.core.exceptions`
+
+If any of these changes, the worker is the *only* file that needs to be
+touched — everything else in the pipeline depends on the worker through the
+:meth:`DownloadWorker.run` signature, which is frozen by the PROMPT MASTER.
 
 Concurrency and cancellation
 ----------------------------
 Pages are downloaded concurrently using :class:`asyncio.TaskGroup` bounded
-by a :class:`asyncio.Semaphore`, so a single page failure cancels the
-remaining downloads in the same chapter rather than waiting for them to
-finish. ``asyncio.CancelledError`` is always propagated untouched — the
-worker never turns cancellation into a "failed result", because the manager
-needs to distinguish the two.
+by a :class:`asyncio.Semaphore`. A single page failure cancels the
+remaining downloads of the same chapter — the worker fails the chapter fast
+rather than waiting for pages that will be discarded anyway.
+
+``asyncio.CancelledError`` always propagates untouched. The three cases the
+``TaskGroup`` unwinding must handle are covered explicitly:
+
+1. Parent cancelled directly → ``except asyncio.CancelledError: raise``.
+2. Every child failure was a cancellation → re-raise as
+   ``CancelledError() from eg``.
+3. At least one real child error → wrap in :class:`ChapterDownloadError`
+   from the first real error.
 
 Failure semantics
 -----------------
@@ -37,8 +83,17 @@ Any exception other than :class:`asyncio.CancelledError` is caught, logged,
 reported to plugins via ``dispatch_on_error``, and returned as a
 :class:`DownloadResult` with ``status=FAILED`` and ``error=<cause>``. The
 worker therefore **never raises for a "normal" failure** — one broken
-chapter cannot abort a multi-chapter run. This is the same convention the
-manager uses when iterating chapters.
+chapter cannot abort a multi-chapter run. This matches how the manager
+iterates chapters.
+
+Retry policy
+------------
+The retry policy is built once per :meth:`run` call via
+:func:`nexusdl.core.downloader.retry.policy_from_settings` and applied to
+each page via :func:`nexusdl.core.downloader.retry.build_retry`. The
+classifier (:func:`~nexusdl.core.downloader.retry.is_retryable`) decides
+which exceptions are worth retrying; the worker does not duplicate that
+knowledge.
 """
 
 from __future__ import annotations
@@ -56,13 +111,12 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from loguru import logger
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
 
+from nexusdl.core.downloader.retry import (
+    RetryPolicy,
+    build_retry,
+    policy_from_settings,
+)
 from nexusdl.core.events import Event, EventBus
 from nexusdl.core.exceptions import (
     ChapterDownloadError,
@@ -77,7 +131,8 @@ from nexusdl.core.models.manga import Manga
 from nexusdl.core.models.page import Page
 from nexusdl.core.packaging.comic_info import ComicInfo
 from nexusdl.core.packaging.factory import PackagerFactory
-from nexusdl.core.utils.text import slugify
+
+from slugify import slugify
 
 if TYPE_CHECKING:
     from nexusdl.core.config import Settings
@@ -94,16 +149,14 @@ __all__ = [
 # Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
-#: Names of the events emitted by the worker. Framework-standard types (see
-#: ``nexusdl.core.events``); not to be confused with ``chapter.*`` events,
-#: which the manager emits when iterating a manga.
+#: Standard event types emitted by the worker (see ``nexusdl.core.events``).
 _EVENT_DOWNLOAD_STARTED: Final[str] = "download.started"
 _EVENT_DOWNLOAD_PROGRESS: Final[str] = "download.progress"
 _EVENT_DOWNLOAD_COMPLETED: Final[str] = "download.completed"
 _EVENT_DOWNLOAD_FAILED: Final[str] = "download.failed"
 
-#: Extension per packaging format. ``FOLDER`` has no extension because the
-#: packager produces a directory, not a file.
+#: Extension per packaging format. ``FOLDER`` produces a directory, hence
+#: the empty extension.
 _FORMAT_EXTENSIONS: Final[Mapping[PackagingFormat, str]] = MappingProxyType(
     {
         PackagingFormat.FOLDER: "",
@@ -115,9 +168,9 @@ _FORMAT_EXTENSIONS: Final[Mapping[PackagingFormat, str]] = MappingProxyType(
     }
 )
 
-#: ISO 639-1 codes for each :class:`Language` enum member. ``UNKNOWN`` maps
-#: to ``"und"`` (undetermined), which is valid per ISO 639-2 and accepted by
-#: ComicInfo readers.
+#: ISO 639-1 codes for each :class:`Language` member. ``UNKNOWN`` maps to
+#: ``"und"`` (undetermined), valid per ISO 639-2 and accepted by ComicInfo
+#: readers (Komga, Kavita, Mihon, YACReader, CDisplayEx).
 _LANGUAGE_ISO_639_1: Final[Mapping[Language, str]] = MappingProxyType(
     {
         Language.FR: "fr",
@@ -135,17 +188,13 @@ _LANGUAGE_ISO_639_1: Final[Mapping[Language, str]] = MappingProxyType(
     }
 )
 
-#: Fraction of the chapter-level progress attributed to page downloads. The
-#: remaining 5% covers packaging.
+#: Fraction of the chapter-level progress attributed to page downloads.
+#: The remaining 5% covers packaging.
 _PAGES_PROGRESS_WEIGHT: Final[float] = 0.95
 
-#: Default settings values used when the corresponding ``Settings`` field is
-#: absent. Centralised here so a configuration change is a single-place edit
-#: and the worker remains usable in tests with a minimal stub.
+#: Default concurrency limit when ``Settings.downloader.max_concurrent_pages``
+#: is absent (defensive — the field is documented in the PROMPT MASTER).
 _DEFAULT_MAX_CONCURRENT_PAGES: Final[int] = 4
-_DEFAULT_RETRY_MAX_ATTEMPTS: Final[int] = 3
-_DEFAULT_RETRY_INITIAL_DELAY: Final[float] = 0.5
-_DEFAULT_RETRY_MAX_DELAY: Final[float] = 30.0
 
 
 # --------------------------------------------------------------------------- #
@@ -157,8 +206,7 @@ class ParserProtocol(Protocol):
     """Minimal parser interface required by the worker.
 
     Satisfied by :class:`nexusdl.parsers.base.BaseParser`. Only the two
-    methods the worker actually uses are declared, so this protocol does not
-    couple the worker to the full parser surface.
+    methods the worker actually uses are declared.
     """
 
     async def get_pages(self, chapter: Chapter) -> list[Page]:
@@ -166,7 +214,7 @@ class ParserProtocol(Protocol):
         ...
 
     async def download_page(self, page: Page, dest: Path) -> None:
-        """Download *page* to *dest* (a file path, not a directory)."""
+        """Download *page* to the file path *dest*."""
         ...
 
 
@@ -174,8 +222,8 @@ class PluginDispatcherProtocol(Protocol):
     """Minimal plugin-dispatcher interface required by the worker.
 
     Satisfied by :class:`nexusdl.plugins.loader.PluginLoader`. Only the two
-    hooks the worker emits are declared; the manager dispatches the other
-    two (``on_before_download``, ``on_after_download``).
+    observer-only hooks the worker emits are declared — the manager
+    dispatches ``on_before_download`` / ``on_after_download``.
     """
 
     async def dispatch_on_page_downloaded(
@@ -195,34 +243,31 @@ class PluginDispatcherProtocol(Protocol):
 class DownloadWorker:
     """Execute a single :class:`DownloadTask` end to end.
 
-    The worker:
+    Lifecycle of one :meth:`run` call:
 
-    1. Fetches the chapter's page list from the parser.
-    2. Downloads pages concurrently to a temporary directory, with per-page
+    1. Fetch the chapter's page list from the parser.
+    2. Build the retry policy once from settings.
+    3. Download pages concurrently to a temporary directory, with per-page
        retry and per-page image validation.
-    3. Builds :class:`ComicInfo` metadata from the manga and chapter.
-    4. Packages pages into the requested format via the
-       :class:`PackagerFactory`.
-    5. Cleans up temporary files in ``finally``.
+    4. Build :class:`ComicInfo` metadata from the manga and chapter.
+    5. Package pages into the requested format via the packager factory.
+    6. Clean up temporary files in ``finally``.
 
-    ``asyncio.CancelledError`` is always propagated untouched — the manager
-    is responsible for translating cancellation into a state transition.
-
-    Any other exception is caught, logged, reported to plugins via
-    ``dispatch_on_error``, and returned as a failed
-    :class:`DownloadResult` — the worker never raises for a "normal" failure.
+    ``asyncio.CancelledError`` is always propagated untouched. Any other
+    exception is caught, logged, reported to plugins via ``dispatch_on_error``,
+    and returned as a failed :class:`DownloadResult` — the worker never
+    raises for a "normal" failure.
 
     State
     -----
-    The worker holds only progress-accounting state (``_pages_completed`` is
-    reset at each :meth:`run`). A single instance must **not** be shared
-    across concurrent :meth:`run` invocations; the manager creates one
-    worker per task, so this constraint is naturally satisfied.
+    A worker instance is bound to a single :meth:`run` at a time. Do not
+    share one worker across concurrent invocations. The manager creates one
+    worker per task (via its injected ``worker_factory``), so this constraint
+    is naturally satisfied.
     """
 
     def __init__(
         self,
-        *,
         parser: ParserProtocol,
         packager_factory: PackagerFactory,
         settings: Settings,
@@ -231,19 +276,24 @@ class DownloadWorker:
     ) -> None:
         """Initialise the worker (no I/O, no side effects on the environment).
 
+        The first four arguments mirror the PROMPT MASTER contract for
+        ``DownloadWorker`` exactly. ``plugin_dispatcher`` is an optional
+        extension captured by the composition root's ``worker_factory``; when
+        ``None``, no plugin hooks are invoked (tests, or contexts where the
+        plugin subsystem is not loaded).
+
         Args:
             parser: Parser bound to the chapter's site, already configured
                 with an HTTP session.
-            packager_factory: Factory that produces the packager matching
-                the task's ``format``.
+            packager_factory: Factory producing the packager matching the
+                task's ``format``.
             settings: Application settings, used for concurrency, retry
-                policy, compression level, and the default output directory.
+                policy, compression level, and output directory.
             event_bus: Shared event bus. The worker emits
                 ``download.started`` / ``download.progress`` /
                 ``download.completed`` / ``download.failed``.
-            plugin_dispatcher: Optional plugin dispatcher. When ``None``, no
-                plugin hooks are invoked — useful for tests and for contexts
-                where the plugin subsystem is not loaded.
+            plugin_dispatcher: Optional dispatcher for the two observer-only
+                plugin hooks (``on_page_downloaded`` and ``on_error``).
         """
         self._parser = parser
         self._packager_factory = packager_factory
@@ -252,16 +302,15 @@ class DownloadWorker:
         self._plugin_dispatcher = plugin_dispatcher
         self._log = logger.bind(component="downloader.worker")
 
-        #: Concurrency limiter for page downloads. Created per worker (i.e.
-        #: per task) so the limit applies *within* a chapter, not across
-        #: chapters.
+        # Per-worker semaphore: the concurrency limit applies *within* a
+        # chapter, not across chapters.
         self._semaphore = asyncio.Semaphore(self._max_concurrent_pages())
 
-        #: Serialises progress-counter updates and event emission so that
-        #: ``download.progress`` events arrive in completion order.
+        # Serialises progress-counter updates and event emission so that
+        # ``download.progress`` events arrive in completion order.
         self._progress_lock = asyncio.Lock()
 
-        #: Reset at the start of each :meth:`run`.
+        # Reset at the start of each ``run`` call.
         self._pages_completed: int = 0
 
     # ------------------------------------------------------------------ #
@@ -277,19 +326,18 @@ class DownloadWorker:
         """Execute *task* and return the outcome.
 
         Args:
-            task: The chapter download to perform. Read-only: the worker
-                does not mutate it. State transitions are the manager's
+            task: The chapter download to perform. Read-only — the worker
+                never mutates it. State transitions are the manager's
                 responsibility.
             output_path: Optional explicit output path. When ``None``, a
                 default is computed from
-                ``settings.storage.downloads_dir``, the manga title, and
-                the chapter title — see :meth:`_compute_output_path`.
+                ``settings.storage.downloads_dir``, the manga title, and the
+                chapter title — see :meth:`_compute_output_path`.
 
         Returns:
             A :class:`DownloadResult` with ``status`` either
-            :attr:`DownloadStatus.DONE` (success) or
-            :attr:`DownloadStatus.FAILED` (failure). On failure the cause is
-            available as ``result.error``.
+            :attr:`DownloadStatus.DONE` or :attr:`DownloadStatus.FAILED`.
+            On failure the cause is available as ``result.error``.
         """
         started_at = time.monotonic()
         self._pages_completed = 0
@@ -311,6 +359,10 @@ class DownloadWorker:
                 )
 
             target = output_path or self._compute_output_path(task)
+            retry_policy = policy_from_settings(
+                getattr(self._settings.downloader, "retry", None)
+            )
+
             await self._emit_event(
                 _EVENT_DOWNLOAD_STARTED,
                 {
@@ -324,14 +376,16 @@ class DownloadWorker:
 
             temp_dir = self._create_temp_dir(target)
             try:
-                await self._download_pages(task, pages, temp_dir)
-                await self._emit_progress(task, 1.0, phase="pages")
+                await self._download_pages(
+                    task, pages, temp_dir, retry_policy
+                )
+                await self._emit_progress(task, _PAGES_PROGRESS_WEIGHT, phase="pages")
 
                 pages_with_paths = self._collect_page_paths(pages, temp_dir)
+                bytes_total = self._sum_page_sizes(pages_with_paths)
+
+                await self._emit_progress(task, 0.97, phase="packaging")
                 output = await self._package(task, pages_with_paths, target)
-                bytes_total = sum(
-                    path.stat().st_size for _, path in pages_with_paths
-                )
             finally:
                 self._cleanup_temp_dir(temp_dir)
 
@@ -368,11 +422,9 @@ class DownloadWorker:
 
         except asyncio.CancelledError:
             # Cancellation is a terminal state, not an error. The temp-dir
-            # ``finally`` above has already run. Re-raise so the manager
+            # ``finally`` above has already run. Propagate so the manager
             # can transition the task to CANCELLED.
-            self._log.debug(
-                "Download cancelled: chapter={!r}", chapter.title
-            )
+            self._log.debug("Download cancelled: chapter={!r}", chapter.title)
             raise
 
         except Exception as exc:
@@ -414,36 +466,40 @@ class DownloadWorker:
         task: DownloadTask,
         pages: list[Page],
         temp_dir: Path,
+        retry_policy: RetryPolicy,
     ) -> None:
         """Download all pages to *temp_dir*, honouring concurrency and retries.
 
-        Uses :class:`asyncio.TaskGroup` so that a first page failure cancels
-        the remaining downloads rather than waiting for them to finish. The
-        resulting :class:`BaseExceptionGroup` is unwrapped into either a bare
-        :class:`asyncio.CancelledError` (if all failures were cancellations)
-        or a :class:`ChapterDownloadError` (otherwise).
+        Uses :class:`asyncio.TaskGroup` so that the first page failure
+        cancels the remaining downloads. The resulting
+        :class:`BaseExceptionGroup` is unwrapped into either a bare
+        :class:`asyncio.CancelledError` (when every child failure was a
+        cancellation) or a :class:`ChapterDownloadError` (otherwise).
 
         Args:
             task: The task being executed (for ids and events).
             pages: Pages to download, in reading order.
             temp_dir: Destination directory for page files.
+            retry_policy: Retry parameters applied per page.
 
         Raises:
-            ChapterDownloadError: If at least one page failed to download
-                after exhausting retries.
-            asyncio.CancelledError: If the task (parent) was cancelled, or
-                if every child failure was a cancellation.
+            ChapterDownloadError: If at least one page failed after exhausting
+                retries.
+            asyncio.CancelledError: If the parent was cancelled, or if every
+                child failure was a cancellation.
         """
         total = len(pages)
         try:
             async with asyncio.TaskGroup() as tg:
                 for page in pages:
                     tg.create_task(
-                        self._download_one_page(task, page, temp_dir, total),
+                        self._download_one_page(
+                            task, page, temp_dir, total, retry_policy
+                        ),
                         name=f"download-page-{page.index}",
                     )
         except asyncio.CancelledError:
-            # Parent task cancelled directly (not a child cancellation).
+            # Parent cancelled directly (not via a child failure).
             raise
         except BaseExceptionGroup as eg:
             real_errors = [
@@ -465,20 +521,22 @@ class DownloadWorker:
         page: Page,
         temp_dir: Path,
         total_pages: int,
+        retry_policy: RetryPolicy,
     ) -> None:
         """Download, validate, and report a single page.
 
-        The download is retried according to ``settings.downloader.retry``
-        (or the module defaults). The downloaded file is validated by
-        :func:`nexusdl.core.image.validator.validate_file` and retried if
-        the validator rejects it — HTML / Cloudflare pages masquerading as
-        images are the common case.
+        The retry controller from
+        :func:`nexusdl.core.downloader.retry.build_retry` decides which
+        exceptions are worth retrying — the worker never duplicates that
+        knowledge. Validation rejects HTML pages masquerading as images by
+        raising :class:`PageDownloadError`, which is retryable.
 
         Args:
             task: The task being executed.
             page: The page to download.
             temp_dir: Directory to write the page file into.
             total_pages: Total number of pages in the chapter (for progress).
+            retry_policy: Retry parameters.
 
         Raises:
             PageDownloadError: If the page could not be downloaded or
@@ -489,15 +547,7 @@ class DownloadWorker:
 
         async with self._semaphore:
             try:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(self._retry_max_attempts()),
-                    wait=wait_exponential_jitter(
-                        initial=self._retry_initial_delay(),
-                        max=self._retry_max_delay(),
-                    ),
-                    retry=retry_if_exception_type(PageDownloadError),
-                    reraise=True,
-                ):
+                async for attempt in build_retry(retry_policy):
                     with attempt:
                         await self._parser.download_page(page, dest)
                         validation = validate_image_file(dest)
@@ -526,8 +576,8 @@ class DownloadWorker:
     ) -> None:
         """Increment the completed-page counter and emit a progress event.
 
-        The lock guarantees that progress events are emitted in completion
-        order, so downstream consumers never see progress go backwards.
+        The lock guarantees progress events are emitted in completion order,
+        so downstream consumers never see progress go backwards.
 
         Args:
             task: The task being executed.
@@ -551,6 +601,12 @@ class DownloadWorker:
     ) -> Path:
         """Package downloaded pages into the requested format.
 
+        Passes ``Sequence[tuple[Page, Path]]`` to the packager so each
+        implementation can sort by ``page.index`` if it wants to, and can
+        ignore the ``Page`` and sort by filename if the naming convention is
+        enough (the worker produces zero-padded filenames — see
+        :meth:`_page_filename`).
+
         Args:
             task: The task being executed (source of ``format`` and metadata).
             pages_with_paths: Each page paired with the file it was written
@@ -560,12 +616,11 @@ class DownloadWorker:
                 a file path.
 
         Returns:
-            The path the packager actually produced (the packager may adjust
-            the extension).
+            The path the packager actually produced.
 
         Raises:
-            PackagingError: If the packager fails. The caller treats this
-                like any other download failure.
+            PackagingError: If the packager fails. The caller treats this as
+                a normal download failure.
         """
         packager = self._packager_factory.create(task.format)
         comic_info = self._build_comic_info(task, len(pages_with_paths))
@@ -584,10 +639,13 @@ class DownloadWorker:
     ) -> ComicInfo:
         """Build :class:`ComicInfo` metadata from the task's manga and chapter.
 
-        Fields not exposed by the manga model are left ``None``. This is a
-        best-effort projection: packagers embed whatever is present in
-        ``ComicInfo.xml``, and readers (Komga / Kavita / Mihon / YACReader)
-        handle missing fields gracefully.
+        Fields not exposed by the manga model are left ``None`` — packagers
+        embed what is present, and readers (Komga / Kavita / Mihon /
+        YACReader) handle missing fields gracefully.
+
+        The ``manga`` field follows the ComicRack convention used by every
+        reader: ``"YesAndRightToLeft"`` for manga, ``"No"`` for
+        non-manga (western comics, webtoons).
 
         Args:
             task: The task being executed.
@@ -599,6 +657,7 @@ class DownloadWorker:
         manga: Manga = task.manga
         chapter: Chapter = task.chapter
         language_iso = _LANGUAGE_ISO_639_1.get(manga.language, "und")
+        is_manga = bool(getattr(manga, "is_manga", True))
         return ComicInfo(
             title=chapter.title,
             series=manga.title,
@@ -607,7 +666,7 @@ class DownloadWorker:
             page_count=page_count,
             summary=getattr(manga, "description", None),
             year=getattr(manga, "year", None),
-            manga=bool(getattr(manga, "is_manga", True)),
+            manga="YesAndRightToLeft" if is_manga else "No",
             web=getattr(chapter, "url", None),
             scan_information=f"Downloaded by NexusDL from {manga.id}",
         )
@@ -628,7 +687,7 @@ class DownloadWorker:
 
         Returns:
             The default output path. The parent directory is created by
-            :meth:`_create_temp_dir`, not here.
+            :meth:`_create_temp_dir`.
         """
         downloads_dir = Path(self._settings.storage.downloads_dir)
         manga_dir = downloads_dir / slugify(task.manga.title)
@@ -657,9 +716,8 @@ class DownloadWorker:
     def _cleanup_temp_dir(temp_dir: Path) -> None:
         """Remove *temp_dir* and its contents if it still exists.
 
-        Idempotent and safe to call from a ``finally`` block: missing or
-        already-removed directories are ignored. The operation is
-        synchronous — deleting a chapter's worth of pages is bounded to a
+        Idempotent and safe to call from a ``finally`` block. The operation
+        is synchronous — deleting a chapter's worth of pages is bounded to a
         few dozen milliseconds and does not warrant an ``asyncio.to_thread``
         hop during shutdown.
 
@@ -670,7 +728,6 @@ class DownloadWorker:
             if temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=False)
         except OSError as exc:
-            # Cleanup failures must not mask the original outcome.
             logger.warning(
                 "Could not remove temp directory {}: {}", temp_dir, exc
             )
@@ -694,13 +751,26 @@ class DownloadWorker:
         ]
 
     @staticmethod
+    def _sum_page_sizes(pages_with_paths: list[tuple[Page, Path]]) -> int:
+        """Return the total size in bytes of the downloaded page files.
+
+        Args:
+            pages_with_paths: Each page paired with the file it was written
+                to.
+
+        Returns:
+            The sum of file sizes in bytes.
+        """
+        return sum(path.stat().st_size for _, path in pages_with_paths)
+
+    @staticmethod
     def _page_filename(page: Page) -> str:
         """Return the on-disk filename for *page*.
 
-        Prefers ``page.filename`` when the model exposes one, otherwise
+        Prefers ``page.filename`` when the model exposes one. Otherwise
         derives the extension from the page URL and uses a zero-padded
         1-based index so that CBZ / ComicInfo readers display pages in
-        order.
+        order (``sorted()`` on filenames matches reading order).
 
         Args:
             page: The page to name.
@@ -724,12 +794,11 @@ class DownloadWorker:
     ) -> None:
         """Publish *event_type* on the bus, swallowing and logging failures.
 
-        Publishing failures must never abort a download — a subscriber
-        exception is the bus's problem, not the worker's.
+        Publishing failures must never abort a download. Cancellation is
+        re-raised.
 
         Args:
-            event_type: Fully qualified event type (e.g.
-                ``download.started``).
+            event_type: Fully qualified event type.
             payload: JSON-serialisable mapping.
         """
         try:
@@ -837,35 +906,5 @@ class DownloadWorker:
                 self._settings.downloader,
                 "max_concurrent_pages",
                 _DEFAULT_MAX_CONCURRENT_PAGES,
-            )
-        )
-
-    def _retry_max_attempts(self) -> int:
-        """Return the retry attempt count from settings."""
-        return int(
-            getattr(
-                getattr(self._settings.downloader, "retry", None),
-                "max_attempts",
-                _DEFAULT_RETRY_MAX_ATTEMPTS,
-            )
-        )
-
-    def _retry_initial_delay(self) -> float:
-        """Return the retry initial delay (seconds) from settings."""
-        return float(
-            getattr(
-                getattr(self._settings.downloader, "retry", None),
-                "initial_delay",
-                _DEFAULT_RETRY_INITIAL_DELAY,
-            )
-        )
-
-    def _retry_max_delay(self) -> float:
-        """Return the retry maximum delay (seconds) from settings."""
-        return float(
-            getattr(
-                getattr(self._settings.downloader, "retry", None),
-                "max_delay",
-                _DEFAULT_RETRY_MAX_DELAY,
             )
         )

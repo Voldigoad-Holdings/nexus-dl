@@ -5,16 +5,18 @@ about external plugins. It performs five things, in this order:
 
 1. **Discovery** — walk the configured plugin roots and identify candidate
    plugin directories. Directories whose name starts with ``_`` (such as
-   the shipped ``_example/``), directories listed in
-   ``settings.plugins.disabled``, and directories missing either
-   ``nexus.plugin.yaml`` or ``plugin.py`` are skipped.
+   the shipped ``_example/``), directories listed in ``settings.plugins.disabled``,
+   and directories missing either ``nexus.plugin.yaml`` or ``plugin.py`` are
+   skipped and recorded in the :class:`LoadReport`.
 2. **Import** — dynamically load each ``plugin.py`` as a standalone module
    (not as a Python package), under a namespaced internal module name so
    plugins can never shadow framework modules.
 3. **Conformance** — find exactly one top-level class implementing the
-   mandatory :class:`~nexusdl.plugins.api.NexusPlugin` members, then run
-   :func:`nexusdl.plugins.validators.validate_plugin` (manifest structure,
-   version bounds, hook presence, sync/async flavour).
+   mandatory members of :class:`~nexusdl.plugins.api.NexusPlugin`, then run
+   the full validation pipeline
+   (:func:`nexusdl.plugins.validators.load_manifest` →
+   :func:`~nexusdl.plugins.validators.validate_manifest_compatibility` →
+   :func:`~nexusdl.plugins.validators.validate_class_matches_manifest`).
 4. **Lifecycle** — build a :class:`~nexusdl.plugins.api.PluginContext` and
    call ``on_load(context)``. If ``on_load`` raises, the plugin is rolled
    back (``on_unload`` is attempted, module is purged from ``sys.modules``)
@@ -33,9 +35,12 @@ Design invariants
 * **Lock-free dispatch** — ``self._loaded`` is an immutable tuple swapped
   atomically on load/unload, so dispatchers need no lock and always observe
   a consistent snapshot.
+* **No hook-name literals** — every hook name comes from
+  :mod:`nexusdl.plugins.hooks`. Renaming a hook requires editing only
+  ``hooks.py`` and ``api.py``.
 * **Read-only paths** — plugin code lives in the plugin directory and is
   never written by the framework; mutable state goes under
-  ``<data_root>/<plugin_name>/``.
+  ``<data_root>/<plugin_name>/``, guaranteed to exist before ``on_load``.
 
 This module is the only one that imports plugin ``plugin.py`` files. It is
 also the only one that mutates ``sys.modules`` for plugins.
@@ -57,13 +62,20 @@ from loguru import logger
 
 from nexusdl.core.exceptions import PluginError
 from nexusdl.plugins.api import PluginContext
+from nexusdl.plugins.hooks import (
+    HOOK_ON_AFTER_DOWNLOAD,
+    HOOK_ON_BEFORE_DOWNLOAD,
+    HOOK_ON_ERROR,
+    HOOK_ON_LOAD,
+    HOOK_ON_PAGE_DOWNLOADED,
+    HOOK_ON_UNLOAD,
+)
 from nexusdl.plugins.validators import (
-    HOST_VERSION,
     MANIFEST_FILENAME,
     PluginManifest,
     load_manifest,
-    validate_manifest_compatibility,
     validate_class_matches_manifest,
+    validate_manifest_compatibility,
 )
 
 if TYPE_CHECKING:
@@ -78,8 +90,8 @@ if TYPE_CHECKING:
 
 
 __all__ = [
-    "LoadedPlugin",
     "LoadReport",
+    "LoadedPlugin",
     "PluginLoader",
 ]
 
@@ -88,23 +100,29 @@ __all__ = [
 # Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
+#: Filename of the plugin implementation module, expected alongside the
+#: manifest in each plugin directory.
+PLUGIN_MODULE_FILENAME: Final[str] = "plugin.py"
+
 #: Prefix for the internal module name under which each plugin is imported.
 #: Prefixed with an underscore so plugins cannot accidentally shadow
 #: first-party modules in ``sys.modules``.
 _MODULE_PREFIX: Final[str] = "_nexusdl_plugin_"
 
-#: Attributes that every conforming plugin class must declare. These are the
-#: Protocol's mandatory members; the four async hooks may be omitted from the
-#: class as long as they are also omitted from the manifest's ``hooks:`` list.
+#: Attributes every conforming plugin class must declare for discovery.
+#: Imported from :mod:`nexusdl.plugins.hooks` so that a rename in the
+#: canonical module propagates automatically. The four optional pipeline
+#: hooks are **not** listed here — they are validated later against
+#: ``manifest.hooks``.
 _REQUIRED_ATTRS: Final[tuple[str, ...]] = (
     "name",
     "version",
-    "on_load",
-    "on_unload",
+    HOOK_ON_LOAD,
+    HOOK_ON_UNLOAD,
 )
 
 #: Files that must exist in a directory for it to be considered a plugin.
-_REQUIRED_FILES: Final[tuple[str, ...]] = (MANIFEST_FILENAME, "plugin.py")
+_REQUIRED_FILES: Final[tuple[str, ...]] = (MANIFEST_FILENAME, PLUGIN_MODULE_FILENAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -154,10 +172,11 @@ class LoadReport:
 
     Attributes:
         loaded: Names of plugins that loaded and started successfully.
-        failed: Mapping ``name -> error message`` for plugins that failed
-            to load. The plugin is not in the dispatch snapshot.
+        failed: Mapping ``name -> error message`` for plugins that failed to
+            load. The plugin is **not** in the dispatch snapshot.
         skipped: Mapping ``name-or-path -> reason`` for directories that were
-            not attempted (underscore prefix, disabled, missing files).
+            not attempted (underscore prefix, disabled in settings, missing
+            required files, unreadable directory).
     """
 
     loaded: list[str] = field(default_factory=list)
@@ -184,7 +203,7 @@ class PluginLoader:
     """Discover, load, unload, and dispatch to NexusDL plugins.
 
     One instance is created by each composition root (CLI, TUI, GUI, Web) and
-    is not shared across threads — it is asyncio-native and must be driven
+    is **not** shared across threads — it is asyncio-native and must be driven
     from a single event loop.
 
     Example:
@@ -217,12 +236,14 @@ class PluginLoader:
                 ``data_dir_root`` when those are not passed explicitly.
             event_bus: Shared :class:`~nexusdl.core.events.EventBus` passed
                 to each plugin via its :class:`~nexusdl.plugins.api.PluginContext`.
-            http_session: Optional shared :class:`~nexusdl.core.session.http_session.HttpSession`.
+            http_session: Optional shared
+                :class:`~nexusdl.core.session.http_session.HttpSession`.
                 Plugins that perform network I/O should reuse it rather than
-                opening their own client. ``None`` in contexts without network
-                access (e.g. an offline TUI settings screen).
+                opening their own client. ``None`` in contexts without
+                network access (e.g. an offline TUI settings screen).
             plugin_dirs: Roots to scan for plugin subdirectories. Defaults to
-                ``settings.plugins.dirs`` if present, otherwise the empty list.
+                ``settings.plugins.dirs`` if present, otherwise the empty
+                tuple.
             data_dir_root: Root under which per-plugin data directories are
                 created. Defaults to ``settings.plugins.data_dir`` if present,
                 otherwise ``platformdirs.user_data_path("nexusdl") / "plugins"``.
@@ -234,6 +255,7 @@ class PluginLoader:
         self._http_session = http_session
 
         plugins_cfg = getattr(settings, "plugins", None)
+
         self._plugin_dirs: tuple[Path, ...] = tuple(
             Path(p)
             for p in (
@@ -301,10 +323,11 @@ class PluginLoader:
             plugin_dirs: Roots to scan. Defaults to the roots passed to the
                 constructor.
             strict: If ``True``, the first plugin failure aborts the whole
-                load and is raised as :class:`~nexusdl.core.exceptions.PluginError`.
-                Used by CI and the ``nexusdl plugins check`` command. In the
-                default (lenient) mode, failures are recorded in the report
-                and other plugins still load.
+                load and is raised as
+                :class:`~nexusdl.core.exceptions.PluginError`. Used by CI
+                and the ``nexusdl plugins check`` command. In the default
+                (lenient) mode, failures are recorded in the report and
+                other plugins still load.
 
         Returns:
             A :class:`LoadReport` describing what loaded, failed, or was
@@ -332,8 +355,8 @@ class PluginLoader:
     async def unload_all(self) -> None:
         """Unload every plugin and reset the dispatch snapshot.
 
-        ``on_unload`` is invoked on each plugin in **reverse load order** so a
-        plugin can rely on dependencies loaded after it still being alive.
+        ``on_unload`` is invoked on each plugin in **reverse load order** so
+        a plugin can rely on dependencies loaded after it still being alive.
         Exceptions raised by ``on_unload`` are logged and swallowed: unload
         runs during shutdown, where raising accomplishes nothing useful.
         """
@@ -370,7 +393,8 @@ class PluginLoader:
 
         Each plugin receives the task as transformed by the previous one. A
         plugin that returns ``None`` (against the Protocol contract) is
-        ignored rather than corrupting the chain.
+        ignored rather than corrupting the chain. Any exception raised by a
+        plugin is logged and the next plugin sees the task unchanged.
 
         Args:
             task: The task about to be executed.
@@ -380,7 +404,7 @@ class PluginLoader:
         """
         current: DownloadTask = task
         for plugin in self._loaded:
-            if "on_before_download" not in plugin.manifest.hooks:
+            if HOOK_ON_BEFORE_DOWNLOAD not in plugin.manifest.hooks:
                 continue
             try:
                 transformed = await plugin.instance.on_before_download(current)
@@ -410,7 +434,7 @@ class PluginLoader:
         """
         current: DownloadResult = result
         for plugin in self._loaded:
-            if "on_after_download" not in plugin.manifest.hooks:
+            if HOOK_ON_AFTER_DOWNLOAD not in plugin.manifest.hooks:
                 continue
             try:
                 transformed = await plugin.instance.on_after_download(current)
@@ -438,7 +462,7 @@ class PluginLoader:
             path: Filesystem location of the written image.
         """
         for plugin in self._loaded:
-            if "on_page_downloaded" not in plugin.manifest.hooks:
+            if HOOK_ON_PAGE_DOWNLOADED not in plugin.manifest.hooks:
                 continue
             try:
                 await plugin.instance.on_page_downloaded(page, path)
@@ -466,7 +490,7 @@ class PluginLoader:
             error: The exception raised by the worker.
         """
         for plugin in self._loaded:
-            if "on_error" not in plugin.manifest.hooks:
+            if HOOK_ON_ERROR not in plugin.manifest.hooks:
                 continue
             try:
                 await plugin.instance.on_error(task_id, error)
@@ -516,7 +540,9 @@ class PluginLoader:
             if candidate.name in self._disabled:
                 report.skipped[candidate.name] = "disabled in settings"
                 continue
-            missing = [f for f in _REQUIRED_FILES if not (candidate / f).is_file()]
+            missing = [
+                f for f in _REQUIRED_FILES if not (candidate / f).is_file()
+            ]
             if missing:
                 report.skipped[candidate.name] = (
                     f"missing required file(s): {', '.join(missing)}"
@@ -566,7 +592,10 @@ class PluginLoader:
         report.loaded.append(plugin.name)
         self._loaded = (*self._loaded, plugin)
         self._log.info(
-            "Loaded plugin {} v{} from {}", plugin.name, plugin.version, plugin_dir
+            "Loaded plugin {} v{} from {}",
+            plugin.name,
+            plugin.version,
+            plugin_dir,
         )
 
     async def _load_plugin_instance(self, plugin_dir: Path) -> LoadedPlugin:
@@ -588,18 +617,19 @@ class PluginLoader:
             Exception: Any exception raised by ``on_load`` is propagated
                 after rollback.
         """
-        manifest = load_manifest(plugin_dir / MANIFEST_FILENAME)
+        manifest = load_manifest(plugin_dir)
         name = manifest.name
 
         module = self._import_plugin_module(name, plugin_dir)
-        cls: type | None = None
+        instance: NexusPlugin | None = None
         try:
             cls = _find_plugin_class(module)
 
-            # Re-run all three validation layers against the loaded class.
-            # ``validate_plugin`` re-reads the manifest, which is cheap and
-            # guarantees the class matches exactly what's on disk.
-            manifest = self._validate_against_class(plugin_dir, cls, manifest)
+            # Re-run the two remaining validation layers against the loaded
+            # class. The manifest has already been parsed above, so this
+            # avoids a redundant read of ``nexus.plugin.yaml``.
+            validate_manifest_compatibility(manifest)
+            validate_class_matches_manifest(cls, manifest)
 
             plugin_logger = logger.bind(component="plugin", plugin=name)
             data_dir = self._data_root / name
@@ -614,13 +644,13 @@ class PluginLoader:
             context = PluginContext(
                 logger=plugin_logger,
                 settings=self._settings,
-                http_session=self._http_session,
                 event_bus=self._event_bus,
                 plugin_dir=plugin_dir,
                 data_dir=data_dir,
+                http_session=self._http_session,
             )
 
-            instance: NexusPlugin = cls()
+            instance = cls()
             self._log.debug(
                 "Calling on_load for plugin {} (dir={}, data={})",
                 name,
@@ -629,19 +659,18 @@ class PluginLoader:
             )
             instance.on_load(context)
         except BaseException:
-            # Roll back: purge the module so a reload starts clean, and give
-            # the (possibly half-initialized) plugin a chance to clean up.
-            if cls is not None:
-                instance_or_none = locals().get("instance")
-                if instance_or_none is not None:
-                    try:
-                        instance_or_none.on_unload()
-                    except Exception as cleanup_exc:  # noqa: BLE001
-                        logger.warning(
-                            "on_unload raised during rollback of plugin {}: {}",
-                            name,
-                            cleanup_exc,
-                        )
+            # Roll back: give the (possibly half-initialized) plugin a
+            # chance to clean up, then purge the module so a reload starts
+            # from a clean slate.
+            if instance is not None:
+                try:
+                    instance.on_unload()
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logger.warning(
+                        "on_unload raised during rollback of plugin {}: {}",
+                        name,
+                        cleanup_exc,
+                    )
             self._purge_module(module.__name__)
             raise
 
@@ -655,31 +684,6 @@ class PluginLoader:
             context=context,
             logger=plugin_logger,
         )
-
-    @staticmethod
-    def _validate_against_class(
-        plugin_dir: Path,
-        cls: type,
-        manifest: PluginManifest,
-    ) -> PluginManifest:
-        """Run compatibility + class-conformance checks on an already-parsed manifest.
-
-        Args:
-            plugin_dir: Directory containing the plugin (for error messages).
-            cls: The plugin class found in ``plugin.py``.
-            manifest: The manifest already parsed by :func:`load_manifest`.
-
-        Returns:
-            The same manifest, for caller convenience.
-
-        Raises:
-            PluginError: On any compatibility or conformance failure.
-        """
-        # Compatibility check (host version, interpreter version).
-        validate_manifest_compatibility(manifest, host_version=HOST_VERSION)
-        # Class conformance check (name, version, hook presence + flavour).
-        validate_class_matches_manifest(cls, manifest)
-        return manifest
 
     def _unload_snapshot(self, plugins: Iterable[LoadedPlugin]) -> None:
         """Call ``on_unload`` on each plugin in *plugins* (in reverse order).
@@ -710,8 +714,9 @@ class PluginLoader:
 
         The module is registered in ``sys.modules`` *before* execution so
         intra-plugin imports work, and purged on failure so a retry starts
-        clean. Plugins are never imported as packages — the ``__init__.py``
-        that may exist in a plugin directory (as in ``_example/``) is ignored.
+        clean. Plugins are never imported as packages — a ``__init__.py``
+        that may exist in a plugin directory (as in ``_example/``) is
+        ignored.
 
         Args:
             plugin_name: Value of ``manifest.name``; used to build the module
@@ -724,9 +729,11 @@ class PluginLoader:
         Raises:
             PluginError: If the file is missing or the import fails.
         """
-        plugin_py = plugin_dir / "plugin.py"
+        plugin_py = plugin_dir / PLUGIN_MODULE_FILENAME
         if not plugin_py.is_file():
-            raise PluginError(f"missing plugin.py in {plugin_dir}")
+            raise PluginError(
+                f"missing {PLUGIN_MODULE_FILENAME} in {plugin_dir}"
+            )
 
         module_name = f"{_MODULE_PREFIX}{plugin_name}"
         if module_name in sys.modules:
@@ -768,17 +775,19 @@ class PluginLoader:
 
 
 def _find_plugin_class(module: ModuleType) -> type:
-    """Return the unique top-level class in *module* implementing ``NexusPlugin``.
+    """Return the unique top-level class in *module* implementing the required members.
 
     A class is considered a candidate when:
 
     * it is a class object defined in ``module`` (not imported into it);
     * its name does not start with ``_``;
-    * it declares all attributes in :data:`_REQUIRED_ATTRS`.
+    * it declares all attributes in :data:`_REQUIRED_ATTRS`
+      (``name``, ``version``, and the two sync lifecycle hooks).
 
-    The structural check (rather than ``isinstance(obj, NexusPlugin)``) avoids
-    the ``@runtime_checkable`` Protocol limitation around data members and
-    keeps discovery independent of :mod:`typing` internals.
+    The check is **structural** rather than a runtime ``isinstance`` against
+    :class:`~nexusdl.plugins.api.NexusPlugin`: the protocol intentionally
+    avoids ``@runtime_checkable``, and structural inspection gives better
+    error messages (we can report *which* required attributes are missing).
 
     Args:
         module: The imported ``plugin.py`` module.
@@ -787,10 +796,9 @@ def _find_plugin_class(module: ModuleType) -> type:
         The single candidate class.
 
     Raises:
-        PluginError: If zero or more than one candidate is found. Messages
-            name the module and list the candidates (for the ambiguous case)
-            or the required attributes that were missing (for the empty
-            case, when plausible classes were found but rejected).
+        PluginError: If zero or more than one candidate is found. The message
+            names the module and, for the empty case, lists the plausible
+            classes with their missing attributes.
     """
     candidates: list[type] = []
     rejected: list[tuple[str, list[str]]] = []
@@ -818,8 +826,8 @@ def _find_plugin_class(module: ModuleType) -> type:
                 for name, miss in rejected
             )
         raise PluginError(
-            f"no NexusPlugin class found in module {module.__name__!r}."
-            f" Expected a top-level class declaring "
+            f"no NexusPlugin class found in module {module.__name__!r}. "
+            f"Expected a top-level class declaring "
             f"{', '.join(_REQUIRED_ATTRS)}.{details}"
         )
 

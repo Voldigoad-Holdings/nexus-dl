@@ -1,31 +1,40 @@
-"""Reference NexusDL plugin — demonstrates every hook of the ``NexusPlugin`` protocol.
+"""Reference NexusDL plugin — demonstrates every hook of the ``NexusPlugin``
+protocol as a strictly-transparent passthrough.
 
-This module is deliberately pedagogical and side-effect-bounded:
+This module is deliberately pedagogical:
 
-* It never mutates the download pipeline (each hook is a transparent passthrough
-  that returns the *same* object it received).
-* It never raises out of a hook — every failure is logged and swallowed so a
-  misbehaving example can never break a real download.
-* It touches the outside world only through sanctioned channels: the plugin
-  ``logger``, the shared ``event_bus``, and a tiny JSON stats file under
-  ``context.data_dir``.
+* Every hook is exercised, so a plugin author can read one file and see the
+  complete lifecycle.
+* Nothing in the download pipeline is mutated — each hook returns the object
+  it received. A reference example must never surprise.
+* No exception escapes a hook: the loader would isolate it anyway, but doing
+  it here too demonstrates the "one bad plugin never breaks the pipeline"
+  contract in practice.
+* The outside world is touched only through sanctioned channels: the plugin
+  ``logger``, the shared ``event_bus``, and a JSON stats file under
+  ``context.data_dir`` (the only writable path a plugin is given).
 
 Layout of this example plugin (already present in the repo)::
 
     _example/
-    ├── __init__.py
-    ├── nexus.plugin.yaml   # manifest — see docs/development/plugins.md
-    └── plugin.py           # ← this file
+    ├── __init__.py           # re-exports ``ExamplePlugin``
+    ├── nexus.plugin.yaml     # manifest — see docs/development/plugins.md
+    └── plugin.py             # ← this file
 
-To activate it, copy the whole ``_example/`` directory into your user plugin
-directory (see ``docs/development/plugins.md``) and rename the directory. The
-manifest must live side-by-side with ``plugin.py``.
+To activate the example, copy the whole ``_example/`` directory into your
+user plugin directory (see ``docs/development/plugins.md``) and rename the
+directory so it no longer starts with ``_`` (the loader skips reserved
+names). The manifest must live side-by-side with ``plugin.py``.
 
-The class below structurally satisfies :class:`nexusdl.plugins.api.NexusPlugin`;
-because that protocol is **structural** (``typing.Protocol``), no explicit
-inheritance is required. The ``TYPE_CHECKING`` block at the bottom statically
-asserts the conformance, so any drift between this example and the protocol
-surfaces in ``mypy --strict``.
+The class below **structurally** satisfies :class:`nexusdl.plugins.api.NexusPlugin`:
+
+* mandatory members: ``name``, ``version``, ``on_load``, ``on_unload``;
+* optional hooks: the four async pipeline hooks — implemented here for
+  completeness and declared in the manifest's ``hooks:`` list, so the loader
+  dispatches to them.
+
+Static conformance is checked by ``mypy --strict`` via the
+``if TYPE_CHECKING:`` assertion at the bottom of this file.
 """
 
 from __future__ import annotations
@@ -34,22 +43,46 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 from uuid import uuid4
 
 from nexusdl.core.events import Event
-from nexusdl.core.models.download import DownloadResult, DownloadTask
-from nexusdl.core.models.page import Page
 from nexusdl.plugins.api import PluginContext
+from nexusdl.plugins.hooks import (
+    HOOK_ON_AFTER_DOWNLOAD,
+    HOOK_ON_BEFORE_DOWNLOAD,
+    HOOK_ON_ERROR,
+    HOOK_ON_PAGE_DOWNLOADED,
+)
+
+if TYPE_CHECKING:
+    from nexusdl.core.models.download import DownloadResult, DownloadTask
+    from nexusdl.core.models.page import Page
+    from nexusdl.plugins.api import NexusPlugin
 
 
-# Custom event types namespaced under ``plugin.example.*`` to avoid colliding
-# with the framework's own ``download.*``, ``chapter.*`` etc. (see
-# ``core/events.py`` for the list of standard events).
-_EVENT_DOWNLOAD_COMPLETED = "plugin.example.download_completed"
-_EVENT_DOWNLOAD_FAILED = "plugin.example.download_failed"
+# --------------------------------------------------------------------------- #
+# Module constants                                                            #
+# --------------------------------------------------------------------------- #
 
-_STATS_FILENAME = "example_plugin_stats.json"
+#: Custom event types namespaced under ``plugin.example.*`` to avoid
+#: colliding with framework events (``download.*``, ``chapter.*``, …).
+#: See ``nexusdl.core.events`` for the list of standard event types.
+_EVENT_DOWNLOAD_COMPLETED: Final[str] = "plugin.example.download_completed"
+_EVENT_DOWNLOAD_FAILED: Final[str] = "plugin.example.download_failed"
+
+#: Filename under ``context.data_dir`` used to persist cross-run statistics.
+_STATS_FILENAME: Final[str] = "example_plugin_stats.json"
+
+#: Upper bound on the size of the stats file we are willing to read back.
+#: Protects against a corrupted or hostile file whose ``read_text()`` would
+#: otherwise be unbounded.
+_MAX_STATS_FILE_BYTES: Final[int] = 64 * 1024  # 64 KiB
+
+
+# --------------------------------------------------------------------------- #
+# Example plugin                                                              #
+# --------------------------------------------------------------------------- #
 
 
 class ExamplePlugin:
@@ -59,7 +92,14 @@ class ExamplePlugin:
     ``context.data_dir``, and republishes two custom events on the shared
     :class:`~nexusdl.core.events.EventBus`. It is safe to enable in any
     environment and is a good starting point to copy for your own plugins.
+
+    Threading model: the loader guarantees no two hooks of the *same* plugin
+    instance run concurrently, but the ``asyncio.Lock`` is still taken
+    defensively around the mutable ``_stats`` dict — it costs nothing and
+    makes the class correct even if that guarantee is ever relaxed.
     """
+
+    __slots__ = ("_ctx", "_lock", "_stats", "_stats_path")
 
     #: Plugin identifier — must match ``name:`` in ``nexus.plugin.yaml``.
     name: str = "example"
@@ -89,30 +129,13 @@ class ExamplePlugin:
         """Receive the plugin context and restore any persisted state.
 
         Args:
-            context: Framework-provided context exposing ``logger``,
-                ``settings``, ``http_session`` (optional), ``event_bus``,
-                ``plugin_dir`` and ``data_dir``.
+            context: Framework-provided services (see
+                :class:`~nexusdl.plugins.api.PluginContext`). Store the fields
+                the plugin needs on ``self``; do not mutate the context.
         """
         self._ctx = context
         self._stats_path = context.data_dir / _STATS_FILENAME
-
-        # ``on_load`` is synchronous by contract, and the stats file is bounded
-        # to a few hundred bytes, so a synchronous read is acceptable here.
-        try:
-            if self._stats_path.is_file():
-                raw = json.loads(self._stats_path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    for key in self._stats:
-                        value = raw.get(key)
-                        if isinstance(value, int) and value >= 0:
-                            self._stats[key] = value
-        except (OSError, json.JSONDecodeError) as exc:
-            # Corruption is non-fatal: log and start fresh.
-            context.logger.warning(
-                "Could not restore previous plugin stats ({}); starting fresh.",
-                exc,
-            )
-
+        self._restore_stats(context)
         context.logger.info(
             "ExamplePlugin v{} loaded (data_dir={}, plugin_dir={})",
             self.version,
@@ -123,9 +146,10 @@ class ExamplePlugin:
     def on_unload(self) -> None:
         """Persist stats and release the context.
 
-        Synchronous by contract. The stats file is tiny, so the write is
-        bounded and will not meaningfully stall the event loop even when
-        ``on_unload`` is invoked from an async shutdown path.
+        Synchronous by contract. The stats file is tiny and bounded
+        (see :data:`_MAX_STATS_FILE_BYTES`), so the write is safe to do
+        inline even when ``on_unload`` is invoked from an async shutdown
+        path.
         """
         if self._ctx is None or self._stats_path is None:
             return
@@ -137,8 +161,7 @@ class ExamplePlugin:
                 encoding="utf-8",
             )
             self._ctx.logger.info(
-                "ExamplePlugin unloaded. Persisted stats: {}",
-                self._stats,
+                "ExamplePlugin unloaded. Persisted stats: {}", self._stats
             )
         except OSError as exc:
             # Never raise from a lifecycle hook: the framework is shutting down.
@@ -150,7 +173,7 @@ class ExamplePlugin:
             self._stats_path = None
 
     # ------------------------------------------------------------------ #
-    # Download pipeline hooks (asynchronous)                             #
+    # Download pipeline hooks (asynchronous)                              #
     # ------------------------------------------------------------------ #
 
     async def on_before_download(self, task: DownloadTask) -> DownloadTask:
@@ -171,19 +194,16 @@ class ExamplePlugin:
         async with self._lock:
             self._stats["tasks_started"] += 1
 
-        # Optional: the context may expose a shared ``HttpSession``. It is
-        # ``None`` when the plugin is loaded in a context that has no network
-        # access (e.g. the offline TUI settings screen).
-        # session = self._ctx.http_session
-        # if session is not None:
-        #     ...
-
         self._ctx.logger.debug(
-            "on_before_download: task_id={} status={}", task.id, task.status
+            HOOK_ON_BEFORE_DOWNLOAD + ": task_id={} status={}",
+            task.id,
+            task.status,
         )
         return task
 
-    async def on_after_download(self, result: DownloadResult) -> DownloadResult:
+    async def on_after_download(
+        self, result: DownloadResult
+    ) -> DownloadResult:
         """Observe a completed download and republish a custom event.
 
         Args:
@@ -200,8 +220,9 @@ class ExamplePlugin:
             self._stats["tasks_completed"] += 1
             snapshot = dict(self._stats)
 
-        self._ctx.logger.info("on_after_download: result={!r}", result)
-
+        self._ctx.logger.info(
+            HOOK_ON_AFTER_DOWNLOAD + ": result={!r}", result
+        )
         await self._safe_publish(
             _EVENT_DOWNLOAD_COMPLETED,
             {"plugin": self.name, "stats": snapshot},
@@ -222,7 +243,7 @@ class ExamplePlugin:
             self._stats["pages_downloaded"] += 1
 
         self._ctx.logger.trace(
-            "on_page_downloaded: index={} size={} bytes",
+            HOOK_ON_PAGE_DOWNLOADED + ": index={} size={} bytes",
             page.index,
             _safe_size(path),
         )
@@ -243,7 +264,7 @@ class ExamplePlugin:
             self._stats["errors_seen"] += 1
 
         self._ctx.logger.error(
-            "on_error: task_id={} error={}: {}",
+            HOOK_ON_ERROR + ": task_id={} error={}: {}",
             task_id,
             type(error).__name__,
             error,
@@ -262,6 +283,59 @@ class ExamplePlugin:
     # Internals                                                          #
     # ------------------------------------------------------------------ #
 
+    def _restore_stats(self, context: PluginContext) -> None:
+        """Load persisted counters from disk into ``self._stats``.
+
+        Silently starts fresh on any failure. The read is capped at
+        :data:`_MAX_STATS_FILE_BYTES` so a corrupted file cannot hang
+        ``on_load``.
+
+        Args:
+            context: Plugin context (used for the logger).
+        """
+        assert self._stats_path is not None  # set by on_load before call
+
+        if not self._stats_path.is_file():
+            return
+
+        try:
+            with self._stats_path.open("r", encoding="utf-8") as fh:
+                raw = fh.read(_MAX_STATS_FILE_BYTES + 1)
+        except OSError as exc:
+            context.logger.warning(
+                "Could not read plugin stats ({}); starting fresh.", exc
+            )
+            return
+
+        if len(raw) > _MAX_STATS_FILE_BYTES:
+            context.logger.warning(
+                "Plugin stats file exceeds {} bytes; ignoring and starting fresh.",
+                _MAX_STATS_FILE_BYTES,
+            )
+            return
+
+        try:
+            parsed: Any = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            context.logger.warning(
+                "Could not parse plugin stats ({}); starting fresh.", exc
+            )
+            return
+
+        if not isinstance(parsed, dict):
+            context.logger.warning(
+                "Plugin stats file is not a JSON object; starting fresh."
+            )
+            return
+
+        for key in self._stats:
+            value = parsed.get(key)
+            # ``type(x) is int`` rejects ``bool`` (which is a subclass of
+            # ``int``) and any JSON floating-point, keeping the counters
+            # strictly integer.
+            if type(value) is int and value >= 0:
+                self._stats[key] = value
+
     async def _safe_publish(
         self, event_type: str, payload: dict[str, Any]
     ) -> None:
@@ -269,14 +343,15 @@ class ExamplePlugin:
 
         The :class:`~nexusdl.core.events.EventBus` already isolates handler
         exceptions, but this wrapper also protects against a misconfigured bus
-        (e.g. ``publish`` raising ``RuntimeError`` because it was already
-        closed during shutdown).
+        (e.g. ``publish`` raising because it was already closed during
+        shutdown). ``asyncio.CancelledError`` is a ``BaseException`` and is
+        therefore **not** caught here — cancellation must always propagate.
 
         Args:
             event_type: Namespaced event type, e.g. ``plugin.example.foo``.
             payload: JSON-serialisable mapping carried by the event.
         """
-        if self._ctx is None:
+        if self._ctx is None:  # defensive: callers already guarantee this
             return
         try:
             await self._ctx.event_bus.publish(
@@ -291,6 +366,11 @@ class ExamplePlugin:
             self._ctx.logger.warning(
                 "Failed to publish custom event {}: {}", event_type, exc
             )
+
+
+# --------------------------------------------------------------------------- #
+# Module-level helpers                                                        #
+# --------------------------------------------------------------------------- #
 
 
 def _safe_size(path: Path) -> int:
@@ -309,12 +389,10 @@ def _safe_size(path: Path) -> int:
         return -1
 
 
-# ---------------------------------------------------------------------- #
-# Static conformance check — verifies in ``mypy --strict`` that this       #
-# example still implements the full ``NexusPlugin`` protocol. It is a      #
-# runtime no-op (``TYPE_CHECKING`` is False at import time).               #
-# ---------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Static conformance check — verifies under ``mypy --strict`` that this      #
+# example still satisfies the ``NexusPlugin`` protocol. Runtime no-op        #
+# (``TYPE_CHECKING`` is False at import time).                                #
+# --------------------------------------------------------------------------- #
 if TYPE_CHECKING:
-    from nexusdl.plugins.api import NexusPlugin
-
     _: NexusPlugin = ExamplePlugin()

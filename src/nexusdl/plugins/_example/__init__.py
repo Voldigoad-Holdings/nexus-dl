@@ -1,31 +1,54 @@
-"""Reference NexusDL plugin package.
+"""Reference NexusDL plugin package — a complete, self-contained example.
 
-This directory is a *complete, self-contained* example of a NexusDL plugin.
-It is shipped inside the wheel (as package data) so users can copy it as a
-starting point, but it is **not** loaded by default — directories whose names
-start with an underscore are skipped by :mod:`nexusdl.plugins.loader`.
+This package is a **template**, not a plugin that the framework activates by
+default:
+
+* The directory name starts with ``_``, and
+  :meth:`nexusdl.plugins.loader.PluginLoader._iter_plugin_dirs` skips every
+  such directory (the underscore prefix is reserved for internal and
+  reference packages). The example is therefore never loaded at runtime —
+  it is shipped inside the wheel purely as package data so users can copy
+  it as a starting point.
+* To activate the example, copy the whole directory into your user plugin
+  directory (see ``docs/source/development/plugins.md`` for the platform-
+  specific location) and rename the copy so it no longer starts with ``_``.
+  Then update ``name:`` / ``version:`` in ``nexus.plugin.yaml`` **and** the
+  matching class attributes in ``plugin.py`` — the loader cross-checks both.
 
 Contents
 --------
-* ``nexus.plugin.yaml`` — the manifest (identity, compatibility, hooks,
-  dependencies). See ``docs/source/development/plugins.md`` for the schema.
+* ``nexus.plugin.yaml`` — the manifest. Parsed and validated by
+  :func:`nexusdl.plugins.validators.load_manifest` *before* ``plugin.py`` is
+  imported; a schema violation aborts the load with
+  :class:`~nexusdl.core.exceptions.PluginError`.
 * ``plugin.py`` — the implementation of :class:`ExamplePlugin`, a
   strictly-transparent passthrough that exercises every hook of the
   :class:`~nexusdl.plugins.api.NexusPlugin` protocol.
 
-The single public symbol re-exported here is :class:`ExamplePlugin`, so that
-tests and documentation can ``from nexusdl.plugins._example import
-ExamplePlugin`` without reaching into the private module path.
+Import behaviour
+----------------
+This ``__init__.py`` exists so the example can be imported as a normal
+Python package::
 
-To use this as a template for a real plugin:
+    from nexusdl.plugins._example import ExamplePlugin
 
-1. Copy the whole ``_example/`` directory to your plugin directory
-   (see ``docs/source/development/plugins.md`` for the location on each
-   platform).
-2. Rename the directory so it no longer starts with ``_``.
-3. Update ``name:`` and ``version:`` in ``nexus.plugin.yaml`` **and** the
-   matching class attributes in ``plugin.py`` — the loader cross-checks them.
-4. Replace the hook bodies with your own logic.
+The loader itself **never** executes this file. When it loads a plugin it
+imports ``plugin.py`` as a standalone module under a namespaced name
+(``_nexusdl_plugin_<name>``) via :mod:`importlib.util`, bypassing package
+import machinery entirely — see
+:meth:`nexusdl.plugins.loader.PluginLoader._import_plugin_module`. The
+result is that a user copying this directory gets their own independent
+module instance, with no risk of collision with the reference example.
+
+The re-export below is therefore intended for **tests and documentation**,
+which want a stable import path to assert against the reference
+implementation. Production code never imports from this package.
+
+Public API
+----------
+Only :class:`ExamplePlugin` is exported. The package deliberately hides
+everything else so that future internal additions (helper modules, type
+stubs, tests) do not widen the public surface.
 """
 
 from __future__ import annotations

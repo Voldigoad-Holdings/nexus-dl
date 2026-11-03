@@ -1,0 +1,464 @@
+/* =============================================================================
+   NexusDL TUI — global theme
+   =============================================================================
+   This file is the App's CSS, loaded by Textual via the ``CSS_PATH``
+   class attribute on :class:`nexusdl.interfaces.cli.app.NexusDLApp`.
+
+   It is **layer 2** of the TUI's styling:
+
+     • Layer 1 — Textual's own default stylesheet and the active theme
+       (``textual-dark`` by default, from ``settings.tui.theme``). This
+       provides the theme variables (``$primary``, ``$surface``,
+       ``$accent``, …) and the baseline styling every widget inherits.
+
+     • Layer 2 — this file. Extends the theme with app-specific styling
+       for standard widgets (Input, Button, OptionList, DataTable,
+       Select), the modal overlay, scrollbars, and the App's Footer
+       and Header.
+
+     • Layer 3 — the per-widget ``DEFAULT_CSS`` declared on each widget
+       and screen. Widget-specific rules that only make sense inside
+       that widget.
+
+   The layering means this file does **not** override the widget-level
+   rules; it only adds what those rules assume exists (theme variables,
+   standard widget appearance, global chrome). A rule that would
+   conflict with a widget's own ``DEFAULT_CSS`` belongs on the widget,
+   not here.
+
+   Theme variables come from the active Textual theme. Overriding them
+   here would defeat the purpose of ``settings.tui.theme`` — a user
+   picking ``textual-light`` expects the palette to switch. Custom
+   variables (prefixed ``$nsdl-``) are allowed for values that are
+   genuinely app-specific and not part of the theme contract.
+   ============================================================================= */
+
+
+/* =============================================================================
+   Custom variables
+   =============================================================================
+   Every value below is either a theme variable (which resolves per
+   theme) or a fixed app-specific choice (which does not). Fixed values
+   are the ones a theme author would not consider "part of the palette"
+   — the adult-content badge colour, the JS-required badge colour — but
+   that the app wants to be consistent across themes.
+   ============================================================================= */
+
+$nsdl-adult-badge: $error;
+$nsdl-js-badge: $warning;
+$nsdl-status-current: $accent;
+$nsdl-status-read: $success;
+
+
+/* =============================================================================
+   Screen base
+   =============================================================================
+   Every Screen in the app already declares its own ``background:
+   $surface`` in its ``DEFAULT_CSS``. This rule catches Screens that do
+   not (a future ModalScreen subclass, a dialog) so the app never
+   renders a white flash on top of a dark theme.
+   ============================================================================= */
+
+Screen {
+    background: $background;
+    color: $text;
+}
+
+
+/* =============================================================================
+   Header and Footer
+   =============================================================================
+   The app does not push a Header (the main screen's own dashboard
+   header is a Label), but the Footer is enabled for the whole app so
+   every screen shows its bindings. Styling the Footer here keeps the
+   shortcut hints visually consistent with the rest of the chrome.
+   ============================================================================= */
+
+Footer {
+    background: $panel;
+    color: $text-muted;
+    height: 1;
+}
+
+Footer > .footer--key {
+    color: $accent;
+    text-style: bold;
+}
+
+Footer > .footer--description {
+    color: $text-muted;
+}
+
+Footer > .footer--highlight {
+    background: $primary;
+    color: $text;
+}
+
+Footer > .footer--highlight-key {
+    color: $accent;
+    text-style: bold;
+}
+
+Header {
+    background: $panel;
+    color: $text;
+    text-style: bold;
+}
+
+
+/* =============================================================================
+   Input
+   =============================================================================
+   The search, library, and download screens each contain an Input. The
+   border colour communicates focus: neutral primary when idle, accent
+   when focused, error when the value is rejected. Textual's default is
+   already close to this; the rules below tighten the padding and the
+   border character selection so text inside the input sits flush with
+   the surrounding chrome.
+   ============================================================================= */
+
+Input {
+    background: $surface;
+    color: $text;
+    border: tall $primary;
+    padding: 0 1;
+}
+
+Input:focus {
+    border: tall $accent;
+}
+
+Input.-invalid,
+Input.-invalid:focus {
+    border: tall $error;
+}
+
+Input > .input--placeholder {
+    color: $text-muted;
+}
+
+Input > .input--cursor {
+    background: $accent;
+    color: $surface;
+}
+
+
+/* =============================================================================
+   Button
+   =============================================================================
+   Every screen in the app uses Button variants (``default``,
+   ``success``, ``warning``, ``error``). Textual generates a
+   ``Button.-{variant}`` class for each; styling the class once here
+   means every call site's variant choice is honoured with the same
+   visual language. The disabled state is uniform across variants —
+   a disabled ``success`` button should not look green.
+   ============================================================================= */
+
+Button {
+    min-width: 8;
+    margin: 0 1 0 0;
+    border: tall $primary;
+    content-align: center middle;
+}
+
+Button.-default {
+    background: $panel;
+    color: $text;
+    border: tall $primary;
+}
+
+Button.-default:hover {
+    background: $boost;
+    border: tall $accent;
+}
+
+Button.-default:focus {
+    border: tall $accent;
+}
+
+Button.-primary {
+    background: $primary;
+    color: $text;
+    border: tall $primary;
+}
+
+Button.-primary:hover {
+    background: $primary-lighten-1;
+}
+
+Button.-primary:focus {
+    border: tall $accent;
+}
+
+Button.-success {
+    background: $success;
+    color: $text;
+    border: tall $success;
+}
+
+Button.-success:hover {
+    background: $success-lighten-1;
+}
+
+Button.-success:focus {
+    border: tall $accent;
+}
+
+Button.-warning {
+    background: $warning;
+    color: $text;
+    border: tall $warning;
+}
+
+Button.-warning:hover {
+    background: $warning-lighten-1;
+}
+
+Button.-warning:focus {
+    border: tall $accent;
+}
+
+Button.-error {
+    background: $error;
+    color: $text;
+    border: tall $error;
+}
+
+Button.-error:hover {
+    background: $error-lighten-1;
+}
+
+Button.-error:focus {
+    border: tall $accent;
+}
+
+Button:disabled {
+    background: $panel;
+    color: $text-disabled;
+    border: tall $panel;
+}
+
+
+/* =============================================================================
+   Select (format picker, level picker)
+   =============================================================================
+   Textual's Select renders three components: the closed widget, the
+   current value, and the open overlay. All three are styled here so
+   that the closed state and the open state share the same background
+   and border — the overlay would otherwise inherit the surface colour
+   and disappear against the surrounding panel.
+   ============================================================================= */
+
+Select {
+    background: $surface;
+    border: tall $primary;
+}
+
+Select:focus {
+    border: tall $accent;
+}
+
+SelectCurrent {
+    background: $surface;
+    color: $text;
+    border: none;
+}
+
+SelectOverlay {
+    background: $panel;
+    border: tall $primary;
+}
+
+SelectOverlay > .option-list--option {
+    padding: 0 1;
+}
+
+SelectOverlay > .option-list--option-highlighted {
+    background: $primary;
+    color: $text;
+}
+
+
+/* =============================================================================
+   OptionList (main menu, settings sections, help categories)
+   =============================================================================
+   The list is rendered with a panel background so it reads as a
+   distinct sidebar. The highlighted row uses the primary colour when
+   the list does not have focus, and the accent colour (with bold text)
+   when it does — the user can see at a glance which widget is
+   receiving keyboard input.
+   ============================================================================= */
+
+OptionList {
+    background: $panel;
+    color: $text;
+    border: none;
+    padding: 0;
+}
+
+OptionList > .option-list--option {
+    padding: 0 1;
+    color: $text;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: $primary;
+    color: $text;
+}
+
+OptionList:focus > .option-list--option-highlighted {
+    background: $accent;
+    color: $text;
+    text-style: bold;
+}
+
+OptionList > .option-list--option-disabled {
+    color: $text-disabled;
+}
+
+
+/* =============================================================================
+   DataTable (chapter list)
+   =============================================================================
+   The chapter list relies on zebra striping to help the eye track a
+   row across the four columns. The cursor row must remain visible when
+   the table does not have focus (a user comparing two chapters before
+   clicking) and must be more prominent when it does.
+   ============================================================================= */
+
+DataTable {
+    background: $surface;
+    color: $text;
+}
+
+DataTable > .datatable--header {
+    background: $panel;
+    color: $accent;
+    text-style: bold;
+}
+
+DataTable > .datatable--even-row {
+    background: $surface;
+}
+
+DataTable > .datatable--odd-row {
+    background: $boost;
+}
+
+DataTable > .datatable--cursor {
+    background: $primary;
+    color: $text;
+}
+
+DataTable:focus > .datatable--cursor {
+    background: $accent;
+    color: $text;
+    text-style: bold;
+}
+
+DataTable > .datatable--hover {
+    background: $boost;
+}
+
+
+/* =============================================================================
+   RichLog (log viewer body)
+   =============================================================================
+   RichLog renders pre-styled Rich Text. The background and colour
+   properties here only affect the padding area around the log body;
+   the per-line styling comes from the LogEntry renderer in
+   ``log_viewer.py``.
+   ============================================================================= */
+
+RichLog {
+    background: $surface;
+    color: $text;
+    padding: 0;
+}
+
+
+/* =============================================================================
+   Textual's built-in ProgressBar (overall bar in the download screen)
+   =============================================================================
+   The overall bar is styled with the accent colour so it reads as the
+   primary progress indicator. The per-task bars (Unicode block
+   characters in ``progress_bar.py``) are styled separately by their
+   own builder.
+   ============================================================================= */
+
+ProgressBar {
+    color: $accent;
+}
+
+ProgressBar > .progress-bar--bar {
+    color: $primary;
+}
+
+ProgressBar > .progress-bar--percentage {
+    color: $text-muted;
+}
+
+
+/* =============================================================================
+   Modal screens (the quit-confirmation dialog)
+   =============================================================================
+   A modal is rendered on top of the screen beneath it with a dimmed
+   backdrop. The dim level (``$background 60%``) is a stylistic choice;
+   a lighter dim (``$background 30%``) would leave more of the
+   underlying screen visible, a heavier one (``80%``) would feel
+   claustrophobic. 60% matches the modal styling of most modern TUIs.
+   ============================================================================= */
+
+ModalScreen {
+    background: $background 60%;
+    align: center middle;
+}
+
+
+/* =============================================================================
+   Scrollbars
+   =============================================================================
+   Every scrollable container in the app (VerticalScroll on most
+   screens, RichLog in the log viewer, OptionList in the main menu)
+   inherits this scrollbar styling. The neutral state is dim (the
+   scrollbar should not compete with content for attention), the hover
+   and active states are accent, and the track is the panel colour so
+   the scrollbar reads as part of the surrounding chrome.
+   ============================================================================= */
+
+* {
+    scrollbar-background: $panel;
+    scrollbar-background-hover: $boost;
+    scrollbar-background-active: $boost;
+    scrollbar-color: $primary;
+    scrollbar-color-hover: $accent;
+    scrollbar-color-active: $accent;
+    scrollbar-corner-color: $panel;
+}
+
+
+/* =============================================================================
+   Loading indicator
+   =============================================================================
+   Textual's built-in LoadingIndicator is displayed briefly during any
+   worker that runs longer than the App's loading delay (default 0.5s).
+   The accent colour matches the rest of the app's "this is doing
+   something" language.
+   ============================================================================= */
+
+LoadingIndicator {
+    color: $accent;
+}
+
+
+/* =============================================================================
+   Badges used in manga card titles and chapter-list status cells
+   =============================================================================
+   The manga card builder in ``manga_card.py`` emits styled Text spans
+   using the ``$nsdl-adult-badge`` custom variable (defined above).
+   These selectors are not used by the widget's DOM — the styles are
+   baked into the ``Text`` object — but declaring the variables here
+   keeps the colour choice visible in a single place a themer can find.
+   ============================================================================= */
+
+/* The spans themselves are rendered by the widget; no CSS rules apply. */

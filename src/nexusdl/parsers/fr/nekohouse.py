@@ -681,6 +681,6 @@ NekohouseParser._pages_from_html = _pages_from_html_impl  # type: ignore[method-
 
 
 # Auto-registration — triggered when ``nexusdl.parsers.fr`` is imported,
-# which in turn is imported by ``nexusdl.parsers``.  This keeps the factory
+# which in turn is imported by ``nexusdl.parsers``.  This keeps the factory 
 # populated without any manual wiring in the composition root.
 register("nekohouse", NekohouseParser)

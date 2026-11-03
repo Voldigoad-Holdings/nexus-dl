@@ -52,6 +52,7 @@ class GalaxyScansParser(MangaThemesiaMixin, BaseParser):
     adult: bool = False
 
 
+
 # Auto-registration — triggered when ``nexusdl.parsers.en`` is imported,
 # which in turn is imported by ``nexusdl.parsers``.  This keeps the factory
 # populated without any manual wiring in the composition root.

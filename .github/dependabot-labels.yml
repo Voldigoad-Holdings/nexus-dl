@@ -1,0 +1,27 @@
+# .github/workflows/dependabot-labels.yml
+# Ajoute un label "needs-review" aux PRs Dependabot qui touchent
+# des dépendances critiques (pydantic, fastapi, playwright, next, react).
+# Ces PRs ne sont JAMAIS auto-mergées même en minor/patch.
+name: Label critical Dependabot PRs
+on: pull_request
+jobs:
+  label:
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const critical = ['pydantic', 'pydantic-settings', 'sqlalchemy',
+                              'fastapi', 'playwright', 'next', 'react',
+                              'react-dom', 'tailwindcss', 'eslint'];
+            const body = context.payload.pull_request.title;
+            if (critical.some(c => body.toLowerCase().includes(c))) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                labels: ['critical-dependency', 'needs-review'],
+              });
+            }

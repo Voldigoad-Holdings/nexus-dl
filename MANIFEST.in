@@ -1,6 +1,35 @@
 # ════════════════════════════════════════════════════════════════════
 # NexusDL — MANIFEST.in
 # ════════════════════════════════════════════════════════════════════
+#
+# ⚠️  Ce fichier n'est PAS lu par le build backend actuel (hatchling).
+#     Il est conservé pour documentation des contributeurs et pour un
+#     éventuel retour à setuptools.  La source de vérité pour la sdist
+#     est [tool.hatch.build.targets.sdist] dans pyproject.toml.
+#
+# ════════════════════════════════════════════════════════════════════
+# NOTES DE SYNTAXE — à respecter pour toute modification future
+# ════════════════════════════════════════════════════════════════════
+#
+#   1. ``prune <dir>`` prend UN SEUL argument.  ``prune .venv venv env``
+#      est une erreur silencieuse — ``prune`` ne traite que ``.venv``
+#      et ignore le reste.  Chaque dossier nécessite sa propre ligne.
+#
+#   2. ``prune <glob>`` NE SUPPORTE PAS les globs.  ``prune *.egg-info``
+#      ne matche rien.  Il faut ``prune <nom-exact>``.
+#
+#   3. ``exclude <pattern>`` ne matche qu'à la RACINE de la sdist.
+#      Pour exclure un fichier à n'importe quelle profondeur, utiliser
+#      ``global-exclude <pattern>``.
+#
+#   4. ``recursive-exclude . <name>`` matche des FICHIERS, pas des
+#      dossiers.  Pour exclure un dossier de cache à n'importe quelle
+#      profondeur, utiliser ``global-exclude */<dirname>/*``.
+#
+#   5. ``recursive-include <dir> <pattern>`` accepte plusieurs patterns
+#      sur la même ligne : ``recursive-include src *.py *.pyi``.
+#
+# ════════════════════════════════════════════════════════════════════
 
 # ────────────────────────────────────────────────────────────────────
 # 1. FICHIERS RACINE
@@ -16,7 +45,8 @@ include nexus.dl
 include pyproject.toml
 include MANIFEST.in
 
-# Exemples de configuration (pas les fichiers réels)
+# Fichiers de configuration du dépôt (utiles aux contributeurs qui
+# extraient la sdist pour contribuer au projet).
 include .env.example
 include .editorconfig
 include .gitattributes
@@ -28,26 +58,22 @@ include .pre-commit-config.yaml
 # ────────────────────────────────────────────────────────────────────
 # 2. PACKAGE PYTHON — src/nexusdl/
 # ────────────────────────────────────────────────────────────────────
-# Le package Python est découvert automatiquement par hatchling,
-# mais on inclut explicitement les données non-Python nécessaires.
+# Le code Python est découvert automatiquement par hatchling/setuptools.
+# Les règles ci-dessous ne couvrent que les fichiers non-Python
+# nécessaires au fonctionnement à l'exécution.
 
 # ── Données runtime (indispensables au fonctionnement) ──
-recursive-include src/nexusdl/data *.yaml
-recursive-include src/nexusdl/data *.yml
-recursive-include src/nexusdl/data *.json
-recursive-include src/nexusdl/data *.xml
-recursive-include src/nexusdl/data *.txt
-recursive-include src/nexusdl/data/translations *.json
+# ``data/translations/*.json`` est déjà couvert par ``*.json`` ci-dessous.
+recursive-include src/nexusdl/data *.yaml *.yml *.json *.xml *.txt
 
-# ── Migrations SQL (indispensables au démarrage) ──
+# ── Migrations SQL (indispensables au démarrage de la bibliothèque) ──
 recursive-include src/nexusdl/core/library/migrations *.sql
 
 # ── Marqueur PEP 561 (typage) ──
 include src/nexusdl/py.typed
 
 # ── Exemple de plugin (référence pour la communauté) ──
-recursive-include src/nexusdl/plugins/_example *.py
-recursive-include src/nexusdl/plugins/_example *.yaml
+recursive-include src/nexusdl/plugins/_example *.py *.yaml
 
 # ── Template de parser custom (référence pour la communauté) ──
 recursive-include src/nexusdl/parsers/custom *.py
@@ -56,22 +82,15 @@ recursive-include src/nexusdl/parsers/custom *.py
 recursive-include src/nexusdl/interfaces/cli *.tcss
 
 # ────────────────────────────────────────────────────────────────────
-# 3. CONFIGURATION (exemples uniquement)
+# 3. CONFIGURATION (exemples uniquement, pas les configs réelles)
 # ────────────────────────────────────────────────────────────────────
-recursive-include config *.example.yaml
-recursive-include config *.example.yml
+recursive-include config *.example.yaml *.example.yml
 include config/logging.yaml
 
 # ────────────────────────────────────────────────────────────────────
-# 4. DOCUMENTATION (uniquement les sources, pas les builds)
+# 4. DOCUMENTATION (sources uniquement, pas les builds Sphinx)
 # ────────────────────────────────────────────────────────────────────
-recursive-include docs/source *.md
-recursive-include docs/source *.rst
-recursive-include docs/source *.py
-recursive-include docs/source *.css
-recursive-include docs/source *.html
-recursive-include docs/source *.png
-recursive-include docs/source *.svg
+recursive-include docs/source *.md *.rst *.py *.css *.html *.png *.svg
 include docs/API.md
 include docs/README.md
 
@@ -94,12 +113,13 @@ include docker/entrypoint.ps1
 include docker/nginx.conf
 
 # ────────────────────────────────────────────────────────────────────
-# 7. GITHUB (templates pour contributeurs)
+# 7. GITHUB (templates pour contributeurs et workflows CI)
 # ────────────────────────────────────────────────────────────────────
 include .github/CODEOWNERS
 include .github/dependabot.yml
 include .github/PULL_REQUEST_TEMPLATE.md
 recursive-include .github/ISSUE_TEMPLATE *.md
+recursive-include .github/workflows *.yml
 
 # ────────────────────────────────────────────────────────────────────
 # 8. ASSETS LÉGERS (bannière, logo — pas les screenshots)
@@ -118,8 +138,7 @@ include tests/pytest.ini
 include tests/conftest.py
 
 # Fixtures légères (JSON/YAML) uniquement — pas les binaires
-recursive-include tests/fixtures *.json
-recursive-include tests/fixtures *.yaml
+recursive-include tests/fixtures *.json *.yaml
 
 # ────────────────────────────────────────────────────────────────────
 # 10. BUILD & CI (référence)
@@ -127,18 +146,14 @@ recursive-include tests/fixtures *.yaml
 include Makefile
 include justfile
 include tox.ini
-include .github/workflows/*.yml
 
 # ════════════════════════════════════════════════════════════════════
-# EXCLUSIONS — ne JAMAIS inclure dans le sdist
+# EXCLUSIONS — ne JAMAIS inclure dans la sdist
 # ════════════════════════════════════════════════════════════════════
 
 # ── Secrets ──
 exclude .env
 exclude .env.*
-exclude .env.local
-exclude .env.production
-exclude .env.development
 recursive-exclude . *.key
 recursive-exclude . *.keyfile
 recursive-exclude . *.pem
@@ -157,17 +172,21 @@ exclude src/nexusdl/interfaces/web/frontend/*.tsbuildinfo
 exclude src/nexusdl/interfaces/web/frontend/.eslintcache
 
 # ── Fichiers Python générés ──
-recursive-exclude . __pycache__
-recursive-exclude . *.py[cod]
-recursive-exclude . *$py.class
-recursive-exclude . *.so
-recursive-exclude . *.pyd
-recursive-exclude . .mypy_cache
-recursive-exclude . .ruff_cache
-recursive-exclude . .pytest_cache
-recursive-exclude . .hypothesis
-recursive-exclude . .tox
-recursive-exclude . .nox
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude *.pyd
+
+# ── Répertoires de cache (n'importe quelle profondeur) ──
+# ``recursive-exclude . <dirname>`` matche des fichiers, pas des
+# dossiers — la forme ``global-exclude */<dirname>/*`` exclut le contenu
+# de chaque dossier de ce nom, rendant le dossier vide, donc absent.
+global-exclude */__pycache__/*
+global-exclude */.mypy_cache/*
+global-exclude */.ruff_cache/*
+global-exclude */.pytest_cache/*
+global-exclude */.hypothesis/*
+global-exclude */.tox/*
+global-exclude */.nox/*
 
 # ── Environnements virtuels ──
 prune .venv
@@ -180,9 +199,9 @@ prune node_modules
 prune build
 prune dist
 prune .eggs
-prune *.egg-info
-recursive-exclude . *.egg
-recursive-exclude . *.whl
+prune nexusdl.egg-info
+global-exclude *.egg
+global-exclude *.whl
 
 # ── Données runtime NexusDL ──
 prune data
@@ -198,11 +217,9 @@ exclude cookies.enc
 recursive-exclude . *.sqlite
 recursive-exclude . *.sqlite3
 recursive-exclude . *.log
-recursive-exclude . *.log.*
 
 # ── Screenshots (trop lourds) ──
 prune assets/screenshots
-prune src/nexusdl/interfaces/web/frontend/public/screenshots
 
 # ── IDE / éditeurs ──
 prune .idea
@@ -214,16 +231,15 @@ recursive-exclude . *.swo
 recursive-exclude . *~
 
 # ── OS ──
-exclude .DS_Store
-exclude ._*
-exclude .Spotlight-V100
-exclude .Trashes
-exclude Thumbs.db
-exclude desktop.ini
-exclude Icon?
+global-exclude .DS_Store
+global-exclude ._*
+global-exclude .Spotlight-V100
+global-exclude .Trashes
+global-exclude Thumbs.db
+global-exclude desktop.ini
+global-exclude Icon?
 
 # ── Divers ──
-prune .github/workflows/ci-tmp
 recursive-exclude . *.tmp
 recursive-exclude . *.bak
 recursive-exclude . *.orig

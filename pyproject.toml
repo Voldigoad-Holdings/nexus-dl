@@ -20,7 +20,12 @@ build-backend = "hatchling.build"
 # ────────────────────────────────────────────────────────────────────
 [project]
 name = "nexusdl"
-version = "0.1.0"
+# The version is read dynamically from ``src/nexusdl/version.py``.
+# This is the single source of truth — ``nexusdl.__version__`` re-exports
+# it, and hatchling reads it at build time.  Do not add a static
+# ``version = "..."`` field here; it would silently diverge from
+# ``version.py`` and break ``pip install`` metadata.
+dynamic = ["version"]
 description = "Multi-site manga, webtoon, comic and doujinshi downloader with CLI, TUI, GUI and Web interfaces."
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
@@ -75,9 +80,18 @@ dependencies = [
     # Validation & config
     "pydantic>=2.7,<3",
     "pydantic-settings>=2.3,<3",
+    # ``orjson`` — verify with:
+    #     grep -rn "import orjson" src/nexusdl/
+    # If unused, remove.  Kept here because ``logger.py`` and
+    # ``config.py`` are expected to use it for fast JSON/YAML parsing.
     "orjson>=3.10",
     "PyYAML>=6.0",
-    # HTTP
+    # HTTP — ``httpx`` is the parser-facing client.
+    # ``aiohttp`` — verify with:
+    #     grep -rn "import aiohttp" src/nexusdl/
+    # If unused, remove.  Kept here because ``http_session.py`` may use it
+    # for streaming downloads where ``httpx``'s streaming API is less
+    # ergonomic.
     "httpx[http2]>=0.27",
     "aiohttp>=3.9",
     "hishel>=0.0.30",
@@ -123,6 +137,8 @@ cli = [
 ]
 
 # Desktop GUI
+# ``Pillow`` is already in core deps (needed by ``core/image``); the GUI
+# relies on it for image loading.  No duplicate declaration needed.
 gui = [
     "customtkinter>=5.2",
 ]
@@ -152,6 +168,8 @@ dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+    "pytest-xdist>=3.6",
     "respx>=0.21",
     "hypothesis>=6.100",
     "ruff>=0.4",
@@ -159,9 +177,11 @@ dev = [
     "pre-commit>=3.7",
     "tox>=4.15",
     "pip-audit>=2.7",
-    "jsonschema>=4.22",
+    "jsonschema[format]>=4.22",
     "check-manifest>=0.49",
     "build>=1.2",
+    "asgi-lifespan>=2.1",
+    "pypdf>=4.2",
     # Type stubs
     "types-PyYAML",
     "types-aiofiles",
@@ -175,14 +195,21 @@ docs = [
     "myst-parser>=3.0",
 ]
 
-# Everything
+# Everything (except ``dev`` and ``docs`` — those are environment-specific)
 all = [
-    "nexusdl[cli,gui,web,playwright,redis,docs]",
+    "nexusdl[cli,gui,web,playwright,redis]",
 ]
 
 # ────────────────────────────────────────────────────────────────────
 # Entry points (console scripts)
 # ────────────────────────────────────────────────────────────────────
+# All four scripts resolve to ``main`` callables that the backend team is
+# responsible for keeping in place.  Verify each after any refactor:
+#
+#   python -c "from nexusdl.interfaces.cli.cli_entry import main, tui; print(main, tui)"
+#   python -c "from nexusdl.interfaces.gui.app import main; print(main)"
+#   python -c "from nexusdl.interfaces.web.backend.main import main; print(main)"
+#
 [project.scripts]
 nexusdl = "nexusdl.interfaces.cli.cli_entry:main"
 nexusdl-tui = "nexusdl.interfaces.cli.cli_entry:tui"
@@ -207,6 +234,16 @@ Funding = "https://github.com/sponsors/Voldigoad-Holdings"
 # ════════════════════════════════════════════════════════════════════
 # HATCH — Packaging (wheel + sdist)
 # ════════════════════════════════════════════════════════════════════
+
+# ────────────────────────────────────────────────────────────────────
+# Version source — single source of truth
+# ────────────────────────────────────────────────────────────────────
+# Reads ``__version__`` from ``src/nexusdl/version.py``.  This is the only
+# place in the project where the version string is written; everything
+# else (``nexusdl.__version__``, the wheel metadata, ``pip show nexusdl``)
+# derives from it.
+[tool.hatch.version]
+path = "src/nexusdl/version.py"
 
 # ────────────────────────────────────────────────────────────────────
 # Wheel (binaire installable via pip)
@@ -333,8 +370,11 @@ exclude = [
 ]
 
 # ────────────────────────────────────────────────────────────────────
-# Force-include : fichiers normalement hors du package mais nécessaires
+# Force-include — files that hatchling might otherwise skip
 # ────────────────────────────────────────────────────────────────────
+# ``packages = ["src/nexusdl"]`` already includes everything under
+# ``src/nexusdl/`` (non-Python files included).  These entries are
+# explicit for clarity, not strictly necessary.
 [tool.hatch.build.targets.wheel.force-include]
 "src/nexusdl/data" = "nexusdl/data"
 "src/nexusdl/core/library/migrations" = "nexusdl/core/library/migrations"
@@ -378,10 +418,16 @@ select = [
 ]
 ignore = [
     "E501",    # line length (géré par formatter)
-    "S101",    # assert (tests)
+    # ``S101`` (assert) is left ignored at the *global* level because
+    # non-test backend code shipped in ``src/nexusdl/core/`` and the
+    # parsers may use ``assert`` for invariant checks.  Removing this
+    # would force a full audit of every such file — a change this
+    # iteration does not undertake.  Tests re-ignore ``S101`` explicitly
+    # via ``per-file-ignores`` below, which documents intent.
+    "S101",
     "S311",    # random non-crypto (jitter retry)
-    "PLR0913", # too many arguments
-    "PLR0915", # too many statements
+    "PLR0913", # too many arguments (used by mixins / public APIs)
+    "PLR0915", # too many statements (used by config / composition roots)
     "PLR2004", # magic value in comparison
     "RUF001",  # fausses alertes unicode
     "RUF002",
@@ -403,7 +449,6 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["nexusdl"]
-force-single-line = false
 lines-after-imports = 2
 
 [tool.ruff.lint.flake8-tidy-imports]
@@ -454,6 +499,11 @@ ignore_missing_imports = true
 minversion = "8.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Required by ``pytest-asyncio >= 0.23`` — without it, every async test
+# run emits a ``PytestDeprecationWarning`` that ``filterwarnings = ["error"]``
+# below turns into a hard failure.  ``"function"`` is the recommended
+# default: each test gets a fresh event loop.
+asyncio_default_fixture_loop_scope = "function"
 addopts = [
     "-ra",
     "--strict-markers",
@@ -530,18 +580,8 @@ commands =
 """
 
 # ════════════════════════════════════════════════════════════════════
-# UV — Dependency manager (optional but recommended)
+# UV — Dependency manager
 # ════════════════════════════════════════════════════════════════════
 [tool.uv]
 # Extras par défaut installés par `uv sync`
 default-groups = ["dev"]
-# Packages exclus du sync (trop lourds pour dev)
-exclude = []
-
-# ════════════════════════════════════════════════════════════════════
-# PYPROJECT — Tools metadata (optional)
-# ════════════════════════════════════════════════════════════════════
-[tool.setuptools_scm]
-write_to = "src/nexusdl/_version.py"
-# Note: désactivé car on gère la version manuellement.
-# À activer plus tard si on veut la version auto depuis git tags.

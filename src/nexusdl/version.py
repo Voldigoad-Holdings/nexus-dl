@@ -5,7 +5,7 @@
 This module is the **single source of truth** for the package version.
 It is imported by:
 
-    - pyproject.toml (via hatch-vcs, if configured) or manually synced
+    - pyproject.toml (via ``[tool.hatch.version] path = ...``)
     - src/nexusdl/__init__.py
     - src/nexusdl/__main__.py
     - src/nexusdl/interfaces/cli/cli_entry.py (--version)
@@ -21,15 +21,21 @@ Contract:
     - __build__: "dev" | "ci" | "release" (from env NEXUSDL_BUILD, default "dev")
     - __commit__: short git SHA if available, else None
     - __commit_date__: ISO 8601 date of the commit, else None
-    - __build_date__: ISO 8601 UTC timestamp of the build
+    - __build_date__: ISO 8601 UTC timestamp of the **module import**
+      (best approximation of build time available at runtime; the true
+      build time is recorded in the wheel metadata by hatchling)
     - __author__: author name
     - __license__: SPDX identifier
     - __homepage__: project URL
     - __python_requires__: minimum Python version
 
-The module has NO side effects (no I/O, no network, no subprocess)
-except a single `git rev-parse` call wrapped in try/except, cached
-at import time. If git is not installed, `__commit__` is None.
+The module has **no side effects** except:
+
+    - a ``datetime.now()`` call at import time (for ``__build_date__``),
+    - two ``git`` subprocess calls (``rev-parse`` and ``log``) wrapped in
+      ``contextlib.suppress`` with a 1-second timeout, cached at import.
+      If git is unavailable, ``__commit__`` and ``__commit_date__`` are
+      ``None`` and the module continues to work.
 
 Example:
     >>> from nexusdl.version import __version__
@@ -42,8 +48,8 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
-from pathlib import Path
+from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Final
 
 # ════════════════════════════════════════════════════════════════════
@@ -51,7 +57,8 @@ from typing import Final
 # ════════════════════════════════════════════════════════════════════
 # ⚠️  This is the ONLY place where the version is hardcoded.
 #     Bump it manually when releasing.
-#     `pyproject.toml` and `nexus.dl` MUST match (checked in CI).
+#     `pyproject.toml` reads this file (``[tool.hatch.version] path``).
+#     `nexus.dl` MUST match (checked in CI).
 __version__: Final[str] = "0.1.0"
 
 
@@ -109,24 +116,32 @@ __release__: Final[str] = __version__
 #: Build type: "dev" (local), "ci" (CI), "release" (PyPI/Docker).
 __build__: Final[str] = os.environ.get("NEXUSDL_BUILD", "dev")
 
-#: Build timestamp (UTC, ISO 8601).
-__build_date__: Final[str] = datetime.now(tz=timezone.utc).isoformat(
-    timespec="seconds"
-)
+#: Module import timestamp (UTC, ISO 8601).
+#:
+#: NOTE: this is the **import time**, not the build time.  The true
+#: build time is recorded by hatchling in the wheel metadata
+#: (``nexusdl-*.dist-info/METADATA``) and is not available at runtime
+#: without reading the wheel.  For a development checkout, import time
+#: and build time are equivalent.  For an installed wheel, this value
+#: reflects when the module first ran in the current process.
+__build_date__: Final[str] = datetime.now(tz=UTC).isoformat(timespec="seconds")
 
 
 # ════════════════════════════════════════════════════════════════════
 # 4. GIT METADATA (optional, no crash if git not available)
 # ════════════════════════════════════════════════════════════════════
 def _read_git_commit() -> str | None:
-    """Return the short git SHA if available, else None.
+    """Return the short git SHA if available, else ``None``.
+
+    Runs ``git rev-parse --short HEAD`` with a 1-second timeout.
+    Any failure (git not installed, not a git repository, timeout) is
+    silently swallowed and ``None`` is returned.
 
     Returns:
-        The short git SHA (7-8 chars), or ``None`` if git is not
-        available or the project is not a git repository.
+        The short git SHA (7–8 chars), or ``None``.
     """
-    try:
-        result = subprocess.run(
+    with suppress(subprocess.TimeoutExpired, OSError):
+        result = subprocess.run(  # noqa: S603, S607 — trusted input, PATH lookup intentional
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
@@ -135,19 +150,20 @@ def _read_git_commit() -> str | None:
         )
         if result.returncode == 0:
             return result.stdout.strip() or None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
     return None
 
 
 def _read_git_commit_date() -> str | None:
-    """Return the ISO 8601 commit date if available, else None.
+    """Return the ISO 8601 commit date if available, else ``None``.
+
+    Runs ``git log -1 --format=%cI`` with a 1-second timeout.
+    Any failure is silently swallowed and ``None`` is returned.
 
     Returns:
         The commit date (ISO 8601, UTC), or ``None``.
     """
-    try:
-        result = subprocess.run(
+    with suppress(subprocess.TimeoutExpired, OSError):
+        result = subprocess.run(  # noqa: S603, S607 — trusted input, PATH lookup intentional
             ["git", "log", "-1", "--format=%cI"],
             capture_output=True,
             text=True,
@@ -156,8 +172,6 @@ def _read_git_commit_date() -> str | None:
         )
         if result.returncode == 0:
             return result.stdout.strip() or None
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
     return None
 
 
@@ -205,11 +219,14 @@ def version_string() -> str:
     return " ".join(parts)
 
 
-def version_dict() -> dict[str, str | int | None]:
+def version_dict() -> dict[str, str | int | list[int] | None]:
     """Return the version info as a dict (for JSON output).
 
     Returns:
-        A dict with all version fields.
+        A dict whose values are JSON-serialisable.  ``version_info`` is
+        a three-element list of integers (JSON has no tuple type);
+        ``commit`` and ``commit_date`` may be ``None`` when git is
+        unavailable.
     """
     return {
         "version": __version__,

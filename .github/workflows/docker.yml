@@ -1,0 +1,388 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — docker.yml
+#
+# Builds, scans, and (on push to main / tags / workflow_call) publishes
+# the three Docker images the project ships:
+#
+#   * ``nexusdl``       — base image, CLI + TUI (from ``docker/Dockerfile``)
+#   * ``nexusdl-web``   — full backend + Next.js frontend bundle
+#                         (from ``docker/Dockerfile.web``)
+#   * ``nexusdl-gui``   — CustomTkinter desktop application running
+#                         under X11 (from ``docker/Dockerfile.gui``)
+#
+# These are the exact images the ``docker-*`` targets in the justfile
+# and Makefile build locally, with the tags the ``docker-push`` recipe
+# expects to find (``ghcr.io/voldigoad-holdings/nexusdl[-web|-gui]:...``).
+#
+# ────────────────────────────────────────────────────────────────────
+# ⚠️  PREREQUISITE — pnpm-lock.yaml
+# ────────────────────────────────────────────────────────────────────
+# ``Dockerfile.web`` builds the Next.js frontend inside the image via a
+# multi-stage build that runs ``pnpm install --frozen-lockfile``.  The
+# first CI run on a fresh clone will fail because the committed
+# ``pnpm-lock.yaml`` is a placeholder.  A developer must run
+# ``pnpm install`` locally once, then commit the resulting lockfile —
+# same prerequisite as ``build.yml``.  See the header of that workflow
+# for the rationale.
+#
+# ────────────────────────────────────────────────────────────────────
+# ⚠️  PREREQUISITE — Dockerfile paths
+# ────────────────────────────────────────────────────────────────────
+# The workflow assumes the files are named:
+#     docker/Dockerfile
+#     docker/Dockerfile.web
+#     docker/Dockerfile.gui
+# which is what the justfile and Makefile reference in their
+# ``docker-build*`` targets.  If the project later renames the base
+# Dockerfile to ``Dockerfile.base``, update the ``dockerfile:`` field in
+# the matrix below — the rest of the workflow does not care.
+#
+# ────────────────────────────────────────────────────────────────────
+# Multi-architecture policy
+# ────────────────────────────────────────────────────────────────────
+# PRs and pushes to main build ``linux/amd64`` only — the frontend and
+# Playwright install steps are dominated by network latency, and
+# emulating arm64 via QEMU multiplies every Rust/C build step
+# (``cryptography``, ``lxml``, ``Pillow``) by 5–10x.  A full multi-arch
+# build would take ~45 minutes per image and hit GitHub's 6-hour runner
+# limit on the web image.
+#
+# Tagged releases (``v*``) build ``linux/amd64,linux/arm64`` because that
+# is the moment the images are actually consumed by end users, most of
+# whom run amd64, but a growing minority run arm64 on Apple Silicon and
+# Raspberry Pi.  This is the same trade-off ``python:3.12-slim`` and
+# ``node:20`` themselves make — multi-arch on release, single-arch on CI.
+#
+# ════════════════════════════════════════════════════════════════════
+
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "docker/**"
+      - "src/nexusdl/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    paths:
+      - "docker/**"
+      - "src/nexusdl/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push images to GHCR"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      push:
+        description: "Push images to GHCR"
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      GITHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  packages: write        # needed for GHCR push
+  id-token: write        # needed for build provenance attestation
+  attestations: write    # needed for build provenance attestation
+  security-events: write # needed for Trivy SARIF upload (main + tags only)
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: voldigoad-holdings   # lowercase — GHCR requires it
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # Build / scan / push, one matrix entry per image
+  # ──────────────────────────────────────────────────────────────────
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: nexusdl
+            dockerfile: docker/Dockerfile
+            cache-scope: base
+            timeout: 45
+          - name: nexusdl-web
+            dockerfile: docker/Dockerfile.web
+            cache-scope: web
+            # The web image builds the Next.js bundle from scratch inside
+            # the container, which is the single most expensive step in
+            # the whole workflow.  A full cold build is ~12–15 min on a
+            # warm cache, ~25 min cold.  60 min leaves headroom for the
+            # arm64 leg on tags.
+            timeout: 60
+          - name: nexusdl-gui
+            dockerfile: docker/Dockerfile.gui
+            cache-scope: gui
+            timeout: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ── Version / tag consistency ──────────────────────────────
+      - name: Verify git tag matches version.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          src=$(grep -oP '__version__[^"]*"\K[^"]+' src/nexusdl/version.py | head -1)
+          echo "git tag:        v$tag"
+          echo "version.py:     $src"
+          if [ "$tag" != "$src" ]; then
+            echo "❌ Tag v$tag does not match version.py ($src)"
+            echo "   Either re-tag, or bump version.py before tagging."
+            exit 1
+          fi
+          echo "✅ Tag and version.py agree: $src"
+
+      # ── Free ~30 GB of pre-installed tooling we do not use ─────
+      # GitHub's ubuntu-latest runners ship with Android SDK, .NET,
+      # Haskell, CodeQL databases, and a duplicate copy of every
+      # toolchain.  Docker layer storage on a 14 GB filesystem fills
+      # up long before the build finishes.  This step is not optional.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false      # keep — needed by later steps
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true    # removes pre-pulled images we don't use
+          swap-storage: false    # keep swap — Docker benefits from it
+
+      # ── Set up QEMU (only needed on tagged releases) ───────────
+      - name: Set up QEMU
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # ``docker-container`` driver is required for multi-platform
+          # builds (the default ``docker`` driver cannot export a
+          # manifest list).  For single-platform builds it is also
+          # needed to enable GHA cache export.
+          driver: docker-container
+
+      # ── Determine platforms for this run ───────────────────────
+      - name: Set platforms
+        id: platforms
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=linux/amd64" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Determine whether this run should push ─────────────────
+      - name: Set push flag
+        id: push
+        env:
+          # ``inputs.push`` resolves to the default when the event is
+          # ``workflow_dispatch`` or ``workflow_call``; it is ``null``
+          # for ``push`` / ``pull_request`` events (which have no
+          # inputs).  The expression below makes the boolean explicit:
+          #  * push event → push only on main or v* tags
+          #  * workflow_dispatch / workflow_call → honour the input
+          #  * pull_request → never push
+          PUSH: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.push) || false }}
+        run: |
+          echo "value=$PUSH" >> "$GITHUB_OUTPUT"
+          echo "push=$PUSH"
+
+      # ── Log in to GHCR (only when pushing) ─────────────────────
+      - name: Log in to GHCR
+        if: steps.push.outputs.value == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Compute tags and labels ────────────────────────────────
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}
+          # Tag rules:
+          #  * v0.1.0 tag       → 0.1.0, 0.1, latest, sha-a1b2c3d
+          #  * v1.2.3 tag       → 1.2.3, 1.2, 1, latest, sha-a1b2c3d
+          #  * v0.x is unstable → no bare ``0`` tag (avoid implying stability)
+          #  * main branch      → main, sha-a1b2c3d
+          #  * PR #42           → pr-42, sha-a1b2c3d
+          #
+          # ``latest`` only tracks tagged releases, not main — a rolling
+          # ``latest`` from main is a footgun for self-hosters who pin to
+          # ``latest`` and expect stability.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=NexusDL ${{ matrix.name }}
+            org.opencontainers.image.description=Multi-site manga, webtoon, comic and doujinshi downloader
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      # ── Build and (optionally) push ────────────────────────────
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ steps.platforms.outputs.value }}
+          push: ${{ steps.push.outputs.value == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # ``provenance`` and ``sbom`` are generated by buildx itself
+          # when the driver supports them (``docker-container`` does).
+          # They are attached to the manifest list and surfaced through
+          # ``docker buildx imagetools inspect`` — no extra action needed.
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.cache-scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache-scope }}
+          # A failed build should not leave a half-pushed manifest.  The
+          # ``push`` is atomic on buildx: either the whole manifest list
+          # lands, or nothing does.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }},push-by-digest=${{ steps.push.outputs.value != 'true' }}
+
+      # ── Trivy scan ─────────────────────────────────────────────
+      # ``exit-code: 0`` on every event: a CVE in a transitive Go or C
+      # dependency must not block a legitimate PR.  The SARIF upload
+      # below populates the GitHub Security tab, where reviewers see the
+      # findings without CI failing.  Operators with a vulnerability
+      # management process can flip ``exit-code`` to ``1`` and
+      # ``severity`` to ``CRITICAL,HIGH`` at the tag step only.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          # Scan the local image, not the registry — the image is not
+          # pushed on PRs, so ``image-ref`` must point at the local
+          # Docker daemon.
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}:${{ steps.meta.outputs.version }}
+          format: "sarif"
+          output: "trivy-${{ matrix.name }}.sarif"
+          severity: "CRITICAL,HIGH"
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload Trivy results to GitHub Security
+        # ``security-events: write`` is only granted on push to main and
+        # tags; on PRs from forks it is not available, so we skip the
+        # upload rather than fail the job.
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-${{ matrix.name }}.sarif"
+          category: "trivy-${{ matrix.name }}"
+
+      # ── SBOM (CycloneDX) ───────────────────────────────────────
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.17.0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}:${{ steps.meta.outputs.version }}
+          format: cyclonedx-json
+          output-file: "sbom-${{ matrix.name }}.cdx.json"
+          upload-artifact: false
+
+      - name: Upload SBOM as artifact
+        if: steps.push.outputs.value == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.name }}
+          path: "sbom-${{ matrix.name }}.cdx.json"
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── Build provenance attestation ───────────────────────────
+      - name: Attest build provenance
+        if: steps.push.outputs.value == 'true'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── Human-readable summary ─────────────────────────────────
+      - name: Add job summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo ""
+            echo "- **Dockerfile:** \`${{ matrix.dockerfile }}\`"
+            echo "- **Platforms:** \`${{ steps.platforms.outputs.value }}\`"
+            echo "- **Pushed:** ${{ steps.push.outputs.value == 'true' && '✅ yes' || '❌ no (PR build)' }}"
+            if [ -n "${{ steps.build.outputs.digest }}" ]; then
+              echo "- **Digest:** \`${{ steps.build.outputs.digest }}\`"
+            fi
+            if [ -n "${{ steps.meta.outputs.tags }}" ]; then
+              echo ""
+              echo "**Tags:**"
+              echo '```'
+              echo "${{ steps.meta.outputs.tags }}"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────────────────────────
+  # Summary — one consolidated roll-up for the PR check tab
+  # ──────────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Docker build summary"
+            echo ""
+            echo "| Image | Result |"
+            echo "|---|---|"
+            echo "| nexusdl (base) | ${{ needs.build.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo ""
+          echo "> Matrix job \`build\` aggregates every image."
+          echo "> See the individual job for per-image status."
+          echo "> See the Security tab for Trivy findings on main and tags."

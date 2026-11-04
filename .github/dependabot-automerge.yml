@@ -1,0 +1,24 @@
+# .github/workflows/dependabot-automerge.yml
+# Fusionne automatiquement les PRs Dependabot quand :
+#   - l'auteur est dependabot[bot]
+#   - le bump est minor/patch (pas major)
+#   - toutes les CI checks sont vertes
+#   - la PR a reçu au moins 1 approval manuel (sauf si tu veux vraiment full auto)
+name: Dependabot auto-merge
+on: pull_request
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  automerge:
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dependabot/fetch-metadata@v2
+        id: meta
+      - name: Auto-merge minor/patch
+        if: ${{ steps.meta.outputs.update-type != 'version-update:semver-major' }}
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

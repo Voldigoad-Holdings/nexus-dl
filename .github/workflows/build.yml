@@ -1,0 +1,334 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — build.yml
+#
+# Builds and verifies the Python artifacts (wheel + sdist) and the
+# Next.js frontend bundle.  Does NOT run tests (see test.yml), does NOT
+# run linters (see lint.yml), does NOT build Docker images (see
+# docker.yml), does NOT publish (see release.yml).
+#
+# The workflow serves two purposes:
+#
+#   1. Every push to main and every PR targeting main validates that the
+#      wheel and sdist build cleanly and contain exactly the files they
+#      are supposed to contain — nothing more, nothing less.
+#   2. The same jobs are reusable via `workflow_call` from `release.yml`,
+#      so publishing to PyPI reuses the exact artifacts that CI just
+#      verified, rather than rebuilding (and risking drift).
+#
+# ⚠️  PREREQUISITE — pnpm-lock.yaml
+#     The first CI run on a fresh clone will FAIL on `pnpm install
+#     --frozen-lockfile` because the committed lockfile is a placeholder.
+#     A developer must run `pnpm install` locally once, then commit the
+#     resulting `pnpm-lock.yaml`.  This is intentional: the lockfile is
+#     a build artifact that must be regenerated from `package.json` and
+#     committed in the same change that touches dependencies.
+#
+# ════════════════════════════════════════════════════════════════════
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - "CHANGELOG.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE.md"
+      - "CHANGELOG.md"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "20"
+  PNPM_VERSION: "9"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # 1. Python wheel + sdist
+  # ──────────────────────────────────────────────────────────────────
+  build-python:
+    name: Build Python artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Verify metadata
+        run: |
+          set -euo pipefail
+          # ``twine check`` validates the metadata embedded in the wheel
+          # and sdist (long description rendering, classifier syntax,
+          # etc.) exactly as PyPI will when the artifacts are uploaded.
+          uvx twine check dist/*
+          # ``check-wheel-contents`` catches a class of packaging bugs
+          # that ``twine check`` does not: .pyc files, __pycache__
+          # directories, empty folders, and top-level name mismatches.
+          uvx check-wheel-contents dist/*.whl --toplevel nexusdl
+
+      - name: Verify wheel content
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          echo "Checking $wheel"
+
+          # Every file below must be present in the wheel — they are what
+          # makes an installed NexusDL functional at runtime.
+          required=(
+            "nexusdl/data/sites.yaml"
+            "nexusdl/data/default_config.yaml"
+            "nexusdl/data/sites_schema.json"
+            "nexusdl/data/comic_info_template.xml"
+            "nexusdl/data/user_agents.txt"
+            "nexusdl/data/translations/en.json"
+            "nexusdl/data/translations/fr.json"
+            "nexusdl/data/translations/es.json"
+            "nexusdl/data/translations/de.json"
+            "nexusdl/core/library/migrations/001_initial.sql"
+            "nexusdl/core/library/migrations/002_add_reading_progress.sql"
+            "nexusdl/py.typed"
+          )
+          for path in "${required[@]}"; do
+            if ! unzip -l "$wheel" | grep -qF "$path"; then
+              echo "❌ missing required path in wheel: $path"
+              exit 1
+            fi
+          done
+
+          # The Next.js frontend is a separate artifact.  Its presence in
+          # the wheel would be a packaging regression (see pyproject.toml
+          # [tool.hatch.build.targets.wheel].exclude).
+          if unzip -l "$wheel" | grep -qE "nexusdl/interfaces/web/frontend/"; then
+            echo "❌ frontend should be excluded from wheel"
+            exit 1
+          fi
+
+          # No compiled Python or cache directories — these indicate the
+          # build ran in a polluted environment.
+          if unzip -l "$wheel" | grep -qE "(__pycache__/|\.pyc\$)"; then
+            echo "❌ __pycache__ or .pyc found in wheel"
+            exit 1
+          fi
+
+          echo "✅ Wheel content OK"
+
+      - name: Verify sdist content
+        run: |
+          set -euo pipefail
+          sdist=$(ls dist/*.tar.gz)
+          echo "Checking $sdist"
+
+          # ``tar tzf`` output goes to a variable so that ``grep`` runs on
+          # a string rather than on a pipeline.  This avoids interaction
+          # between ``set -o pipefail`` and ``grep -q``'s early exit on
+          # large archives.
+          contents=$(tar tzf "$sdist")
+
+          required=(
+            "pyproject.toml"
+            "README.md"
+            "LICENSE"
+            "MANIFEST.in"
+            "src/nexusdl/__init__.py"
+            "src/nexusdl/version.py"
+            "src/nexusdl/data/sites.yaml"
+            "src/nexusdl/py.typed"
+            "tests/conftest.py"
+          )
+          for path in "${required[@]}"; do
+            # Anchor the regex at the end and escape dots so that
+            # ``/pyproject.toml`` matches exactly and not as a prefix of
+            # ``/pyproject.toml.bak``.
+            escaped=${path//./\\.}
+            if ! grep -qE "/${escaped}\$" <<< "$contents"; then
+              echo "❌ missing required path in sdist: $path"
+              exit 1
+            fi
+          done
+
+          if grep -qE "/src/nexusdl/interfaces/web/frontend/" <<< "$contents"; then
+            echo "❌ frontend should be excluded from sdist"
+            exit 1
+          fi
+
+          echo "✅ Sdist content OK"
+
+      - name: Verify wheel installs in a clean environment
+        run: |
+          set -euo pipefail
+          uv venv /tmp/verify-wheel --python ${{ env.PYTHON_VERSION }}
+          uv pip install dist/*.whl --python /tmp/verify-wheel/bin/python
+          /tmp/verify-wheel/bin/python - <<'PY'
+          import nexusdl
+          from nexusdl.parsers import list_registered_parsers
+
+          assert nexusdl.__version__, "Version is empty"
+          parsers = list_registered_parsers()
+          assert len(parsers) > 0, "No parsers registered"
+
+          print(f"nexusdl {nexusdl.__version__} ({len(parsers)} parsers registered)")
+          PY
+
+      - name: Verify sdist installs in a clean environment
+        run: |
+          set -euo pipefail
+          uv venv /tmp/verify-sdist --python ${{ env.PYTHON_VERSION }}
+          uv pip install dist/*.tar.gz --python /tmp/verify-sdist/bin/python
+          /tmp/verify-sdist/bin/python -c "import nexusdl; print(f'nexusdl {nexusdl.__version__} from sdist')"
+
+      - name: Verify version consistency
+        run: |
+          set -euo pipefail
+          # The version lives in ``src/nexusdl/version.py`` and is read by
+          # hatchling at build time.  A mismatch between the source and the
+          # built wheel metadata indicates that hatchling's regex failed to
+          # extract ``__version__`` and fell back to a stale value, which
+          # would be published to PyPI under the wrong version.
+          src_version=$(grep -oP '__version__[^"]*"\K[^"]+' src/nexusdl/version.py | head -1)
+          wheel=$(ls dist/*.whl)
+          wheel_version=$(unzip -p "$wheel" 'nexusdl-*.dist-info/METADATA' | grep -oP '^Version: \K.*')
+          echo "Source version: $src_version"
+          echo "Wheel version:  $wheel_version"
+          if [ "$src_version" != "$wheel_version" ]; then
+            echo "❌ Version mismatch between version.py and wheel metadata"
+            exit 1
+          fi
+          echo "✅ Versions match: $wheel_version"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # 2. Next.js frontend
+  # ──────────────────────────────────────────────────────────────────
+  build-frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: src/nexusdl/interfaces/web/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+          cache-dependency-path: src/nexusdl/interfaces/web/frontend/pnpm-lock.yaml
+
+      - name: Install dependencies
+        # ``--frozen-lockfile`` guarantees that CI uses exactly the
+        # dependency graph that was committed, and fails loudly when
+        # ``package.json`` has drifted from ``pnpm-lock.yaml``.  See the
+        # PREREQUISITE note in the workflow header.
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      - name: Verify build output
+        run: |
+          set -euo pipefail
+          # ``next.config.js`` sets ``output: "standalone"``, which
+          # produces a self-contained ``.next/standalone/`` tree that the
+          # production Docker image copies verbatim.
+          if [ ! -d ".next" ]; then
+            echo "❌ .next directory not produced by pnpm build"
+            exit 1
+          fi
+          if [ ! -d ".next/standalone" ]; then
+            echo "❌ .next/standalone not produced (output: standalone)"
+            exit 1
+          fi
+          if [ ! -f ".next/standalone/server.js" ]; then
+            echo "❌ .next/standalone/server.js not produced"
+            exit 1
+          fi
+          echo "✅ Frontend build output OK"
+
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-standalone
+          path: src/nexusdl/interfaces/web/frontend/.next/standalone
+          if-no-files-found: error
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # 3. Summary — one line per job, visible in the PR checks tab
+  # ──────────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [build-python, build-frontend]
+    if: always()
+    steps:
+      - name: Write job summary
+        run: |
+          {
+            echo "## Build Summary"
+            echo ""
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| Python artifacts | ${{ needs.build-python.result }} |"
+            echo "| Frontend bundle  | ${{ needs.build-frontend.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

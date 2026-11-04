@@ -14,16 +14,16 @@ built, tested and deployed independently:
   Python package — there is no ``__init__.py`` inside it, and no Python
   code path ever imports it.
 
-This file, therefore, exists to do three things:
+This file exists to do exactly three things:
 
 1. **Mark the package.**  ``nexusdl.interfaces.web`` is a Python package, so
    it needs an ``__init__.py`` even though there is very little to put in
    it.
-2. **Expose the ASGI application entry point.**  So that the composition
-   root of any consumer — Uvicorn, Gunicorn, ASGI lifespan tests, an
-   in-process test client, a deployment script — can write
-   ``nexusdl.interfaces.web:app`` instead of reaching into the backend's
-   internal structure at ``nexusdl.interfaces.web.backend.main:app``.
+2. **Expose the two ASGI entry points** that the backend actually provides:
+   :func:`create_app` (dependency-injected factory, for tests and custom
+   composition) and :func:`create_app_from_env` (zero-argument factory, for
+   ``uvicorn --factory`` and Gunicorn).  Both names are what the deployment
+   tooling references, so they are the two names this package re-exports.
 3. **Stay lazy.**  Importing ``nexusdl.interfaces.web`` must **not** trigger
    a full backend bootstrap — no reading ``data/default_config.yaml``, no
    creating an ``httpx.AsyncClient``, no registering sixty parsers, no
@@ -32,73 +32,94 @@ This file, therefore, exists to do three things:
    merely wants to check "is the web interface installed?" must not pay for
    it.
 
+Why ``app`` is **not** exposed
+------------------------------
+The backend's ``main.py`` deliberately does not construct a module-level
+FastAPI instance.  Doing so would share a single ``AppServices`` container
+— a single :class:`~.websocket.ConnectionManager`, a single
+:class:`~.session.http_session.HttpSession`, a single rate-limit store —
+across every forked worker in a multi-worker deployment.  That is exactly
+the bug ``main.py``'s own docstring warns against, and it is why the
+project's prescribed deployment pattern uses ``--factory``.
+
+The consequence for callers is a single, explicit flag in the ``uvicorn``
+command line:
+
+.. code-block:: shell
+
+    # Production (multi-worker — the prescribed pattern):
+    uvicorn nexusdl.interfaces.web:create_app_from_env \\
+        --factory --workers 4 --host 0.0.0.0 --port 8000
+
+    # Production with gunicorn:
+    gunicorn nexusdl.interfaces.web:create_app_from_env \\
+        --worker-class uvicorn.workers.UvicornWorker \\
+        --workers 4
+
+    # Development (single process, reload):
+    uvicorn nexusdl.interfaces.web:create_app_from_env \\
+        --factory --reload
+
+    # In-process test (each test gets its own app + services):
+    from nexusdl.interfaces.web import create_app
+    app = create_app(FakeServices())
+
+The ``--factory`` flag tells uvicorn to **call** the callable instead of
+treating it as an ASGI app instance.  This is uvicorn's standard convention
+— not a NexusDL-specific quirk — and it is what makes each worker build
+its own services container.
+
 The lazy-loading contract
 -------------------------
-Both ``app`` and ``create_app`` are resolved through PEP 562's
-``__getattr__`` mechanism.  That means:
+Both names are resolved through PEP 562's ``__getattr__`` mechanism.  That
+means:
 
 .. code-block:: python
 
-    from nexusdl.interfaces.web import app  # triggers backend boot on first use
-    from nexusdl.interfaces.web import create_app  # same
+    from nexusdl.interfaces.web import create_app         # ← import ok, no boot
+    from nexusdl.interfaces.web import create_app_from_env  # ← import ok, no boot
 
     import nexusdl.interfaces.web as web
-    web.app  # triggers backend boot on first attribute access
+    web.create_app          # ← backend imported on first access
+    web.create_app_from_env # ← backend imported on first access
 
-    hasattr(web, "app")  # triggers backend boot — see below
-    hasattr(web, "create_app")  # triggers backend boot — see below
+    hasattr(web, "create_app")          # ← False on broken install, no crash
+    hasattr(web, "create_app_from_env") # ← same
 
 Attribute access is the trigger, not module import.  This is what makes it
 safe for a caller to do::
 
-    from nexusdl.interfaces import web as _web_module  # no bootstrap
-    if hasattr(_web_module, "app"):
+    from nexusdl.interfaces import web as _web_module   # no bootstrap
+    if hasattr(_web_module, "create_app_from_env"):
         ...  # bootstrap on the ``hasattr`` call, once, at the point of use
 
 without committing to running a web server.
 
-The backend is expected to expose both an ``app`` instance and a
-``create_app`` factory:
-
-* ``app`` — the module-level ASGI application.  This is what ``uvicorn`` and
-  ``gunicorn`` are pointed at when the app is run as a single process:
-  ``uvicorn nexusdl.interfaces.web:app``.
-* ``create_app`` — the factory function.  Preferred for testing (each test
-  gets a fresh app with its own lifespan, its own dependency overrides, and
-  its own ``TestClient``) and for multi-process deployments where each
-  worker needs its own instance:
-  ``gunicorn nexusdl.interfaces.web:create_app --worker-class uvicorn.workers.UvicornWorker``.
-
-Both names are declared in :data:`__all__`, so they appear in
-``from nexusdl.interfaces.web import *``, and they are annotated for
-``mypy --strict`` via the ``TYPE_CHECKING`` block below.  If the backend
-does not in fact export one of them, accessing it raises
-:class:`AttributeError` with a message that names the missing name and the
-module that should provide it — a clean, actionable failure, not an opaque
-``ImportError``.
-
 How the backend is expected to be invoked
 -----------------------------------------
-The canonical deployments use the composed form:
+Every deployment form documented in ``docker/`` and ``nexusdl.dl`` calls
+one of the two exposed names:
 
 .. code-block:: shell
 
-    # Development (reload enabled, factory not needed)
-    uvicorn nexusdl.interfaces.web:app --reload
+    # Development (reload enabled)
+    uvicorn nexusdl.interfaces.web:create_app_from_env --factory --reload
 
-    # Production (single worker, preload disabled)
-    uvicorn nexusdl.interfaces.web:app --host 0.0.0.0 --port 8000 --workers 4
+    # Production (single worker)
+    uvicorn nexusdl.interfaces.web:create_app_from_env \\
+        --factory --host 0.0.0.0 --port 8000
 
-    # Production with a process manager
-    gunicorn nexusdl.interfaces.web:create_app \\
+    # Production (multi-worker via uvicorn)
+    uvicorn nexusdl.interfaces.web:create_app_from_env \\
+        --factory --host 0.0.0.0 --port 8000 --workers 4
+
+    # Production (multi-worker via gunicorn)
+    gunicorn nexusdl.interfaces.web:create_app_from_env \\
         --worker-class uvicorn.workers.UvicornWorker \\
         --workers 4
 
-The ``docker/docker-compose.yml`` and ``docker/Dockerfile.web`` files
-reference one of these forms; the ``nexusdl.dl`` launcher script uses the
-``create_app`` factory so that it can build an app with a custom lifespan
-for the local single-user flow.  None of those choices affect this file —
-both names resolve correctly regardless of which one is used.
+None of those choices affect this file — both exposed names resolve
+correctly regardless of which command is used.
 
 Why the frontend is not exported
 --------------------------------
@@ -132,6 +153,19 @@ What this module deliberately does **not** do
   package boundary, not a convenience layer for the backend.
 * **No configuration.**  No env-var reads, no YAML loading, no
   ``Settings`` construction.  Those belong to the composition root.
+* **No module-level ``app``.**  See the section above — it would silently
+  share state across forked workers.
+
+Known limitations
+-----------------
+* If the backend cannot be imported (missing optional dependency, syntax
+  error, broken install), the first attribute access on ``create_app`` or
+  ``create_app_from_env`` raises :class:`AttributeError` with the
+  underlying :class:`ImportError` chained as ``__cause__``.  This keeps
+  ``hasattr`` and ``getattr(obj, name, default)`` working as Python users
+  expect, while still surfacing the real error in a traceback.  A CI smoke
+  test that does ``from nexusdl.interfaces.web import create_app_from_env``
+  will therefore fail with a clear message, not a mysterious ``None``.
 """
 
 from __future__ import annotations
@@ -145,33 +179,46 @@ if TYPE_CHECKING:
     # types produced by the lazy ``__getattr__`` below.  These declarations
     # are **not** executed at runtime — the runtime implementation is
     # ``__getattr__``, which imports the backend on first access.
-    app: FastAPI
+    def create_app(
+        services: Any,
+        *,
+        cors_config: Any = None,
+        auth_config: Any = None,
+        rate_limit_config: Any = None,
+        logging_config: Any = None,
+        ws_config: Any = None,
+        static_dir: Any = None,
+        mount_static: bool = True,
+        routers_only: set[str] | None = None,
+        routers_skip: set[str] | None = None,
+        expose_openapi: bool = True,
+    ) -> FastAPI: ...
 
-    def create_app() -> FastAPI: ...
+    def create_app_from_env() -> FastAPI: ...
 
 
-__all__ = ["app", "create_app"]
+__all__ = ["create_app", "create_app_from_env"]
 
 
 def __getattr__(name: str) -> Any:
-    """Lazily resolve ``app`` and ``create_app`` from the backend package.
+    """Lazily resolve ``create_app`` and ``create_app_from_env``.
 
-    Called by the import machinery whenever an attribute is accessed on this
-    module that is not found in the module's ``__dict__`` (PEP 562).  The
-    only names we handle are the two declared in :data:`__all__`; anything
-    else raises :class:`AttributeError` so that ``hasattr`` and
+    Called by the import machinery whenever an attribute is accessed on
+    this module that is not found in the module's ``__dict__`` (PEP 562).
+    The only names we handle are the two declared in :data:`__all__`;
+    anything else raises :class:`AttributeError` so that ``hasattr`` and
     introspection behave as users expect.
 
     Args:
         name: The attribute name being accessed.
 
     Returns:
-        The FastAPI application instance (for ``"app"``) or the
-        ``create_app`` factory function (for ``"create_app"``), exactly as
-        exposed by :mod:`nexusdl.interfaces.web.backend.main`.
+        The ``create_app`` factory or the ``create_app_from_env``
+        zero-argument factory, exactly as exposed by
+        :mod:`nexusdl.interfaces.web.backend.main`.
 
     Raises:
-        AttributeError: When *name* is not one of the two public exports,
+        AttributeError: When ``name`` is not one of the two public exports,
             when the backend module cannot be imported (a broken install or
             a mid-migration state), or when the backend module does not
             expose the requested name.  ``AttributeError`` — rather than
@@ -181,7 +228,11 @@ def __getattr__(name: str) -> Any:
     if name not in __all__:
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}. "
-            f"Available attributes: {', '.join(__all__)}."
+            f"Available attributes: {', '.join(__all__)}. "
+            f"Note: this package does not expose a module-level 'app' "
+            f"instance — use 'create_app_from_env' with '--factory', "
+            f"e.g. 'uvicorn nexusdl.interfaces.web:create_app_from_env "
+            f"--factory'. See the package docstring for details."
         )
 
     # Import the backend lazily.  Once imported, ``sys.modules`` caches it,
@@ -209,9 +260,9 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(
             f"The NexusDL web backend module "
             f"'nexusdl.interfaces.web.backend.main' does not export "
-            f"{name!r}.  Expected a FastAPI application named ``app`` "
-            f"and/or a factory function named ``create_app`` in that "
-            f"module."
+            f"{name!r}.  This is a composition-root bug — the backend "
+            f"must always export both 'create_app' and "
+            f"'create_app_from_env'."
         ) from None
 
 
@@ -221,11 +272,13 @@ def __dir__() -> list[str]:
     Python's default :func:`dir` implementation collects a module's
     ``__dict__`` and, when the module defines ``__getattr__``, calls it with
     each name returned here to decide what to display.  Without this
-    override, ``dir(nexusdl.interfaces.web)`` would not list ``app`` or
-    ``create_app`` — they are never present in ``__dict__`` — which would
-    make the module appear empty in an interactive session.
+    override, ``dir(nexusdl.interfaces.web)`` would not list ``create_app``
+    or ``create_app_from_env`` — they are never present in ``__dict__`` —
+    which would make the module appear empty in an interactive session.
 
     The returned list is the union of :data:`__all__` and the standard
     module dunders a user typically expects to see.
     """
-    return sorted(set(__all__) | {"__all__", "__doc__", "__name__", "__package__"})
+    return sorted(
+        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+    )

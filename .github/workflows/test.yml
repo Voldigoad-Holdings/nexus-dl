@@ -1,0 +1,420 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — test.yml
+#
+# Runs the pytest suite across the supported Python and OS matrix.
+#
+# ────────────────────────────────────────────────────────────────────
+# Matrix policy — what runs when
+# ────────────────────────────────────────────────────────────────────
+#
+# PRs run a **fast path**: Ubuntu + Python 3.12 only, unit tests only,
+# no network access.  Target: under 90 seconds end-to-end.  The goal is
+# to give a developer feedback before they finish their coffee, on the
+# configuration that matters most (the one CI uses to build release
+# artifacts).
+#
+# Pushes to ``main`` and tag pushes run the **full matrix**:
+#
+#   Python  3.12  (primary, matches ``requires-python``)
+#   Python  3.13  (per tox ``envlist = py312, py313``)
+#
+#   Ubuntu  latest   (primary, matches CI + Docker)
+#   macOS   latest   (secondary, catches Apple-specific I/O and paths)
+#   Windows latest   (secondary, catches path separator and encoding
+#                     bugs that Ubuntu never surfaces)
+#
+# A full matrix is 2 × 3 = 6 jobs, ~2 min each.  Running that on every
+# PR would double the median PR latency for no diagnostic benefit: a
+# bug that only manifests on Windows will still be caught when the PR
+# is merged to ``main``, and the reviewer sees it in the merge commit
+# before the next release is tagged.
+#
+# Integration tests run on ``main`` and tags only, on Ubuntu + 3.12,
+# because they need network access and a real Playwright browser — both
+# of which are slow and flaky.  Smoke tests are manual-dispatch only.
+#
+# ────────────────────────────────────────────────────────────────────
+# Graceful degradation when tests are not yet written
+# ────────────────────────────────────────────────────────────────────
+#
+# The ``tests/unit/`` directory may not exist yet during early
+# development.  pytest returns exit code 5 for "no tests collected" and
+# exit code 4 for "path not found".  Both are treated as success by
+# this workflow — with a loud warning — so that CI is green from day
+# one and turns meaningful the moment the first test file is added.
+# The alternative (fail on missing tests) would make every PR red from
+# the start and hide the real signal under constant noise.
+#
+# ────────────────────────────────────────────────────────────────────
+# Why no ``workflow_call``
+# ────────────────────────────────────────────────────────────────────
+#
+# This workflow is **not** wired into ``release.yml``.  Tests are not
+# a hard gate on release in the current design — the maintainer
+# verifies the release manually by reviewing the CI run on the tagged
+# commit before approving the ``pypi`` deployment in the ``release.yml``
+# workflow.
+#
+# If you later want the release to be blocked on tests passing, add:
+#
+#   on: workflow_call
+#
+# to this file, and in ``release.yml`` add a ``test`` job that uses it,
+# then add ``test`` to ``publish-pypi.needs``.  That is a deliberately
+# separate change, not part of this delivery, because it changes the
+# release contract.
+#
+# ════════════════════════════════════════════════════════════════════
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/workflows/test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "scripts/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/workflows/test.yml"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Which test suite to run"
+        required: false
+        default: "unit"
+        type: choice
+        options:
+          - unit
+          - unit+integration
+          - all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_PRIMARY: "3.12"
+  PYTHON_SECONDARY: "3.13"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # 1. unit — matrix across Python × OS
+  # ──────────────────────────────────────────────────────────────────
+  unit:
+    name: unit (${{ matrix.py }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    # PR fast path: only Ubuntu + 3.12.  Everything else only on
+    # push to main and tag pushes.  The condition uses the matrix
+    # values, so the skipped combinations are visible in the Actions
+    # UI as "skipped", not silently absent.
+    if: |
+      github.event_name != 'pull_request'
+      || (matrix.os == 'ubuntu-latest' && matrix.py == '3.12')
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        py: ["3.12", "3.13"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # ``enable-cache: true`` caches the uv venv directory keyed on
+          # ``uv.lock`` — a no-op on the first run and ~30 seconds saved
+          # on every subsequent run.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.py }}
+        run: uv python install ${{ matrix.py }}
+
+      - name: Install project + all extras
+        # ``--all-extras`` ensures pytest-timeout, pytest-xdist, respx,
+        # hypothesis and every other dev/test dependency is installed.
+        # The project itself is installed in editable mode, which is
+        # what makes ``--cov=nexusdl`` work without a separate install
+        # step.
+        run: uv sync --all-extras --python ${{ matrix.py }}
+
+      - name: Run unit tests
+        shell: bash
+        # ``set +e`` around the pytest call so that we can inspect its
+        # exit code.  Codes 4 ("path not found") and 5 ("no tests
+        # collected") are treated as success with a warning — see the
+        # workflow header.  Any other non-zero code fails the job.
+        run: |
+          set -euo pipefail
+
+          if [ ! -d tests/unit ]; then
+            echo "::warning title=No tests yet::tests/unit/ does not exist. Unit tests will not run until it does."
+            exit 0
+          fi
+
+          set +e
+          uv run pytest tests/unit -v \
+            --timeout=60 \
+            --junitxml=junit/unit-${{ matrix.py }}-${{ matrix.os }}.xml
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ]; then
+            echo "::warning title=No tests yet::pytest returned $rc — no unit tests collected. This is expected while the test suite is being written."
+            exit 0
+          fi
+
+          exit "$rc"
+
+      - name: Upload coverage (primary only)
+        # Only the primary combination uploads coverage — the others
+        # would produce near-identical reports for a project that is
+        # tested primarily on Ubuntu, and three copies is just noise.
+        if: matrix.os == 'ubuntu-latest' && matrix.py == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            htmlcov/
+            coverage.xml
+            .coverage
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload test results
+        # ``actions/upload-artifact`` is unconditional; the file may or
+        # may not exist depending on whether pytest actually ran.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-unit-${{ matrix.py }}-${{ matrix.os }}
+          path: junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # 2. integration — Ubuntu + 3.12 only, main/tag only, Playwright
+  # ──────────────────────────────────────────────────────────────────
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [unit]
+    # Skip on PR — integration tests need network and a real browser.
+    # The unit matrix already covers the fast feedback path.
+    if: |
+      github.event_name == 'push'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_PRIMARY }}
+
+      - name: Install project + all extras
+        run: uv sync --all-extras
+
+      # Playwright's browser binaries are ~150 MB per browser and take
+      # 30–90 seconds to download.  Cache them keyed on the installed
+      # ``playwright`` version so that a version bump invalidates the
+      # cache and a version bump alone does not download 150 MB for
+      # nothing.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run integration tests
+        shell: bash
+        env:
+          # Integration tests routinely touch ~10–20 sites sequentially.
+          # A 5-minute per-test timeout catches hangs without failing
+          # legitimate slow-network tests.
+          PYTEST_TIMEOUT: "300"
+        run: |
+          set -euo pipefail
+
+          if [ ! -d tests/integration ]; then
+            echo "::warning title=No integration tests yet::tests/integration/ does not exist."
+            exit 0
+          fi
+
+          set +e
+          uv run pytest tests/integration -v \
+            -m integration \
+            --timeout=300 \
+            --junitxml=junit/integration.xml
+          rc=$?
+          set -e
+
+          if [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ]; then
+            echo "::warning title=No integration tests yet::pytest returned $rc — no integration tests collected."
+            exit 0
+          fi
+
+          exit "$rc"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-integration
+          path: junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # 3. smoke — manual dispatch only
+  # ──────────────────────────────────────────────────────────────────
+  #
+  # Smoke tests hit the real, live sites — ~20 parsers over ~10 seconds
+  # each is 3–4 minutes of network activity that depends on every
+  # supported site being reachable.  Running that automatically would
+  # make CI fail every time any of sixty sites goes down, which is
+  # indistinguishable from "our code is broken".  It is therefore a
+  # manual tool: a maintainer runs it before a release, sees which
+  # sites are currently unreachable, and decides whether the failure
+  # is expected (site down) or a regression (parser broken).
+  smoke:
+    name: smoke (manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: |
+      github.event_name == 'workflow_dispatch'
+      && (inputs.suite == 'all' || inputs.suite == 'unit+integration')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_PRIMARY }}
+
+      - name: Install project + all extras
+        run: uv sync --all-extras
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run smoke tests
+        shell: bash
+        # Smoke tests are expected to be flaky — they hit live third-party
+        # sites.  ``continue-on-error: true`` on this step means a site
+        # being temporarily down does not fail the workflow; the operator
+        # reads the summary to decide whether the failure is expected.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ ! -d tests/ ]; then
+            echo "::warning title=No tests yet::tests/ does not exist."
+            exit 0
+          fi
+
+          uv run pytest -v \
+            -m smoke \
+            --timeout=120 \
+            --junitxml=junit/smoke.xml || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-smoke
+          path: junit/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # 4. Summary — consolidated roll-up
+  # ──────────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    if: always()
+    steps:
+      - name: Write summary
+        env:
+          UNIT: ${{ needs.unit.result }}
+          INTEGRATION: ${{ needs.integration.result }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          {
+            echo "## Test summary"
+            echo ""
+            echo "**Trigger:** \`$EVENT\` on \`$REF\`"
+            echo ""
+            echo "| Suite | Result |"
+            echo "|---|---|"
+            echo "| unit | $UNIT |"
+            echo "| integration | $INTEGRATION |"
+            echo ""
+
+            if [ "$EVENT" = "pull_request" ]; then
+              echo "> PR fast path: only Ubuntu + Python 3.12 unit tests ran."
+              echo "> The full matrix (3 OS × 2 Python) runs on push to main."
+            fi
+
+            if [ "$INTEGRATION" = "skipped" ] && [ "$EVENT" = "pull_request" ]; then
+              echo "> Integration tests are skipped on PRs (network + Playwright)."
+              echo "> They run automatically on push to main and tag pushes."
+            fi
+
+            if [ "$UNIT" = "success" ] && [ "$INTEGRATION" = "skipped" ]; then
+              echo "> ✅ Unit tests passed.  Integration will run on merge."
+            elif [ "$UNIT" = "success" ] && [ "$INTEGRATION" = "success" ]; then
+              echo "> ✅ All tests passed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

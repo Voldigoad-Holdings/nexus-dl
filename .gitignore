@@ -8,14 +8,17 @@
 #   4. Données runtime NexusDL
 #   5. Outils (ruff, mypy, pytest, coverage, hypothesis)
 #   6. Build et distribution
-#   7. Environnements virtuels
-#   8. Docker
-#   9. IDE et éditeurs
-#  10. OS
-#  11. Divers
+#   7. Docker
+#   8. IDE et éditeurs
+#   9. OS
+#  10. Divers
 #
 # ⚠️  Rappel : un fichier ignoré n'est PAS versionné. Ne jamais retirer
 #     les entrées "Secrets" sous aucun prétexte.
+#
+# ⚠️  Règle d'or : toute nouvelle règle d'ignore qui matche un dossier
+#     (``dir/``) doit être ancrée (``/dir/``) si ce dossier peut exister
+#     sous ``src/nexusdl/`` — sinon elle masque des fichiers versionnés.
 # ════════════════════════════════════════════════════════════════════
 
 
@@ -63,7 +66,10 @@ env/
 ENV/
 env.bak/
 venv.bak/
-.python-version
+
+# ⚠️  ``.python-version`` N'EST PAS ignoré — il est versionné pour
+#     garantir que tous les développeurs utilisent Python 3.12.
+#     (ne pas réintroduire cette ligne)
 
 # Packaging et distribution
 build/
@@ -82,16 +88,10 @@ MANIFEST
 .installed.cfg
 
 # PyInstaller / Nuitka
-*.manifest
 *.spec
-*.build/
-*.dist/
 *.onefile-build/
 __pyinstaller/
 pyinstaller/
-
-# pyenv
-.python-version
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -110,21 +110,15 @@ out/
 *.tsbuildinfo
 next-env.d.ts
 
-# Environnements frontend locaux
-src/nexusdl/interfaces/web/frontend/.env.local
-src/nexusdl/interfaces/web/frontend/.env.*.local
-
-# Build frontend
-src/nexusdl/interfaces/web/frontend/build/
-src/nexusdl/interfaces/web/frontend/dist/
-
 
 # ────────────────────────────────────────────────────────────────────
 # 4. DONNÉES RUNTIME NEXUSDL
 # ────────────────────────────────────────────────────────────────────
-# Base de données locale
-data/
-!data/.gitkeep
+# ⚠️  ``/data/`` est ancré à la racine — il ne masque PAS
+#     ``src/nexusdl/data/`` qui contient les fichiers versionnés
+#     (sites.yaml, default_config.yaml, translations/*.json, etc.).
+#     Un ``data/`` non ancré casserait le package.
+/data/
 library.db
 library.db-*
 library.db-journal
@@ -134,16 +128,16 @@ library.db-shm
 *.sqlite3
 
 # Dossiers de travail
-downloads/
-temp/
-tmp/
-logs/
+/downloads/
+/temp/
+/tmp/
+/logs/
 *.log
 *.log.*
 
 # Caches runtime
-.cache/
-.nexusdl/
+/.cache/
+/.nexusdl/
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -175,15 +169,11 @@ htmlcov/
 .tox/
 .nox/
 
-# Pre-commit
-.pre-commit-cache/
-
 
 # ────────────────────────────────────────────────────────────────────
 # 6. BUILD ET DISTRIBUTION (non-Python)
 # ────────────────────────────────────────────────────────────────────
 # Sorties génériques
-out/
 output/
 release/
 releases/
@@ -201,11 +191,10 @@ releases/
 *.cbr
 *.pdf
 
-# Exceptions — les fixtures de test et le template ComicInfo
+# Exceptions — fixtures de test (nécessaires au CI)
 !tests/fixtures/*.zip
 !tests/fixtures/*.cbz
 !tests/fixtures/*.pdf
-!src/nexusdl/data/comic_info_template.xml
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -236,12 +225,14 @@ docker-compose.*.local.yml
 *.swo
 *.swn
 *~
-.[a-z]*
+.vimrc.local
+.viminfo
 
 # Emacs
 *~
 \#*\#
 .\#*
+.emacs.d/
 
 # Sublime
 *.sublime-project
@@ -256,7 +247,6 @@ docker-compose.*.local.yml
 # NetBeans
 nbproject/private/
 nbbuild/
-dist/
 nbdist/
 .nb-gradle/
 
@@ -334,26 +324,32 @@ tests/fixtures/tmp/
 
 
 # ────────────────────────────────────────────────────────────────────
-# 11. EXCEPTIONS NEXUSDL — fichiers à VERSIONNER explicitement
+# 11. FICHIERS VERSIONNÉS EXPLICITEMENT (documentaire)
 # ────────────────────────────────────────────────────────────────────
-# Ces règles annulent les patterns génériques ci-dessus pour les
-# fichiers qui DOIVENT être commités.
-
-!.gitkeep
-!src/nexusdl/data/*.yaml
-!src/nexusdl/data/*.json
-!src/nexusdl/data/*.xml
-!src/nexusdl/data/*.txt
-!src/nexusdl/data/translations/*.json
-!src/nexusdl/py.typed
-!src/nexusdl/version.py
-!src/nexusdl/interfaces/web/frontend/pnpm-lock.yaml
-!uv.lock
-!nexus.dl
-!LICENSE
-!README.md
-!CHANGELOG.md
-!SECURITY.md
-!SECURITY_HALL_OF_FAME.md
-!CONTRIBUTING.md
-!CODE_OF_CONDUCT.md
+# Cette section liste les fichiers du projet qui DOIVENT être commités
+# et qui pourraient l'être accidentellement ignorés par une règle
+# générique ajoutée dans le futur.  Aucune règle active ne les ignore
+# aujourd'hui — c'est une défense en profondeur contre les régressions.
+#
+# Si tu ajoutes une règle d'ignore générique (``*.md``, ``*.json``, …),
+# vérifie qu'aucun de ces fichiers n'est affecté, et réactive-le ici si
+# nécessaire.
+#
+# !uv.lock
+# !nexus.dl
+# !MANIFEST.in
+# !.python-version
+# !src/nexusdl/py.typed
+# !src/nexusdl/version.py
+# !src/nexusdl/data/sites.yaml
+# !src/nexusdl/data/sites_schema.json
+# !src/nexusdl/data/default_config.yaml
+# !src/nexusdl/data/user_agents.txt
+# !src/nexusdl/data/comic_info_template.xml
+# !src/nexusdl/data/translations/*.json
+# !src/nexusdl/interfaces/web/frontend/pnpm-lock.yaml
+#
+# Les lignes ci-dessus sont commentées : elles n'ont aucun effet
+# aujourd'hui, elles documentent le contrat.  Si une règle d'ignore
+# générique vient à matcher l'un de ces fichiers, décommenter la ligne
+# correspondante rétablit le versionnement.

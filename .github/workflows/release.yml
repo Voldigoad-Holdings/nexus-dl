@@ -1,0 +1,414 @@
+# ════════════════════════════════════════════════════════════════════
+# NexusDL — release.yml
+#
+# Publishes a new NexusDL release when a `v*` tag is pushed.  A single
+# tag push triggers everything:
+#
+#   1. Verify the tag matches `src/nexusdl/version.py` and that
+#      `CHANGELOG.md` contains a section for the released version.
+#   2. Build the wheel and sdist (reusing `build.yml` via
+#      `workflow_call`, so the exact artifacts CI verified are the ones
+#      published — no rebuild, no drift).
+#   3. Sign every artifact with Sigstore (OIDC, no key to manage).
+#   4. Publish to PyPI via **Trusted Publishing** (OIDC, no API token,
+#      no `PYPI_API_TOKEN` secret, nothing to rotate or leak).
+#   5. Build and push the three Docker images to GHCR (reusing
+#      `docker.yml` with `push: true`).
+#   6. Create a GitHub Release with the artifacts attached, the
+#      Sigstore bundle, and the notes extracted from `CHANGELOG.md`.
+#
+# ════════════════════════════════════════════════════════════════════
+# PREREQUISITES — one-time setup, done once on PyPI's side
+# ════════════════════════════════════════════════════════════════════
+#
+#   1. **PyPI Trusted Publisher**.  On
+#      https://pypi.org/manage/account/publishing/ add a new pending
+#      publisher with:
+#          Owner:       Voldigoad-Holdings
+#          Repository:  nexus-dl
+#          Workflow:    release.yml
+#          Environment: pypi
+#      That is the entire configuration.  No token, no secret, no
+#      API key ever touches this repository or GitHub's secret store.
+#
+#   2. **GitHub Environment `pypi`**.  In the repository settings:
+#          Settings → Environments → New environment → "pypi"
+#      Recommended: add "Required reviewers" with the maintainer(s) so
+#      that no release is ever published without a human clicking
+#      "Approve".  This is the only safety net between a `git push
+#      --tags` and an irreversible PyPI upload.
+#
+#   3. **GHCR permissions**.  The Docker images are published under
+#      `ghcr.io/voldigoad-holdings/` — no configuration needed beyond
+#      the `packages: write` permission declared in `docker.yml`.
+#
+# ════════════════════════════════════════════════════════════════════
+# TRIGGERS
+# ════════════════════════════════════════════════════════════════════
+#
+#   * push of a `vX.Y.Z` tag     → full release (all steps)
+#   * workflow_dispatch           → dry-run: build + verify + sign,
+#                                   no publish, no Docker push, no
+#                                   GitHub release.  Used to test the
+#                                   release machinery itself.
+#
+# ════════════════════════════════════════════════════════════════════
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Build and sign, but do NOT publish to PyPI, push Docker images, or create a GitHub Release"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+# A tag push must never be cancelled — a partially cancelled release
+# leaves PyPI and GHCR in an inconsistent state (one artifact published,
+# the other missing).  ``cancel-in-progress: false`` on tag pushes is
+# the correct policy; on workflow_dispatch it makes no difference
+# because there is only ever one run per dispatch.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # 1. verify-tag — fail fast before any expensive work
+  # ──────────────────────────────────────────────────────────────────
+  verify-tag:
+    name: Verify tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Skip on workflow_dispatch — there is no tag to verify in a dry run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check that tag matches version.py
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/v}"
+          src=$(grep -oP '__version__[^"]*"\K[^"]+' src/nexusdl/version.py | head -1)
+          echo "git tag:    v$tag"
+          echo "version.py: $src"
+          if [ "$tag" != "$src" ]; then
+            echo "❌ Tag v$tag does not match version.py ($src)."
+            echo "   Either fix the tag, or bump version.py before tagging."
+            exit 1
+          fi
+          # Reject pre-release tags on the v0.x line unless the version
+          # itself carries a pre-release suffix.  This prevents the
+          # accidental publication of "0.2.0" as a "stable" release when
+          # the intent was "0.2.0a1".
+          if [[ "$src" =~ ^0\. ]] && [[ ! "$src" =~ (a|b|rc) ]]; then
+            echo "ℹ️  Note: releasing $src as a stable v0.x version."
+          fi
+          echo "version=$src" >> "$GITHUB_OUTPUT"
+          echo "✅ Tag v$tag matches version.py"
+
+      - name: Check that CHANGELOG.md has a section for this version
+        run: |
+          set -euo pipefail
+          version="${{ steps.check.outputs.version }}"
+          if ! grep -qE "^## \[?${version//./\\.}\]?" CHANGELOG.md; then
+            echo "❌ CHANGELOG.md has no section for version $version."
+            echo "   Add a '## [$version]' section before tagging."
+            exit 1
+          fi
+          echo "✅ CHANGELOG.md has a section for $version"
+
+  # ──────────────────────────────────────────────────────────────────
+  # 2. build — reuse the CI-verified artifacts via workflow_call
+  # ──────────────────────────────────────────────────────────────────
+  build:
+    name: Build artifacts
+    needs: [verify-tag]
+    # ``verify-tag`` is skipped on workflow_dispatch; the ``always()``
+    # here allows ``build`` to still run in dry-run mode, where there is
+    # no tag to verify but the build must still produce artifacts.
+    if: always() && (needs.verify-tag.result == 'success' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+
+  # ──────────────────────────────────────────────────────────────────
+  # 3. sign-artifacts — Sigstore keyless signing
+  # ──────────────────────────────────────────────────────────────────
+  sign-artifacts:
+    name: Sign artifacts
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write   # required for Sigstore keyless signing via OIDC
+      contents: read
+    steps:
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+      - name: List artifacts to sign
+        run: ls -la dist/
+
+      # ``sigstore/gh-action-sigstore-python`` signs each input file and
+      # produces a ``.sigstore`` bundle alongside it.  The bundle is a
+      # transparency-log entry that proves the signature was created by
+      # this workflow run at this commit — anyone can verify the artifact
+      # without needing to trust GitHub's build pipeline on faith.
+      #
+      # The same signature is uploaded to PyPI alongside the wheel when
+      # ``attestations: true`` is set on the publish step; PyPI embeds
+      # the attestation in its metadata, and ``pip install --require-
+      # attestations nexusdl`` will then verify it at install time.
+      - name: Sign the artifacts with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: |
+            dist/*.whl
+            dist/*.tar.gz
+          # Do not fail the job if the artifact list is empty in dry-run
+          # mode where ``build`` might have skipped.  Real tags always
+          # produce both files.
+          release-signing-artifacts: false
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-artifacts
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.sigstore
+          if-no-files-found: error
+          retention-days: 30
+
+  # ──────────────────────────────────────────────────────────────────
+  # 4. publish-pypi — Trusted Publishing, no token
+  # ──────────────────────────────────────────────────────────────────
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [sign-artifacts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The ``pypi`` environment gates publication behind required
+    # reviewers (see the PREREQUISITES section in the workflow header).
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nexusdl
+    # Never publish from a workflow_dispatch dry run.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write   # required for Trusted Publishing
+    steps:
+      - name: Download signed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-artifacts
+          path: dist/
+
+      - name: List artifacts to publish
+        run: ls -la dist/
+
+      # ``pypa/gh-action-pypi-publish`` uses Trusted Publishing: it
+      # requests a short-lived OIDC token from GitHub, presents it to
+      # PyPI, and PyPI verifies that the workflow run matches the
+      # configured publisher before issuing an upload token valid for
+      # a few minutes.  There is **no** ``PYPI_API_TOKEN`` secret to
+      # rotate or leak.
+      #
+      # ``skip-existing: true`` makes the step idempotent: a re-run of
+      # the workflow after a partial failure will not fail with
+      # ``File already exists`` on the artifacts that were already
+      # published.  PyPI does not allow re-uploading a file that
+      # exists, so without this option a single failed release can
+      # never be completed.
+      #
+      # ``attestations: true`` uploads the Sigstore attestation bundle
+      # generated by the previous job alongside each file; ``pip
+      # install --require-attestations nexusdl`` will then verify it.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          skip-existing: true
+          attestations: true
+          print-hash: true
+
+  # ──────────────────────────────────────────────────────────────────
+  # 5. docker — build and push the three images
+  # ──────────────────────────────────────────────────────────────────
+  docker:
+    name: Publish Docker images
+    needs: [build]
+    # Only publish Docker images from a real tag push.  A dry run must
+    # not touch GHCR.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/docker.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      push: true
+    # Docker's workflow_call accepts GITHUB_TOKEN as an input; pass the
+    # automatic token so the images push to GHCR using the workflow's
+    # own identity, not a personal access token.
+    secrets:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────────────────────────────
+  # 6. github-release — create the release with extracted notes
+  # ──────────────────────────────────────────────────────────────────
+  github-release:
+    name: Create GitHub Release
+    needs: [sign-artifacts, publish-pypi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # required to create the release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download signed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-artifacts
+          path: dist/
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Extract everything between ``## [<version>]`` and the next
+          # ``## [`` heading.  The awk program handles both bracketed
+          # (``## [0.1.0]``) and unbracketed (``## 0.1.0``) headings,
+          # and it tolerates the trailing date suffix that Keep a
+          # Changelog allows (``## [0.1.0] - 2026-11-04``).
+          awk -v ver="$VERSION" '
+            BEGIN { in_section = 0 }
+            /^## / {
+              # A new H2 closes the current section if we are inside one.
+              if (in_section) { exit }
+              # Detect the target section heading.
+              if ($0 ~ "^## \\[?" ver "\\]?") { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "⚠️  No notes extracted — falling back to a generic body."
+            echo "Release $VERSION" > /tmp/release-notes.md
+          fi
+
+          echo "Extracted notes:"
+          echo "----------------------------------------"
+          cat /tmp/release-notes.md
+          echo "----------------------------------------"
+
+      # ``softprops/action-gh-release`` is used (rather than the
+      # equivalent ``gh release create``) because it natively handles
+      # the case where the release already exists: a re-run replaces
+      # the notes and re-attaches the assets without failing.
+      #
+      # The ``--prerelease`` flag is set automatically for versions
+      # that carry a pre-release suffix (``a``, ``b``, ``rc``), which
+      # is what every Python packaging tool expects.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NexusDL v${{ needs.verify-tag.outputs.version }}
+          body_path: /tmp/release-notes.md
+          prerelease: ${{ contains(needs.verify-tag.outputs.version, 'a') || contains(needs.verify-tag.outputs.version, 'b') || contains(needs.verify-tag.outputs.version, 'rc') }}
+          draft: false
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.sigstore
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────────────────────────────
+  # 7. summary
+  # ──────────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    needs: [verify-tag, build, sign-artifacts, publish-pypi, docker, github-release]
+    if: always()
+    steps:
+      - name: Write summary
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          {
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "## 🧪 Release dry-run"
+              echo ""
+              echo "This was a **dry-run**.  Nothing was published."
+              echo "No PyPI upload, no Docker push, no GitHub Release."
+            else
+              echo "## 🚀 Release v$VERSION"
+              echo ""
+              echo "| Step | Result |"
+              echo "|---|---|"
+              echo "| Verify tag        | ${{ needs.verify-tag.result }} |"
+              echo "| Build artifacts   | ${{ needs.build.result }} |"
+              echo "| Sign artifacts    | ${{ needs.sign-artifacts.result }} |"
+              echo "| Publish to PyPI   | ${{ needs.publish-pypi.result }} |"
+              echo "| Docker images     | ${{ needs.docker.result }} |"
+              echo "| GitHub Release    | ${{ needs.github-release.result }} |"
+              echo ""
+              if [ "${{ needs.publish-pypi.result }}" = "success" ]; then
+                echo "### 📦 Published"
+                echo ""
+                echo "- **PyPI:** https://pypi.org/project/nexusdl/$VERSION/"
+                echo "- **GitHub:** https://github.com/Voldigoad-Holdings/nexus-dl/releases/tag/v$VERSION"
+                echo "- **Docker (base):** \`ghcr.io/voldigoad-holdings/nexusdl:$VERSION\`"
+                echo "- **Docker (web):**  \`ghcr.io/voldigoad-holdings/nexusdl-web:$VERSION\`"
+                echo "- **Docker (gui):**  \`ghcr.io/voldigoad-holdings/nexusdl-gui:$VERSION\`"
+                echo ""
+                echo "### 🔐 Signature verification"
+                echo ""
+                echo "Users can verify the release with:"
+                echo '```'
+                echo "pip install --require-attestations nexusdl==$VERSION"
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

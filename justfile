@@ -1,23 +1,21 @@
 # ════════════════════════════════════════════════════════════════════
 # NexusDL — justfile
-
 # ════════════════════════════════════════════════════════════════════
 
 # ────────────────────────────────────────────────────────────────────
 # Configuration globale
 # ────────────────────────────────────────────────────────────────────
 
-# Utiliser bash strict mode par défaut (Linux/macOS)
-# Sur Windows, `just` utilise `sh` (via Git Bash) ou `cmd.exe` selon dispo.
+# Utiliser bash strict mode.  ``bash`` doit être disponible dans le PATH —
+# sur Windows, cela signifie Git Bash (installé avec Git for Windows).
+# Ce n'est pas un fallback : ``just`` échoue au démarrage si ``bash`` est
+# introuvable.  Sur Windows sans Git Bash, lancer ``just`` depuis WSL.
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Échouer si une variable non définie est utilisée
+# Charge ``.env`` si présent (même mécanisme que pydantic-settings).
 set dotenv-load := true
 
-# Ne pas imprimer chaque commande par défaut (plus propre)
-set quiet := false
-
-# Exporter les variables d'environnement (utile pour les recettes Python)
+# Exporter la racine du projet (utile pour les recettes Python).
 export NEXUSDL_PROJECT_ROOT := justfile_directory()
 
 # ────────────────────────────────────────────────────────────────────
@@ -32,13 +30,18 @@ frontend_dir  := "src/nexusdl/interfaces/web/frontend"
 dist_dir      := "dist"
 build_dir     := "build"
 
-# Python
-python        := env("PYTHON", "python3.12")
+# Python — ``python3`` par défaut (nom universel POSIX).  ``python`` est
+# ambigu sur certaines distributions (Python 2 sur Debian, absent sur
+# macOS), et ``python3.12`` n'existe pas sur toutes les distros (Fedora le
+# fournit, Debian bookworm non).  La recette ``install`` vérifie
+# explicitement ``>= 3.12`` et échoue avec un message clair si le binaire
+# ne correspond pas.
+python        := env("PYTHON", "python3")
 pytest        := python + " -m pytest"
 mypy          := python + " -m mypy"
 ruff          := python + " -m ruff"
 
-# uv (optionnel)
+# uv (optionnel — détecté dynamiquement dans les recettes qui le supportent)
 uv            := env("UV", "uv")
 
 # Node / pnpm
@@ -59,23 +62,23 @@ open_cmd      := if os_name == "macos" { "open" } else if os_name == "windows" {
 
 # Couleurs (désactivées si NO_COLOR est défini)
 if env("NO_COLOR", "") == "" {
-    color_reset := "\033[0m"
-    color_bold  := "\033[1m"
-    color_dim   := "\033[2m"
-    color_red   := "\033[31m"
-    color_green := "\033[32m"
-    color_yell  := "\033[33m"
-    color_blue  := "\033[34m"
-    color_cyan  := "\033[36m"
+    color_reset  := "\033[0m"
+    color_bold   := "\033[1m"
+    color_dim    := "\033[2m"
+    color_red    := "\033[31m"
+    color_green  := "\033[32m"
+    color_yellow := "\033[33m"
+    color_blue   := "\033[34m"
+    color_cyan   := "\033[36m"
 } else {
-    color_reset := ""
-    color_bold  := ""
-    color_dim   := ""
-    color_red   := ""
-    color_green := ""
-    color_yell  := ""
-    color_blue  := ""
-    color_cyan  := ""
+    color_reset  := ""
+    color_bold   := ""
+    color_dim    := ""
+    color_red    := ""
+    color_green  := ""
+    color_yellow := ""
+    color_blue   := ""
+    color_cyan   := ""
 }
 
 # ────────────────────────────────────────────────────────────────────
@@ -90,14 +93,25 @@ default:
 # Installation
 # ────────────────────────────────────────────────────────────────────
 
-# Installe le projet + extras dev (utilise uv si dispo)
+# Installe le projet + extras dev + cli (utilise uv si dispo)
 install:
     #!/usr/bin/env bash
     set -euo pipefail
+
+    # Vérifie Python 3.12+ avant toute installation.
+    if ! {{python}} -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)"; then
+        echo -e "{{color_red}}✗{{color_reset}} Python 3.12+ requis, trouvé $(${python} -V 2>&1) (binaire : {{python}})." >&2
+        echo "  Installer Python 3.12+ ou définir PYTHON=/chemin/vers/python3.12." >&2
+        exit 1
+    fi
+
     if command -v {{uv}} >/dev/null 2>&1; then
         echo -e "{{color_cyan}}→{{color_reset}} Installation via uv..."
         {{uv}} python install 3.12
-        {{uv}} venv --allow-existing
+        # ``--python 3.12`` est requis : sans lui, ``uv venv`` utilise le
+        # Python par défaut de PATH, qui peut être 3.11 même après
+        # ``uv python install 3.12``.
+        {{uv}} venv --allow-existing --python 3.12
         {{uv}} pip install -e ".[dev,cli]"
     else
         echo -e "{{color_cyan}}→{{color_reset}} Installation via pip..."
@@ -111,17 +125,18 @@ install:
     echo "  Activer le venv : source .venv/bin/activate"
     echo "  Copier .env     : cp .env.example .env && chmod 600 .env"
 
-# Alias de `install`
+# Alias de ``install``
 install-dev: install
+    @:
 
-# Installe tous les extras (cli, gui, web, playwright, redis, dev)
+# Installe tous les extras (cli, gui, web, playwright, redis, dev, docs)
 install-all:
     #!/usr/bin/env bash
     set -euo pipefail
     if command -v {{uv}} >/dev/null 2>&1; then
-        {{uv}} pip install -e ".[all]"
+        {{uv}} pip install -e ".[all,dev,docs]"
     else
-        {{python}} -m pip install -e ".[all]"
+        {{python}} -m pip install -e ".[all,dev,docs]"
     fi
     echo -e "{{color_green}}✓{{color_reset}} Tous les extras installés."
 
@@ -240,7 +255,7 @@ test-integration:
 
 # Lance les smoke tests (réseau requis)
 test-smoke:
-    echo -e "{{color_yell}}!{{color_reset}} Tests réseau — peuvent être lents."
+    echo -e "{{color_yellow}}!{{color_reset}} Tests réseau — peuvent être lents."
     {{pytest}} -q -m smoke
 
 # Tests avec rapport de couverture HTML
@@ -252,9 +267,12 @@ test-cov:
     echo -e "{{color_green}}✓{{color_reset}} Rapport : htmlcov/index.html"
     -{{open_cmd}} htmlcov/index.html 2>/dev/null || true
 
-# Relance les tests à chaque modification
+# Relance les tests à chaque modification (looponfail de pytest-xdist).
+# ``pytest-watch`` n'est plus maintenu (dernière release 2019) et n'est pas
+# dans les dépendances dev.  ``-f`` / ``--looponfail`` est l'équivalent
+# moderne fourni par ``pytest-xdist``.
 test-watch:
-    {{python}} -m pytest_watch {{test_dir}}/unit -- -q
+    {{pytest}} {{test_dir}}/unit -f -q
 
 # Lance un fichier de test spécifique
 test-file file:
@@ -302,10 +320,16 @@ pre-commit-all:
 # ────────────────────────────────────────────────────────────────────
 
 # Construit sdist + wheel dans dist/
+#
+# ``just`` n'exécute une recette comme un script bash **que si la première
+# ligne du body est le shebang**.  Tout ce qui précède le ``#!`` est traité
+# comme une commande shell séparée, ce qui casse ``if ... fi`` sur
+# plusieurs lignes.  Le shebang doit donc être la toute première ligne du
+# body, et non un ``echo`` suivi du shebang.
 build: clean-build
-    echo -e "{{color_cyan}}→{{color_reset}} Construction du sdist + wheel..."
     #!/usr/bin/env bash
     set -euo pipefail
+    echo -e "{{color_cyan}}→{{color_reset}} Construction du sdist + wheel..."
     if command -v {{uv}} >/dev/null 2>&1; then
         {{uv}} build
     else
@@ -318,6 +342,7 @@ build: clean-build
 build-sdist: clean-build
     #!/usr/bin/env bash
     set -euo pipefail
+    echo -e "{{color_cyan}}→{{color_reset}} Construction du sdist..."
     if command -v {{uv}} >/dev/null 2>&1; then
         {{uv}} build --sdist
     else
@@ -328,6 +353,7 @@ build-sdist: clean-build
 build-wheel: clean-build
     #!/usr/bin/env bash
     set -euo pipefail
+    echo -e "{{color_cyan}}→{{color_reset}} Construction du wheel..."
     if command -v {{uv}} >/dev/null 2>&1; then
         {{uv}} build --wheel
     else
@@ -344,6 +370,7 @@ clean: clean-pyc clean-test clean-build clean-frontend
 # Supprime les fichiers Python générés
 clean-pyc:
     #!/usr/bin/env bash
+    set -euo pipefail
     find . -type f -name '*.py[cod]' -delete 2>/dev/null || true
     find . -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
     find . -type d -name '*.egg-info' -exec rm -rf {} + 2>/dev/null || true
@@ -351,6 +378,7 @@ clean-pyc:
 # Supprime les artefacts de test et de couverture
 clean-test:
     #!/usr/bin/env bash
+    set -euo pipefail
     rm -rf .pytest_cache .mypy_cache .ruff_cache .hypothesis .tox .nox
     rm -rf htmlcov .coverage .coverage.* coverage.xml
     rm -rf tests/.coverage tests/fixtures/tmp
@@ -370,7 +398,7 @@ clean-frontend:
 # Nettoie tout, y compris le venv
 clean-all: clean
     rm -rf .venv venv
-    echo -e "{{color_yell}}!{{color_reset}} Nettoyage complet terminé."
+    echo -e "{{color_yellow}}!{{color_reset}} Nettoyage complet terminé."
 
 # ────────────────────────────────────────────────────────────────────
 # Docker
@@ -449,9 +477,16 @@ frontend-build:
 frontend-lint:
     cd {{frontend_dir}} && {{pnpm}} lint
 
-# Teste le frontend
-frontend-test:
-    cd {{frontend_dir}} && {{pnpm}} test
+# Vérifie le typage et le lint du frontend.
+#
+# Il n'y a pas encore de runner de tests frontend (Vitest/Playwright) —
+# ``package.json`` n'expose ni ``test`` ni les dépendances associées.
+# ``typecheck`` (tsc --noEmit) et ``lint`` (next lint) sont la couverture
+# disponible aujourd'hui.  Un recipe ``frontend-test`` sera ajouté quand
+# un runner sera intégré.
+frontend-check:
+    cd {{frontend_dir}} && {{pnpm}} typecheck
+    cd {{frontend_dir}} && {{pnpm}} lint
 
 # ────────────────────────────────────────────────────────────────────
 # Utilitaires
@@ -465,9 +500,21 @@ benchmark:
 version:
     {{python}} -c "from nexusdl.version import __version__; print(__version__)"
 
-# Affiche la configuration active (secrets masqués par SecretStr)
+# Affiche la configuration active (secrets masqués par SecretStr).
+#
+# Le nom exact de l'entry point de ``nexusdl.core.config`` doit être
+# vérifié côté backend — les trois candidats plausibles sont
+# ``load_settings``, ``get_settings`` et ``Settings()``.  Le fallback
+# ci-dessous essaie les trois dans l'ordre et échoue proprement si aucun
+# ne fonctionne.  ``model_dump_json`` masque les ``SecretStr`` (Pydantic v2
+# les sérialise comme ``"**********"``), donc rien de sensible ne fuit
+# même si l'environnement contient des secrets.
 show-config:
-    {{python}} -c "from nexusdl.core.config import load_settings; print(load_settings().model_dump_json(indent=2))"
+    {{python}} -c "\
+from nexusdl.core import config as _c; \
+_loader = getattr(_c, 'load_settings', None) or getattr(_c, 'get_settings', None); \
+_s = _loader() if callable(_loader) else _c.Settings(); \
+print(_s.model_dump_json(indent=2))"
 
 # Ouvre le repo dans le navigateur
 open-repo:

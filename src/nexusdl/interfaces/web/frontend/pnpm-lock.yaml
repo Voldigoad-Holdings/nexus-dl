@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# pnpm-lock.yaml — GENERATED ARTIFACT, NOT HAND-AUTHORED
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This file is intentionally delivered as an **empty initial lockfile**.
+# It is NOT the final content, and it cannot be: a real pnpm lockfile records
+# the exact resolved version, tarball URL and SHA-512 integrity hash of every
+# direct and transitive dependency, plus the full peer-dependency resolution
+# graph. That information only exists after pnpm itself has queried the actual
+# npm registry against the exact `package.json` sitting next to this file.
+#
+# Hand-authoring a "plausible" lockfile would produce:
+#   • Wrong integrity hashes → `pnpm install --frozen-lockfile` fails in CI.
+#   • Wrong resolved versions → silent drift between developer machines.
+#   • Wrong peer-dep graph → subtle runtime incompatibilities.
+#
+# All of which would force regeneration anyway — the exact "re-open a
+# delivered file" failure mode the project forbids.
+#
+# ── Workflow ────────────────────────────────────────────────────────────────
+#
+#   1. cd src/nexusdl/interfaces/web/frontend
+#   2. pnpm install
+#   3. git add pnpm-lock.yaml && git commit
+#
+# Step 2 replaces this placeholder with the real lockfile in full.
+#
+# ── Rules ───────────────────────────────────────────────────────────────────
+#
+#   • Never edit pnpm-lock.yaml by hand.
+#   • Never run `pnpm install --no-lockfile` in this directory — it defeats
+#     the reproducibility guarantee that the lockfile exists to provide.
+#   • CI must run `pnpm install --frozen-lockfile` so that any divergence
+#     between this file and `package.json` fails loudly.
+#   • When `package.json` changes intentionally, run `pnpm install` locally
+#     and commit the resulting lockfile alongside the `package.json` change.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .: {}

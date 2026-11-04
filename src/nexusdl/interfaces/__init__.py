@@ -1,10 +1,11 @@
 """Interface adapters — the primary side of the hexagonal architecture.
 
 This package groups every **inbound** adapter of NexusDL — the code that
-sits on the boundary between the outside world and the application's domain
-core.  Each interface translates user input (keyboard, mouse, HTTP request,
-WebSocket frame) into calls on the core's ports, and translates the core's
-outbound events back into whatever format the interface presents.
+sits on the boundary between the outside world and the application's
+domain core.  Each interface translates user input (keyboard, mouse, HTTP
+request, WebSocket frame) into calls on the core's ports, and translates
+the core's outbound events back into whatever format the interface
+presents.
 
 The four interfaces
 -------------------
@@ -23,7 +24,11 @@ interface layer contains exactly four adapters:
   experience for users who prefer a window over a shell.
 * **Web** — :mod:`nexusdl.interfaces.web`.  A FastAPI backend serving a
   REST API and a WebSocket event stream, paired with a Next.js frontend.
-  Launched by ``nexusdl web`` or by ``uvicorn``/``gunicorn`` directly.
+  Launched by ``nexusdl web`` or by ``uvicorn``/``gunicorn`` directly via
+  the factories exposed by the ``web`` package
+  (:func:`~nexusdl.interfaces.web.create_app_from_env` for the zero-arg
+  deployment factory, :func:`~nexusdl.interfaces.web.create_app` for
+  injected composition in tests and alternate hosts).
 
 Dependency rule (R4)
 --------------------
@@ -79,10 +84,10 @@ Both of these forms are supported and behave identically:
 
     # Attribute access — resolves through ``__getattr__`` below.
     from nexusdl.interfaces import web as web_interface
-    web_interface.app  # imports ``nexusdl.interfaces.web`` here.
+    web_interface.create_app_from_env  # imports ``nexusdl.interfaces.web`` here.
 
     # Direct submodule import — Python's own import machinery.
-    from nexusdl.interfaces.web import app
+    from nexusdl.interfaces.web import create_app_from_env
 
 The **trigger** is attribute access on the package namespace, not module
 import.  As a direct consequence:
@@ -106,8 +111,11 @@ Which interface should a caller use?
 * ``from nexusdl.interfaces import gui`` — desktop, requires a display and
   the ``gui`` extras.
 * ``from nexusdl.interfaces import web`` — HTTP / WebSocket driven, usable
-  from a browser or another service.  Also the entry point for
-  ``uvicorn nexusdl.interfaces.web:app``.
+  from a browser or another service.  The zero-argument ASGI factory is
+  ``nexusdl.interfaces.web.create_app_from_env``, designed for
+  ``uvicorn nexusdl.interfaces.web:create_app_from_env --factory``.  For
+  injected composition (tests, embedded hosts), use
+  ``nexusdl.interfaces.web.create_app(services)`` directly.
 
 The ``nexusdl.__main__`` module dispatches between them based on the
 sub-command the user runs (``nexusdl``, ``nexusdl tui``, ``nexusdl gui``,
@@ -140,14 +148,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    # Declared under ``TYPE_CHECKING`` so that ``mypy --strict`` sees the
-    # subpackages as typed modules when resolving
-    # ``from nexusdl.interfaces import web``.  These declarations are
-    # **not** executed at runtime — the runtime implementation is
-    # ``__getattr__`` below, which imports the subpackage on first access.
-    from nexusdl.interfaces import cli, gui, web
-
-    _TYPED_SUBPACKAGES = (cli, gui, web)  # noqa: F841 — type-narrowing only
+    # Declared under ``TYPE_CHECKING`` so that ``mypy --strict`` and IDEs
+    # see the three subpackages as typed modules when resolving
+    # ``from nexusdl.interfaces import web`` and similar forms.  These
+    # declarations are **not** executed at runtime — the runtime
+    # implementation is ``__getattr__`` below, which imports the
+    # subpackage on first attribute access.
+    from . import cli, gui, web
 
 
 __all__ = ["cli", "gui", "web"]
@@ -235,4 +242,6 @@ def __dir__() -> list[str]:
     expects to see when exploring a package.  The order is alphabetical so
     that the output is stable across Python versions.
     """
-    return sorted(set(__all__) | {"__all__", "__doc__", "__name__", "__package__"})
+    return sorted(
+        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+    )

@@ -23,38 +23,65 @@ any of the four interface packages at module load.  ``python -m nexusdl
 --version`` touches only the standard library.
 
 The chosen interface is imported **once**, **at the moment of dispatch**,
-via :func:`runpy.run_module` with ``run_name="__main__"``.  That mechanism:
+through the following preference order:
 
-* runs the sub-interface's ``if __name__ == "__main__":`` block,
-* sets ``sys.argv`` appropriately (with a clean ``argv[0]``),
-* returns when it returns, propagating ``sys.exit`` codes,
-* restores ``sys.argv`` on exit (safe to chain dispatches in tests),
-* does **not** pollute the current namespace with the sub-interface's
+1. **Import the module** (``importlib.import_module``) and call its
+   ``main()`` function if it exposes one.  This is the preferred path for
+   composition-root modules like ``nexusdl.interfaces.cli.cli_entry``,
+   ``nexusdl.interfaces.cli.app`` (TUI), and
+   ``nexusdl.interfaces.web.backend.main``.
+2. **Fall back to ``runpy.run_module``** with ``run_name="__main__"`` for
+   modules that don't expose a ``main()`` function but do have an
+   ``if __name__ == "__main__":`` block.  This handles
+   ``nexusdl.interfaces.gui.__main__`` (if it exists) and any other
+   ``__main__.py`` wrapper.
+
+Both paths honour the same contract:
+
+* the sub-interface runs with a clean ``sys.argv`` (with a friendly
+  ``argv[0]`` so help/error output reads ``nexusdl <iface> ...`` rather
+  than ``/usr/bin/python``),
+* ``sys.exit`` codes propagate to the caller,
+* ``sys.argv`` is restored on exit (safe to chain dispatches in tests),
+* the current namespace is **not** polluted with the sub-interface's
   globals.
 
 Dispatch table
 ==============
 
-Each interface package is expected to expose a runnable module at the
-path listed in :data:`_DISPATCH`:
+Each interface maps to a dotted module path in :data:`_DISPATCH`:
 
-* ``cli``  → :mod:`nexusdl.interfaces.cli.__main__`     (Typer app)
+* ``cli``  → :mod:`nexusdl.interfaces.cli.__main__`     (thin wrapper)
 * ``tui``  → :mod:`nexusdl.interfaces.cli.app`          (Textual app)
-* ``gui``  → :mod:`nexusdl.interfaces.gui.__main__`     (CustomTkinter launcher)
+* ``gui``  → :mod:`nexusdl.interfaces.gui.__main__`     (thin wrapper)
 * ``web``  → :mod:`nexusdl.interfaces.web.backend.main` (uvicorn launcher)
 
-"Runnable" means the module has an ``if __name__ == "__main__":`` block
-(or is a package with a ``__main__.py``) that performs the actual work.
-All four follow this contract already — see their respective files for
-the exact entry points.
+The two ``__main__`` entries are the conventional Python entrypoint for
+their packages.  If they do not exist yet in a given tree, either:
+
+* **create them** as thin wrappers (recommended, five lines each), or
+* **change** :data:`_DISPATCH` to point to the composition-root modules
+  (``cli.cli_entry``, ``gui.app``) — the dispatcher's ``main()``
+  preference handles both transparently.
+
+Both the ``main()`` and the ``if __name__ == "__main__":`` contracts are
+supported at dispatch time; the choice is per-interface and does not
+affect this module's behaviour.
 
 Errors
 ======
 
 * **Missing extras** (``nexusdl gui`` on a headless server without
-  Tkinter): the dispatcher catches the :class:`ImportError` raised by
-  :func:`runpy.run_module` and prints a clean hint pointing at the
-  relevant ``pip install 'nexusdl[gui]'`` line, then exits 1.
+  Tkinter): the dispatcher catches the :class:`ImportError` raised by the
+  import machinery **and** distinguishes two cases:
+
+  - the submodule itself does not exist (``ModuleNotFoundError`` with
+    ``exc.name == dotted``) → the message points at the dispatch table,
+    not at ``pip install``.  This catches composition-root mistakes.
+  - a **transitive** dependency is missing (``exc.name`` is ``tkinter``,
+    ``fastapi``, …) → the message points at the relevant ``pip install
+    'nexusdl[gui]'`` line.  This catches missing extras.
+
 * **Ctrl+C**: exits 130 (Unix convention: 128 + SIGINT=2).
 * **BrokenPipeError** (``nexusdl <cmd> | head``): exits 141 silently
   (128 + SIGPIPE=13).
@@ -72,6 +99,12 @@ corresponding ``NEXUSDL_*`` env vars, which
     nexusdl web --host 0.0.0.0      → NEXUSDL_API_HOST=0.0.0.0
     nexusdl web --port 9000         → NEXUSDL_API_PORT=9000
 
+Translated flags are **consumed** — they are removed from the argv
+forwarded to the web launcher, so the launcher only sees its own
+arguments.  (Before this change they were forwarded but harmlessly
+ignored; the fix makes the behaviour explicit and keeps the launcher's
+argv clean.)
+
 Two common uvicorn flags are **not** supported by this launcher because
 they require the ``uvicorn --factory`` invocation form:
 
@@ -86,6 +119,7 @@ container.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import runpy
 import sys
@@ -102,6 +136,12 @@ __all__ = ["main"]
 #:
 #: Adding a new interface = one entry here + the corresponding runnable
 #: module in ``nexusdl.interfaces``.  No other file must change.
+#:
+#: The ``cli`` and ``gui`` entries point to ``__main__`` packages, which
+#: is the conventional Python convention for ``python -m``-style entry
+#: points.  Either those packages must exist (as thin wrappers around the
+#: composition root), or the entries can be changed to point directly at
+#: the composition-root modules — :func:`_run_module` supports both.
 _DISPATCH: Final[dict[str, str]] = {
     "cli": "nexusdl.interfaces.cli.__main__",
     "tui": "nexusdl.interfaces.cli.app",
@@ -119,7 +159,8 @@ _RESERVED: Final[frozenset[str]] = frozenset(_DISPATCH.keys())
 
 #: ``nexusdl web`` flag → env var translations.  Applied **before** the
 #: web launcher runs so that ``Settings()`` (constructed inside
-#: ``main()``) sees the overrides.
+#: ``main()``) sees the overrides.  Translated flags are **consumed** (not
+#: forwarded to the launcher).
 _WEB_FLAG_TO_ENV: Final[dict[str, str]] = {
     "--host": "NEXUSDL_API_HOST",
     "--port": "NEXUSDL_API_PORT",
@@ -225,17 +266,27 @@ def _run_interface(
         )
 
     if name == "web":
-        _apply_web_flag_env(rest)
+        rest = _consume_web_flags(rest)
     return _run_module(dotted, argv=rest, prog=prog)
 
 
 def _run_module(dotted: str, *, argv: list[str], prog: str) -> int:
     """Run ``dotted`` as ``__main__`` with a controlled ``sys.argv``.
 
-    Uses :func:`runpy.run_module` so the sub-interface sees a clean
-    ``__name__ == "__main__"`` — the same environment it would see under
-    ``python -m <dotted>``.  Restores the original ``sys.argv`` on exit
-    so callers can chain dispatches in tests.
+    Two execution strategies, tried in order:
+
+    1. **``main()`` preference** — import the module and call its
+       ``main()`` function if it exposes one.  This is the composition-
+       root path: ``cli_entry.main()``, ``app.main()``, etc.
+    2. **``runpy`` fallback** — for modules without a ``main()`` function
+       but with an ``if __name__ == "__main__":`` block (e.g. a thin
+       ``__main__.py`` wrapper).
+
+    The distinction between "the module itself is missing" and "a
+    transitive dependency is missing" is preserved in the error
+    reporting: a missing module points the operator at the dispatch
+    table; a missing transitive dep points at the ``[extra]`` install
+    hint.  See :func:`_report_missing_extra`.
 
     Args:
         dotted: Dotted module path to run as ``__main__``.
@@ -252,50 +303,81 @@ def _run_module(dotted: str, *, argv: list[str], prog: str) -> int:
     old_argv = sys.argv
     sys.argv = [prog, *argv]
     try:
-        runpy.run_module(dotted, run_name="__main__", alter_sys=False)
-        return 0
-    except ImportError as exc:
-        return _report_missing_extra(dotted, exc)
+        # Strategy 1 — import and call ``main()`` if present.
+        try:
+            module = importlib.import_module(dotted)
+        except ModuleNotFoundError as exc:
+            # ``exc.name == dotted`` → the module itself is missing.
+            # ``exc.name`` anything else → a transitive dep is missing.
+            return _report_missing_extra(dotted, exc)
+
+        main_fn = getattr(module, "main", None)
+        if callable(main_fn):
+            code = main_fn()
+            return 0 if code is None else int(code)
+
+        # Strategy 2 — fall back to running the module as ``__main__``
+        # so its ``if __name__ == "__main__":`` block executes.
+        try:
+            runpy.run_module(dotted, run_name="__main__", alter_sys=False)
+            return 0
+        except ModuleNotFoundError as exc:
+            return _report_missing_extra(dotted, exc)
     finally:
         # ``finally`` guarantees restoration even on SystemExit /
         # KeyboardInterrupt — no leaked global state across dispatches.
         sys.argv = old_argv
 
 
-def _apply_web_flag_env(args: list[str]) -> None:
-    """Translate a small subset of uvicorn-style flags into env vars.
+def _consume_web_flags(args: list[str]) -> list[str]:
+    """Translate web flags into env vars and remove them from ``args``.
 
-    Only the flags in :data:`_WEB_FLAG_TO_ENV` are translated.  The two
-    flags in :data:`_WEB_UNSUPPORTED_FLAGS` (``--reload`` and
-    ``--workers``) are silently consumed and produce a hint pointing at
-    the correct uvicorn invocation, since supporting them would require
-    the ``--factory`` form (see the module docstring).
+    Returns a **new** list with ``--host <addr>`` and ``--port <n>``
+    consumed (translated into ``NEXUSDL_API_HOST`` / ``NEXUSDL_API_PORT``
+    and removed from the returned argv).  Unsupported flags
+    (``--reload``, ``--workers``) are also removed and reported via a
+    hint on stderr — the current web launcher reads from ``Settings``,
+    so they cannot take effect through it.
 
-    Other flags fall through untouched — the current web launcher reads
-    from ``Settings``, so they are effectively ignored, which is the same
-    behaviour as before this dispatcher existed.
+    Other flags are passed through untouched, which matches the previous
+    behaviour: the web launcher ignores unknown flags by design.
     """
-    i = 0
+    out: list[str] = []
     unsupported: list[str] = []
+
+    i = 0
     while i < len(args):
         flag = args[i]
         target_env = _WEB_FLAG_TO_ENV.get(flag)
+
         if target_env is not None and i + 1 < len(args):
             os.environ[target_env] = args[i + 1]
             i += 2
             continue
+
         if flag in _WEB_UNSUPPORTED_FLAGS:
             unsupported.append(flag)
+            # Also drop the next token if it looks like the flag's value
+            # (``--workers 4`` → drop ``4``; ``--reload`` → no value).
+            if flag == "--workers" and i + 1 < len(args):
+                i += 2
+            else:
+                i += 1
+            continue
+
+        out.append(flag)
         i += 1
 
     if unsupported:
         sys.stderr.write(
-            f"nexusdl web: flag(s) {', '.join(unsupported)} are not supported "
-            f"by this launcher.\n"
+            f"nexusdl web: flag(s) {', '.join(unsupported)} are not "
+            f"supported by this launcher.\n"
             f"Use uvicorn directly instead:\n"
             f"    uvicorn nexusdl.interfaces.web:create_app_from_env "
             f"--factory {' '.join(unsupported)} <other-flags>\n"
         )
+
+    return out
 
 
 # ===========================================================================
@@ -372,8 +454,32 @@ Documentation:
 # Error reporting
 # ===========================================================================
 
-def _report_missing_extra(dotted: str, exc: ImportError) -> int:
-    """Print a clean hint when an interface extra is not installed."""
+def _report_missing_extra(dotted: str, exc: ModuleNotFoundError) -> int:
+    """Report a missing module or missing transitive dependency.
+
+    Two cases, two messages — the distinction matters because the fix is
+    different:
+
+    * **Module missing** (``exc.name == dotted``): the dispatch table
+      points to a module that does not exist.  That is a
+      composition-root bug, not an install issue.  The hint tells the
+      operator to check :data:`_DISPATCH` or create the module.
+    * **Transitive dependency missing** (``exc.name != dotted``): the
+      module exists but imports something that is not installed.  The
+      hint points at the relevant ``[extra]``.
+    """
+    if exc.name == dotted:
+        sys.stderr.write(
+            f"\nnexusdl: cannot start {dotted!r} — the module does not "
+            f"exist in the installed tree.\n"
+            f"This is a dispatch-table entry that points to a missing "
+            f"module. Either:\n"
+            f"  - create it as a thin wrapper, or\n"
+            f"  - update the entry in nexusdl.__main__._DISPATCH to "
+            f"point at the composition root.\n"
+        )
+        return 1
+
     extra = _extra_for(dotted)
     sys.stderr.write(
         f"\nnexusdl: cannot start {dotted!r}: {exc}\n"

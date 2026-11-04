@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NexusDL web frontend — Git ignore rules
+# ─────────────────────────────────────────────────────────────────────────────
+# This file is scoped to the Next.js frontend. Rules from the repository-level
+# .gitignore apply on top of it; nothing here duplicates them except where
+# frontend-specific exclusions are genuinely useful locally (see the note at
+# the bottom).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+
+# ── Next.js build output ────────────────────────────────────────────────────
+.next/
+out/
+build/
+dist/
+
+# Next.js preserves these two files between builds even when .next/ is
+# removed; they are generated and must not be committed.
+next-env.d.ts
+*.tsbuildinfo
+
+# ── Testing and coverage ────────────────────────────────────────────────────
+coverage/
+.nyc_output/
+
+# ── Caches and tool state ───────────────────────────────────────────────────
+.eslintcache
+.stylelintcache
+.turbo/
+.swc/
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── Environment ─────────────────────────────────────────────────────────────
+# Frontend-specific environment overrides live next to package.json. The
+# repository-level .gitignore already excludes .env files globally; these
+# entries document the convention locally and would still apply if this
+# directory were ever extracted into a standalone repository.
+.env
+.env.local
+.env.*.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# ── Editor and OS artefacts ─────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Linter / formatter caches ───────────────────────────────────────────────
+.prettiercache
+.eslintcache
+
+# ── Vercel ──────────────────────────────────────────────────────────────────
+# Even though NexusDL is not deployed on Vercel by default, the ``.vercel``
+# directory is created by ``vercel link`` and should never be committed if a
+# contributor happens to use the CLI locally.
+.vercel

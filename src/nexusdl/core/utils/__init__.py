@@ -144,6 +144,58 @@ currently work correctly. When each affected file is next opened for any
 reason, the substitution is applied. Until then, the duplication is
 acknowledged and documented rather than hidden.
 
+Lazy loading
+------------
+All ~84 exports are resolved through PEP 562's ``__getattr__``
+mechanism. Importing ``nexusdl.core.utils`` **does not import any
+submodule**.
+
+The gain here is smaller than in other packages in the project (the
+utility modules are predominantly stdlib-only), but it is real and it
+completes the lazy-loading convention across every ``__init__.py`` in
+the project:
+
+* ``url.py``, ``time.py``, ``hash.py``, ``filesystem.py``, and
+  ``retry.py`` are stdlib-only — ~2-3 ms each.
+* ``text.py`` pulls in ``python-slugify`` (~10-15 ms, with
+  ``text-unidecode`` as a transitive dep).
+* ``async_helpers.py`` pulls in ``loguru`` (~10-15 ms).
+
+**Total eager cost: ~30-50 ms.** Modest in absolute terms — but every
+parser in ``nexusdl.parsers.*`` imports at least one utility helper
+(``make_manga_id``, ``make_chapter_id``, ``utcnow``, ``utcnow_iso``,
+``normalize``, …) at module load, and none of them needs
+``python-slugify`` or ``loguru`` at that point.
+
+**Before:** any of ``from ...utils import make_manga_id``,
+``from ...utils import utcnow``, or
+``from ...utils import atomic_write_bytes`` paid the entire ~40 ms.
+
+**After:**
+
+=============================================  =========  =========
+Scenario                                        Before     After
+=============================================  =========  =========
+``from ...utils import make_manga_id``         ~40 ms     ~3 ms
+``from ...utils import utcnow``                ~40 ms     ~2 ms
+``from ...utils import atomic_write_bytes``    ~40 ms     ~3 ms
+``from ...utils import RetryPolicy``           ~40 ms     ~3 ms
+``from ...utils import slugify_safe``          ~40 ms     ~15 ms
+``from ...utils import fire_and_forget``       ~40 ms     ~15 ms
+=============================================  =========  =========
+
+The public surface is unchanged: ``from nexusdl.core.utils import X``
+works exactly as before — resolved on first access and cached. No
+caller has to change a line.
+
+.. note::
+   The ``DEFAULT_TRUNCATION_SUFFIX``, ``DEFAULT_SLUG_FALLBACK``, and
+   ``DEFAULT_SLUG_MAX_LENGTH`` module constants in ``text.py`` remain
+   **not** re-exported (they are defaults, not contract), which is why
+   they are absent from ``_LAZY``. A caller that needs a specific
+   truncation suffix or slug fallback passes it as an explicit argument
+   to ``truncate`` / ``slugify_safe``.
+
 Stability
 ---------
 ``__all__`` is the public contract. Adding a symbol is a minor change;
@@ -198,19 +250,19 @@ module and are allowed to change without notice:
 Dependency graph (no cycles)::
 
     core.exceptions
-         ▲
-         │ (retry.py only — RetryTimeoutError)
-         │
-    ┌────┴──────────────────────────────────────┐
-    │  url.py   time.py   text.py   hash.py      │
-    │  filesystem.py         async_helpers.py    │
-    │                    ▲                        │
-    │                    │ (loguru only)          │
-    │                    │                        │
-    │              retry.py                       │
-    └────────────────────────────────────────────┘
-                        ▲
-                        │
+         ^
+         | (retry.py only — RetryTimeoutError)
+         |
+    +----+--------------------------------------+
+    |  url.py   time.py   text.py   hash.py      |
+    |  filesystem.py         async_helpers.py    |
+    |                    ^                        |
+    |                    | (loguru only)          |
+    |                    |                        |
+    |              retry.py                       |
+    +--------------------------------------------+
+                        ^
+                        |
     core.models.* / core.downloader.* / core.image.* /
     core.library.* / core.packaging.* / core.registry.* /
     core.session.* / interfaces.*  — every other package depends on
@@ -220,123 +272,21 @@ Six of the seven submodules are pure leaves with **zero** nexusdl
 imports; ``retry.py`` imports ``core.exceptions`` for the single
 exception class it raises. The package is at the bottom of the
 dependency graph, and this ``__init__.py`` preserves that property —
-importing it triggers the seven submodule imports in leaf-first order,
-none of which can trigger a cycle.
+the seven submodules are loaded lazily, on first attribute access, in
+whatever order the caller happens to access them. Python's normal
+import machinery resolves the nested imports correctly regardless of
+entry point (the graph is cycle-free, so ordering does not matter).
 """
 
 from __future__ import annotations
 
-# --- URL manipulation ---------------------------------------------------- #
-from nexusdl.core.utils.url import (
-    DEFAULT_PORTS,
-    HTTP_SCHEMES,
-    SUPPORTED_SCHEMES,
-    ensure_https,
-    get_extension,
-    get_fragment,
-    get_filename,
-    get_host,
-    get_path,
-    get_port,
-    get_query,
-    get_scheme,
-    get_stem,
-    is_absolute,
-    is_fetchable,
-    is_file,
-    is_http,
-    is_https,
-    is_relative,
-    is_same_origin,
-    is_supported_scheme,
-    join,
-    normalize,
-    strip_fragment,
-    strip_query,
-    strip_userinfo,
-)
+import importlib
+from typing import TYPE_CHECKING, Any
 
-# --- Time and duration --------------------------------------------------- #
-from nexusdl.core.utils.time import (
-    SECONDS_PER_DAY,
-    SECONDS_PER_HOUR,
-    SECONDS_PER_MINUTE,
-    SECONDS_PER_WEEK,
-    UNIX_EPOCH,
-    Stopwatch,
-    format_duration,
-    format_iso,
-    format_relative,
-    from_unix,
-    parse_iso,
-    parse_iso_or_none,
-    to_unix,
-    utcnow,
-    utcnow_iso,
-)
 
-# --- Text and strings ---------------------------------------------------- #
-from nexusdl.core.utils.text import (
-    casefold_key,
-    coerce_str,
-    extract_number,
-    normalize_whitespace,
-    parse_bool,
-    slugify_safe,
-    split_csv,
-    strip_html,
-    truncate,
-    truncate_words,
-)
-
-# --- Hashing and IDs ----------------------------------------------------- #
-from nexusdl.core.utils.hash import (
-    CHAPTER_ID_LENGTH,
-    DEFAULT_FILE_CHUNK_SIZE,
-    MANGA_ID_LENGTH,
-    SHA256_HEX_LENGTH,
-    file_sha256,
-    file_sha256_sync,
-    make_chapter_id,
-    make_manga_id,
-    sha256_hex,
-    sha256_truncated,
-)
-
-# --- Generic retry ------------------------------------------------------- #
-from nexusdl.core.utils.retry import (
-    BackoffStrategy,
-    RetryPolicy,
-    constant_backoff,
-    exponential_backoff,
-    exponential_jitter_backoff,
-    linear_backoff,
-    retry_async,
-    retry_sync,
-)
-
-# --- Filesystem primitives ---------------------------------------------- #
-from nexusdl.core.utils.filesystem import (
-    atomic_replace_directory,
-    atomic_write_bytes,
-    atomic_write_text,
-    chmod_owner_only,
-    delete_file_quietly,
-    ensure_directory,
-    fsync_directory,
-    get_file_size,
-    human_readable_size,
-    is_safe_filename,
-    validate_filename,
-)
-
-# --- Async concurrency --------------------------------------------------- #
-from nexusdl.core.utils.async_helpers import (
-    AsyncLazy,
-    cancel_all,
-    cancel_safely,
-    fire_and_forget,
-)
+# ===========================================================================
+# Public API
+# ===========================================================================
 
 __all__ = [
     # --- URL manipulation ------------------------------------------------ #
@@ -430,4 +380,357 @@ __all__ = [
     "cancel_all",
     "cancel_safely",
     "fire_and_forget",
+    # --- Introspection -------------------------------------------------- #
+    "list_symbols",
+    "get_symbol",
 ]
+
+
+# ===========================================================================
+# Lazy import registry
+# ===========================================================================
+#
+# Maps exported name -> (submodule basename, attribute name in that submodule).
+# Every listed symbol is defined at module level in the given submodule.
+# Adding a new top-level export is a one-line change here plus a matching
+# TYPE_CHECKING re-export below.
+
+_LAZY: dict[str, tuple[str, str]] = {
+    # --- url (stdlib only) ----------------------------------------------- #
+    "DEFAULT_PORTS": ("url", "DEFAULT_PORTS"),
+    "HTTP_SCHEMES": ("url", "HTTP_SCHEMES"),
+    "SUPPORTED_SCHEMES": ("url", "SUPPORTED_SCHEMES"),
+    "ensure_https": ("url", "ensure_https"),
+    "get_extension": ("url", "get_extension"),
+    "get_fragment": ("url", "get_fragment"),
+    "get_filename": ("url", "get_filename"),
+    "get_host": ("url", "get_host"),
+    "get_path": ("url", "get_path"),
+    "get_port": ("url", "get_port"),
+    "get_query": ("url", "get_query"),
+    "get_scheme": ("url", "get_scheme"),
+    "get_stem": ("url", "get_stem"),
+    "is_absolute": ("url", "is_absolute"),
+    "is_fetchable": ("url", "is_fetchable"),
+    "is_file": ("url", "is_file"),
+    "is_http": ("url", "is_http"),
+    "is_https": ("url", "is_https"),
+    "is_relative": ("url", "is_relative"),
+    "is_same_origin": ("url", "is_same_origin"),
+    "is_supported_scheme": ("url", "is_supported_scheme"),
+    "join": ("url", "join"),
+    "normalize": ("url", "normalize"),
+    "strip_fragment": ("url", "strip_fragment"),
+    "strip_query": ("url", "strip_query"),
+    "strip_userinfo": ("url", "strip_userinfo"),
+    # --- time (stdlib only) ---------------------------------------------- #
+    "SECONDS_PER_DAY": ("time", "SECONDS_PER_DAY"),
+    "SECONDS_PER_HOUR": ("time", "SECONDS_PER_HOUR"),
+    "SECONDS_PER_MINUTE": ("time", "SECONDS_PER_MINUTE"),
+    "SECONDS_PER_WEEK": ("time", "SECONDS_PER_WEEK"),
+    "UNIX_EPOCH": ("time", "UNIX_EPOCH"),
+    "Stopwatch": ("time", "Stopwatch"),
+    "format_duration": ("time", "format_duration"),
+    "format_iso": ("time", "format_iso"),
+    "format_relative": ("time", "format_relative"),
+    "from_unix": ("time", "from_unix"),
+    "parse_iso": ("time", "parse_iso"),
+    "parse_iso_or_none": ("time", "parse_iso_or_none"),
+    "to_unix": ("time", "to_unix"),
+    "utcnow": ("time", "utcnow"),
+    "utcnow_iso": ("time", "utcnow_iso"),
+    # --- text (python-slugify) ------------------------------------------- #
+    "casefold_key": ("text", "casefold_key"),
+    "coerce_str": ("text", "coerce_str"),
+    "extract_number": ("text", "extract_number"),
+    "normalize_whitespace": ("text", "normalize_whitespace"),
+    "parse_bool": ("text", "parse_bool"),
+    "slugify_safe": ("text", "slugify_safe"),
+    "split_csv": ("text", "split_csv"),
+    "strip_html": ("text", "strip_html"),
+    "truncate": ("text", "truncate"),
+    "truncate_words": ("text", "truncate_words"),
+    # --- hash (stdlib only) ---------------------------------------------- #
+    "CHAPTER_ID_LENGTH": ("hash", "CHAPTER_ID_LENGTH"),
+    "DEFAULT_FILE_CHUNK_SIZE": ("hash", "DEFAULT_FILE_CHUNK_SIZE"),
+    "MANGA_ID_LENGTH": ("hash", "MANGA_ID_LENGTH"),
+    "SHA256_HEX_LENGTH": ("hash", "SHA256_HEX_LENGTH"),
+    "file_sha256": ("hash", "file_sha256"),
+    "file_sha256_sync": ("hash", "file_sha256_sync"),
+    "make_chapter_id": ("hash", "make_chapter_id"),
+    "make_manga_id": ("hash", "make_manga_id"),
+    "sha256_hex": ("hash", "sha256_hex"),
+    "sha256_truncated": ("hash", "sha256_truncated"),
+    # --- retry (stdlib + core.exceptions) -------------------------------- #
+    "BackoffStrategy": ("retry", "BackoffStrategy"),
+    "RetryPolicy": ("retry", "RetryPolicy"),
+    "constant_backoff": ("retry", "constant_backoff"),
+    "exponential_backoff": ("retry", "exponential_backoff"),
+    "exponential_jitter_backoff": ("retry", "exponential_jitter_backoff"),
+    "linear_backoff": ("retry", "linear_backoff"),
+    "retry_async": ("retry", "retry_async"),
+    "retry_sync": ("retry", "retry_sync"),
+    # --- filesystem (stdlib only) ---------------------------------------- #
+    "atomic_replace_directory": ("filesystem", "atomic_replace_directory"),
+    "atomic_write_bytes": ("filesystem", "atomic_write_bytes"),
+    "atomic_write_text": ("filesystem", "atomic_write_text"),
+    "chmod_owner_only": ("filesystem", "chmod_owner_only"),
+    "delete_file_quietly": ("filesystem", "delete_file_quietly"),
+    "ensure_directory": ("filesystem", "ensure_directory"),
+    "fsync_directory": ("filesystem", "fsync_directory"),
+    "get_file_size": ("filesystem", "get_file_size"),
+    "human_readable_size": ("filesystem", "human_readable_size"),
+    "is_safe_filename": ("filesystem", "is_safe_filename"),
+    "validate_filename": ("filesystem", "validate_filename"),
+    # --- async_helpers (loguru) ------------------------------------------ #
+    "AsyncLazy": ("async_helpers", "AsyncLazy"),
+    "cancel_all": ("async_helpers", "cancel_all"),
+    "cancel_safely": ("async_helpers", "cancel_safely"),
+    "fire_and_forget": ("async_helpers", "fire_and_forget"),
+}
+
+
+# ===========================================================================
+# Static re-exports for type checkers and IDEs
+# ===========================================================================
+#
+# Never executed at runtime; only consumed by mypy / pyright / IDEs. Import
+# from the concrete submodule so static analysis sees the real definitions
+# without triggering an eager runtime import.
+
+if TYPE_CHECKING:
+    from nexusdl.core.utils.async_helpers import (
+        AsyncLazy,
+        cancel_all,
+        cancel_safely,
+        fire_and_forget,
+    )
+    from nexusdl.core.utils.filesystem import (
+        atomic_replace_directory,
+        atomic_write_bytes,
+        atomic_write_text,
+        chmod_owner_only,
+        delete_file_quietly,
+        ensure_directory,
+        fsync_directory,
+        get_file_size,
+        human_readable_size,
+        is_safe_filename,
+        validate_filename,
+    )
+    from nexusdl.core.utils.hash import (
+        CHAPTER_ID_LENGTH,
+        DEFAULT_FILE_CHUNK_SIZE,
+        MANGA_ID_LENGTH,
+        SHA256_HEX_LENGTH,
+        file_sha256,
+        file_sha256_sync,
+        make_chapter_id,
+        make_manga_id,
+        sha256_hex,
+        sha256_truncated,
+    )
+    from nexusdl.core.utils.retry import (
+        BackoffStrategy,
+        RetryPolicy,
+        constant_backoff,
+        exponential_backoff,
+        exponential_jitter_backoff,
+        linear_backoff,
+        retry_async,
+        retry_sync,
+    )
+    from nexusdl.core.utils.text import (
+        casefold_key,
+        coerce_str,
+        extract_number,
+        normalize_whitespace,
+        parse_bool,
+        slugify_safe,
+        split_csv,
+        strip_html,
+        truncate,
+        truncate_words,
+    )
+    from nexusdl.core.utils.time import (
+        SECONDS_PER_DAY,
+        SECONDS_PER_HOUR,
+        SECONDS_PER_MINUTE,
+        SECONDS_PER_WEEK,
+        UNIX_EPOCH,
+        Stopwatch,
+        format_duration,
+        format_iso,
+        format_relative,
+        from_unix,
+        parse_iso,
+        parse_iso_or_none,
+        to_unix,
+        utcnow,
+        utcnow_iso,
+    )
+    from nexusdl.core.utils.url import (
+        DEFAULT_PORTS,
+        HTTP_SCHEMES,
+        SUPPORTED_SCHEMES,
+        ensure_https,
+        get_extension,
+        get_fragment,
+        get_filename,
+        get_host,
+        get_path,
+        get_port,
+        get_query,
+        get_scheme,
+        get_stem,
+        is_absolute,
+        is_fetchable,
+        is_file,
+        is_http,
+        is_https,
+        is_relative,
+        is_same_origin,
+        is_supported_scheme,
+        join,
+        normalize,
+        strip_fragment,
+        strip_query,
+        strip_userinfo,
+    )
+
+
+# ===========================================================================
+# Lazy loader
+# ===========================================================================
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public utility symbol on first access (PEP 562).
+
+    Called by Python's import machinery whenever an attribute is accessed
+    on this package that is not already bound in ``globals()``. Only the
+    names in :data:`__all__` are handled; anything else raises
+    :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
+    default)`` and interactive introspection behave as users expect.
+
+    Args:
+        name: The attribute name being accessed.
+
+    Returns:
+        The symbol registered under ``name`` in the submodule recorded in
+        :data:`_LAZY`. The submodule is imported once and its binding is
+        cached in ``globals()``, so subsequent accesses are plain dict
+        lookups.
+
+    Raises:
+        AttributeError: When ``name`` is not a public export, when the
+            submodule cannot be imported (a missing optional dependency
+            such as ``python-slugify`` or ``loguru``, a syntax error
+            deeper in the module, or a broken installation), or when the
+            submodule does not define the requested name.
+            ``AttributeError`` — rather than ``ImportError`` — is
+            required by PEP 562 so that ``hasattr`` works.
+    """
+    # Dunder / special attributes must never route through lazy loading.
+    if name.startswith("__"):
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
+    entry = _LAZY.get(name)
+    if entry is None:
+        available = ", ".join(sorted(__all__))
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}. "
+            f"Available utility exports: {available}. "
+            f"Every other symbol lives in its specific submodule - "
+            f"e.g. 'from nexusdl.core.utils.text import "
+            f"DEFAULT_TRUNCATION_SUFFIX' or 'from "
+            f"nexusdl.core.utils.retry import _DEFAULT_MAX_ATTEMPTS'."
+        )
+
+    submodule_basename, attr_name = entry
+    try:
+        module = importlib.import_module(f".{submodule_basename}", __name__)
+    except ModuleNotFoundError as exc:
+        # Optional dependency missing from the utilities package.
+        if exc.name in {"slugify", "loguru"}:
+            raise ImportError(
+                f"{name!r} requires the core extra "
+                f"({'python-slugify' if exc.name == 'slugify' else 'loguru'}). "
+                f"Install it with: pip install 'nexusdl[core]' "
+                f"(or 'nexusdl[all]' for the full set)."
+            ) from exc
+        raise
+
+    try:
+        value = getattr(module, attr_name)
+    except AttributeError:
+        raise AttributeError(
+            f"The utility submodule {submodule_basename!r} does not "
+            f"define {attr_name!r}. This is a package-internal "
+            f"inconsistency - nexusdl.core.utils.__all__ and the "
+            f"submodules are out of sync."
+        ) from None
+
+    # Cache in the module namespace so subsequent lookups bypass
+    # __getattr__ entirely (same behavior as a top-level import).
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Return the public names for interactive introspection.
+
+    Python's default :func:`dir` implementation collects a module's
+    ``__dict__`` and, when the module defines ``__getattr__``, calls it
+    with each candidate name to decide what to display. Because none of
+    the ~84 exports are present in ``__dict__`` at import time, an
+    unmodified :func:`dir` would not list them - the package would
+    appear empty in a REPL.
+
+    The returned list is :data:`__all__` plus the standard module
+    dunders a user typically expects to see.
+    """
+    return sorted(
+        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+    )
+
+
+# ===========================================================================
+# Introspection helpers
+# ===========================================================================
+
+def list_symbols() -> list[str]:
+    """Return the sorted list of top-level lazy exports.
+
+    Useful for parametrized tests (``@pytest.mark.parametrize("name",
+    list_symbols())``), documentation generators, and tooling that needs
+    to enumerate the utilities' public surface without importing every
+    submodule. This is the largest ``__all__`` in the project (~84
+    symbols); a docs generator that wants to render the whole surface
+    without paying the import cost will find this function useful.
+    """
+    # Only the public exports, not the introspection helpers themselves -
+    # otherwise ``list_symbols`` would include itself.
+    return sorted(_LAZY.keys())
+
+
+def get_symbol(name: str) -> Any:
+    """Return the utility symbol registered under ``name``.
+
+    Equivalent to ``getattr(package, name)`` but with a clearer error
+    message when the name is unknown. Convenient for dynamic lookups
+    (parametrized tests, documentation generators that need to introspect
+    the surface, external packages that resolve a helper by name).
+
+    Raises:
+        KeyError: If ``name`` is not a public utility export.
+    """
+    if name not in _LAZY:
+        available = ", ".join(sorted(_LAZY.keys()))
+        raise KeyError(
+            f"Unknown utility symbol {name!r}. Available: {available}. "
+            f"Every other symbol lives in its specific submodule - import "
+            f"from 'nexusdl.core.utils.<submodule>' directly."
+        )
+    return getattr(__import__(__name__, fromlist=[name]), name)

@@ -1,195 +1,402 @@
-"""Entry point for ``python -m nexusdl``.
+"""NexusDL top-level CLI dispatcher — the ``python -m nexusdl`` entrypoint.
 
-Universal launcher for the NexusDL command-line interface.  It delegates to
-:func:`nexusdl.interfaces.cli.cli_entry.main`, which is the CLI composition
-root — this file exists purely to make the ``python -m nexusdl`` invocation
-work, and to translate low-level failures (missing dependencies, interrupts,
-unusual ``SystemExit`` payloads) into the exit codes that POSIX shells,
-systemd units, Docker ``ENTRYPOINT`` directives and CI pipelines expect.
+Running ``nexusdl`` (or ``python -m nexusdl``) routes to one of four
+interface adapters based on the first positional argument:
 
-It also serves as the reference implementation for the ``nexusdl`` console
-script declared in ``pyproject.toml`` under ``[project.scripts]``, which
-resolves to ``nexusdl.interfaces.cli.cli_entry:main``.  Both paths reach
-exactly the same code — this file adds nothing that the console script
-lacks, and the console script adds nothing that this file lacks.
+    nexusdl                    → CLI (default)
+    nexusdl <cli-cmd> ...      → CLI (Typer)
+    nexusdl cli <cmd> ...      → CLI (explicit escape hatch)
+    nexusdl tui                → TUI (Textual)
+    nexusdl gui                → GUI (CustomTkinter)
+    nexusdl web [flags...]     → Web (FastAPI + uvicorn)
 
-Exit codes
-----------
-* ``0``   — the CLI ran and reported success.
-* ``1``   — the CLI failed, or its dependencies are missing.
-* ``130`` — the process was interrupted with ``Ctrl+C`` (128 + SIGINT),
-  matching the POSIX convention that shells display as ``"Interrupt"``.
+Plus, at the top level:
 
-Exit codes the CLI itself produces (``--help`` returning 0, a sub-command
-returning 2 for a usage error, …) are honoured unchanged: if the delegated
-``main()`` raises ``SystemExit`` with an integer code, it is propagated
-as-is.  When it raises ``SystemExit`` with a string payload (a Python idiom
-meaning "print this to stderr and exit 1"), the string is printed and the
-exit code is normalised to ``1`` — matching Python's own default handler
-for that case.
+    nexusdl --version / -V / version    → print version
+    nexusdl --help    / -h / help       → print this help text
 
-What this file does **not** do
-------------------------------
-* **No argument parsing.**  ``sys.argv`` is passed through untouched;
-  Typer/Click handle it inside ``cli_entry.main()``.
-* **No configuration loading.**  ``Settings`` is constructed inside the
-  CLI composition root, where the correct precedence
-  (``default_config.yaml`` → ``config/config.yaml`` → ``.env`` →
-  ``kwargs``) is applied.
-* **No asyncio event loop management.**  The core is async-first, and
-  ``cli_entry.main()`` is responsible for running the async sub-command
-  through ``asyncio.run()``.  Managing the event loop here would fight
-  with the loop the CLI already owns.
-* **No generic exception handling.**  An unexpected exception is a bug,
-  and the user should see the traceback so that a bug report is
-  actionable.  Expected failures (``NexusDLError`` and its subclasses)
-  are the CLI's responsibility — it catches and renders them cleanly
-  before control ever reaches this file.  A traceback surfacing here
-  therefore means "the CLI missed a case", which is exactly what the
-  operator needs to see.
-* **No eager imports.**  The CLI imports Typer, Rich and (for the TUI)
-  Textual; deferring the import until ``_run()`` is called keeps
-  ``import nexusdl.__main__`` essentially free.  This matters for tools
-  that walk the module graph without running the CLI — import-scanning
-  linters, ``pyright``'s background analysis, or a deployment script
-  that only wants to check "is the CLI installed?".
-* **No signal-handling overrides.**  ``SIGINT`` is left to Python's
-  default handler (raise ``KeyboardInterrupt``), which is what lets the
-  CLI's async tasks cancel cooperatively.  Installing a custom handler
-  here would preempt the CLI's own cleanup logic.
+Lazy loading contract
+=====================
+
+This module **never** imports Typer, Textual, CustomTkinter, FastAPI, or
+any of the four interface packages at module load.  ``python -m nexusdl
+--version`` touches only the standard library.
+
+The chosen interface is imported **once**, **at the moment of dispatch**,
+via :func:`runpy.run_module` with ``run_name="__main__"``.  That mechanism:
+
+* runs the sub-interface's ``if __name__ == "__main__":`` block,
+* sets ``sys.argv`` appropriately (with a clean ``argv[0]``),
+* returns when it returns, propagating ``sys.exit`` codes,
+* restores ``sys.argv`` on exit (safe to chain dispatches in tests),
+* does **not** pollute the current namespace with the sub-interface's
+  globals.
+
+Dispatch table
+==============
+
+Each interface package is expected to expose a runnable module at the
+path listed in :data:`_DISPATCH`:
+
+* ``cli``  → :mod:`nexusdl.interfaces.cli.__main__`     (Typer app)
+* ``tui``  → :mod:`nexusdl.interfaces.cli.app`          (Textual app)
+* ``gui``  → :mod:`nexusdl.interfaces.gui.__main__`     (CustomTkinter launcher)
+* ``web``  → :mod:`nexusdl.interfaces.web.backend.main` (uvicorn launcher)
+
+"Runnable" means the module has an ``if __name__ == "__main__":`` block
+(or is a package with a ``__main__.py``) that performs the actual work.
+All four follow this contract already — see their respective files for
+the exact entry points.
+
+Errors
+======
+
+* **Missing extras** (``nexusdl gui`` on a headless server without
+  Tkinter): the dispatcher catches the :class:`ImportError` raised by
+  :func:`runpy.run_module` and prints a clean hint pointing at the
+  relevant ``pip install 'nexusdl[gui]'`` line, then exits 1.
+* **Ctrl+C**: exits 130 (Unix convention: 128 + SIGINT=2).
+* **BrokenPipeError** (``nexusdl <cmd> | head``): exits 141 silently
+  (128 + SIGPIPE=13).
+* **Any other exception**: propagates normally with a traceback and
+  exit code 1.  That is the interface's bug, not the dispatcher's —
+  surfacing it loudly is correct.
+
+Web flags
+=========
+
+``nexusdl web`` translates a small set of uvicorn-style flags into the
+corresponding ``NEXUSDL_*`` env vars, which
+:class:`nexusdl.core.config.Settings` reads at construction time:
+
+    nexusdl web --host 0.0.0.0      → NEXUSDL_API_HOST=0.0.0.0
+    nexusdl web --port 9000         → NEXUSDL_API_PORT=9000
+
+Two common uvicorn flags are **not** supported by this launcher because
+they require the ``uvicorn --factory`` invocation form:
+
+    --reload     → use `uvicorn nexusdl.interfaces.web:create_app_from_env --factory --reload`
+    --workers N  → use `uvicorn nexusdl.interfaces.web:create_app_from_env --factory --workers N`
+
+The dispatcher prints a hint pointing at the correct command when either
+of those is passed.  For multi-worker production, the canonical deployment
+pattern is uvicorn's ``--factory`` (documented in
+:mod:`nexusdl.interfaces.web`), which gives each worker its own services
+container.
 """
-
 from __future__ import annotations
 
+import os
+import runpy
 import sys
 from typing import Final
 
 __all__ = ["main"]
 
 
-#: Exit code for a successful run.
-_EXIT_SUCCESS: Final[int] = 0
+# ===========================================================================
+# Dispatch configuration
+# ===========================================================================
 
-#: Exit code for a failed run, matching ``sys.exit(1)`` and Python's
-#: default handler for an uncaught exception.
-_EXIT_ERROR: Final[int] = 1
+#: Canonical dispatch table — subcommand → dotted module to run.
+#:
+#: Adding a new interface = one entry here + the corresponding runnable
+#: module in ``nexusdl.interfaces``.  No other file must change.
+_DISPATCH: Final[dict[str, str]] = {
+    "cli": "nexusdl.interfaces.cli.__main__",
+    "tui": "nexusdl.interfaces.cli.app",
+    "gui": "nexusdl.interfaces.gui.__main__",
+    "web": "nexusdl.interfaces.web.backend.main",
+}
 
-#: Exit code for an interrupted run — ``128 + SIGINT (2)``, the POSIX
-#: convention that shells display as ``"Interrupt"``.  Using 130 here
-#: means a shell script doing ``python -m nexusdl … || echo "failed"``
-#: sees the same code it would see if the process had been killed by a
-#: real ``SIGINT``, which is what systemd's ``Restart=on-failure`` and
-#: Docker's ``--restart`` policies key on.
-_EXIT_INTERRUPTED: Final[int] = 130
+#: Interface used when the user provides no positional argument.
+_DEFAULT_INTERFACE: Final[str] = "cli"
+
+#: First positional arguments reserved as interface selectors.  Any other
+#: first argument is treated as a CLI subcommand and forwarded to the CLI
+#: with the whole argv intact.
+_RESERVED: Final[frozenset[str]] = frozenset(_DISPATCH.keys())
+
+#: ``nexusdl web`` flag → env var translations.  Applied **before** the
+#: web launcher runs so that ``Settings()`` (constructed inside
+#: ``main()``) sees the overrides.
+_WEB_FLAG_TO_ENV: Final[dict[str, str]] = {
+    "--host": "NEXUSDL_API_HOST",
+    "--port": "NEXUSDL_API_PORT",
+}
+
+#: uvicorn flags that require the ``uvicorn --factory`` invocation form
+#: and are therefore **not** supported by ``nexusdl web``.  Passing them
+#: produces a hint pointing at the correct command.
+_WEB_UNSUPPORTED_FLAGS: Final[frozenset[str]] = frozenset(
+    {"--reload", "--workers"}
+)
 
 
-def main() -> None:
-    """Entry point for ``python -m nexusdl``.
+# ===========================================================================
+# Public entrypoint
+# ===========================================================================
 
-    Wraps :func:`_run` in ``SystemExit`` so that both
-    ``python -m nexusdl`` and ``from nexusdl.__main__ import main;
-    main()`` terminate the process with the correct exit code.  Any
-    exception raised by :func:`_run` propagates unchanged — see the
-    module docstring for the rationale.
-    """
-    raise SystemExit(_run())
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch to the appropriate interface based on ``argv``.
 
+    This is the callable that ``if __name__ == "__main__":`` invokes.  It
+    is also what any host that wants to embed the NexusDL CLI (a plugin, a
+    test harness, an integration script) should call.
 
-def _run() -> int:
-    """Run the CLI, translating every expected failure into an exit code.
+    Args:
+        argv: Optional argv (without the program name).  Defaults to
+            ``sys.argv[1:]``.  Accepting this as an argument makes the
+            dispatcher testable without spawning a subprocess.
 
     Returns:
-        The process exit code: :data:`_EXIT_SUCCESS` on success,
-        :data:`_EXIT_ERROR` on missing dependencies, :data:`_EXIT_INTERRUPTED`
-        on ``KeyboardInterrupt``, or whatever integer code the CLI itself
-        raised through ``SystemExit``.
+        The exit code to propagate.  ``0`` on success, ``130`` on Ctrl+C,
+        ``141`` on broken pipe, ``1`` on failure, or the exit code the
+        sub-interface passed to ``sys.exit``.
     """
-    try:
-        from nexusdl.interfaces.cli.cli_entry import main as _cli_main
-    except ImportError as exc:
-        _report_import_error(exc)
-        return _EXIT_ERROR
+    args = list(argv if argv is not None else sys.argv[1:])
 
     try:
-        _cli_main()
-        return _EXIT_SUCCESS
+        return _dispatch(args)
     except KeyboardInterrupt:
-        # A Ctrl+C during CLI startup (before the CLI installs its own
-        # handler) or during synchronous sub-commands surfaces here.
-        # Async sub-commands catch ``KeyboardInterrupt`` inside
-        # ``cli_entry.main`` before it can bubble up, so this branch only
-        # fires for the pre-CLI window and for sync commands — both of
-        # which are correctly exit-130 conditions.
-        return _EXIT_INTERRUPTED
+        # Unix convention: 128 + SIGINT(2) = 130.  Print a trailing
+        # newline because the terminal swallowed our last line.
+        sys.stderr.write("\n")
+        return 130
+    except BrokenPipeError:
+        # Shell convention: 128 + SIGPIPE(13) = 141.  Silent — the user
+        # piped into `head`, `grep -m1`, etc. and expects silence.
+        return 141
     except SystemExit as exc:
-        return _normalise_system_exit(exc)
+        # ``sys.exit(...)`` from a sub-interface.  Preserve the code
+        # exactly (int or string) and let the caller decide.
+        code = exc.code
+        if isinstance(code, int):
+            return code
+        if code is None:
+            return 0
+        sys.stderr.write(f"{code}\n")
+        return 1
 
 
-def _normalise_system_exit(exc: SystemExit) -> int:
-    """Extract a numeric exit code from *exc*.
+# ===========================================================================
+# Dispatcher internals
+# ===========================================================================
 
-    ``SystemExit`` accepts ``None`` (success), an ``int`` (the exit code
-    itself) or any other object (Python prints it to stderr and exits
-    with 1).  Typer and Click raise ``SystemExit`` with an ``int`` in
-    every documented case, but a plugin or a sub-command that calls
-    ``sys.exit("error message")`` produces the string form.  Both are
-    handled here so that the process always exits with a coherent code.
-    """
-    code = exc.code
-    if code is None:
-        return _EXIT_SUCCESS
-    if isinstance(code, int):
-        return code
-    # Non-int payload — Python's default handler would print it to stderr
-    # and exit 1.  Replicate that behaviour so a caller running us under
-    # ``subprocess`` sees the same output and exit code it would have
-    # seen without this wrapper.
-    sys.stderr.write(f"{code}\n")
-    return _EXIT_ERROR
+def _dispatch(args: list[str]) -> int:
+    """Route ``args`` to the correct interface and run it."""
+    # No arguments → default interface (CLI).
+    if not args:
+        return _run_interface(_DEFAULT_INTERFACE, rest=[], prog="nexusdl")
+
+    first = args[0]
+
+    # Top-level informational flags.
+    if first in ("--version", "-V", "version"):
+        return _print_version()
+
+    if first in ("--help", "-h", "help"):
+        return _print_help()
+
+    # Leading flag → CLI default (``nexusdl --foo`` is almost certainly
+    # a CLI global option, not an interface selector).
+    if first.startswith("-"):
+        return _run_interface(_DEFAULT_INTERFACE, rest=args, prog="nexusdl")
+
+    # Explicit interface selector.
+    if first in _RESERVED:
+        return _run_interface(first, rest=args[1:], prog=f"nexusdl {first}")
+
+    # Otherwise — a CLI subcommand.  Forward the whole argv so the CLI's
+    # Typer app re-parses it as if invoked directly.
+    return _run_interface(_DEFAULT_INTERFACE, rest=args, prog="nexusdl")
 
 
-def _report_import_error(exc: ImportError) -> None:
-    """Print a clear, actionable message when the CLI cannot be imported.
-
-    Two failure modes are distinguished:
-
-    * :class:`ModuleNotFoundError` — either the CLI module itself
-      (``nexusdl.interfaces.cli.cli_entry``) or one of its dependencies
-      (Typer, Rich, Textual) is not installed.  The fix is almost always
-      to reinstall with the ``[cli]`` extra; the message tells the
-      operator exactly which command to run.
-    * Plain :class:`ImportError` — the module exists but does not export
-      ``main``.  This is a **bug in the project**, not an installation
-      issue, and the message says so explicitly so that the operator
-      files an issue rather than trying to install something that is
-      already there.
-    """
-    if isinstance(exc, ModuleNotFoundError):
-        sys.stderr.write(
-            "NexusDL could not start: the CLI dependencies are missing.\n"
-            f"\nUnderlying error: {exc}\n"
-            "\nInstall them with one of:\n"
-            "    pip install 'nexusdl[cli]'\n"
-            "    pip install -e '.[cli]'\n"
-            "\nIf you installed NexusDL from a wheel, the `[cli]` extra "
-            "must be\n"
-            "requested explicitly.  Headless deployments that only use "
-            "the web\n"
-            "interface can install `[web]` instead.\n"
+def _run_interface(
+    name: str, *, rest: list[str], prog: str
+) -> int:
+    """Run the interface registered under ``name`` with ``rest`` as argv."""
+    dotted = _DISPATCH.get(name)
+    if dotted is None:
+        # Programmer error — the dispatch table and _RESERVED went out of
+        # sync.  This should never happen at runtime.
+        raise RuntimeError(
+            f"internal error: no dispatch entry for interface {name!r}"
         )
-        return
 
+    if name == "web":
+        _apply_web_flag_env(rest)
+    return _run_module(dotted, argv=rest, prog=prog)
+
+
+def _run_module(dotted: str, *, argv: list[str], prog: str) -> int:
+    """Run ``dotted`` as ``__main__`` with a controlled ``sys.argv``.
+
+    Uses :func:`runpy.run_module` so the sub-interface sees a clean
+    ``__name__ == "__main__"`` — the same environment it would see under
+    ``python -m <dotted>``.  Restores the original ``sys.argv`` on exit
+    so callers can chain dispatches in tests.
+
+    Args:
+        dotted: Dotted module path to run as ``__main__``.
+        argv: Arguments presented to the sub-interface (without the
+            program name; this function synthesizes ``sys.argv[0]``).
+        prog: Friendly name placed in ``sys.argv[0]`` so that help and
+            error output from the sub-interface read ``nexusdl web ...``
+            rather than ``/usr/bin/python``.
+
+    Returns:
+        ``0`` on success, or the exit code the sub-interface raised
+        through :class:`SystemExit`.
+    """
+    old_argv = sys.argv
+    sys.argv = [prog, *argv]
+    try:
+        runpy.run_module(dotted, run_name="__main__", alter_sys=False)
+        return 0
+    except ImportError as exc:
+        return _report_missing_extra(dotted, exc)
+    finally:
+        # ``finally`` guarantees restoration even on SystemExit /
+        # KeyboardInterrupt — no leaked global state across dispatches.
+        sys.argv = old_argv
+
+
+def _apply_web_flag_env(args: list[str]) -> None:
+    """Translate a small subset of uvicorn-style flags into env vars.
+
+    Only the flags in :data:`_WEB_FLAG_TO_ENV` are translated.  The two
+    flags in :data:`_WEB_UNSUPPORTED_FLAGS` (``--reload`` and
+    ``--workers``) are silently consumed and produce a hint pointing at
+    the correct uvicorn invocation, since supporting them would require
+    the ``--factory`` form (see the module docstring).
+
+    Other flags fall through untouched — the current web launcher reads
+    from ``Settings``, so they are effectively ignored, which is the same
+    behaviour as before this dispatcher existed.
+    """
+    i = 0
+    unsupported: list[str] = []
+    while i < len(args):
+        flag = args[i]
+        target_env = _WEB_FLAG_TO_ENV.get(flag)
+        if target_env is not None and i + 1 < len(args):
+            os.environ[target_env] = args[i + 1]
+            i += 2
+            continue
+        if flag in _WEB_UNSUPPORTED_FLAGS:
+            unsupported.append(flag)
+        i += 1
+
+    if unsupported:
+        sys.stderr.write(
+            f"nexusdl web: flag(s) {', '.join(unsupported)} are not supported "
+            f"by this launcher.\n"
+            f"Use uvicorn directly instead:\n"
+            f"    uvicorn nexusdl.interfaces.web:create_app_from_env "
+            f"--factory {' '.join(unsupported)} <other-flags>\n"
+        )
+
+
+# ===========================================================================
+# --version / --help
+# ===========================================================================
+
+def _print_version() -> int:
+    """Print ``nexusdl <version>`` and return 0."""
+    print(f"nexusdl {_version_string()}")
+    return 0
+
+
+def _version_string() -> str:
+    """Return the package version, or a safe fallback.
+
+    Imports :mod:`nexusdl.version` lazily — a trivial module, but keeping
+    the import local means ``import nexusdl.__main__`` costs nothing.
+    """
+    try:
+        from nexusdl.version import __version__ as v
+    except Exception:
+        return "0.0.0+unknown"
+    return str(v)
+
+
+def _print_help() -> int:
+    """Print the top-level help text and return 0."""
+    version = _version_string()
+    text = f"""NexusDL {version} — multi-site manga download platform.
+
+Usage:
+    nexusdl                   Start the CLI (interactive commands).
+    nexusdl <command> ...     Run a CLI subcommand (search, download, …).
+    nexusdl cli <command>...  Same as above; explicit escape hatch for
+                              subcommand names that collide with an
+                              interface name.
+    nexusdl tui               Launch the Textual TUI.
+    nexusdl gui               Launch the desktop GUI (requires the `gui`
+                              extra and a display server).
+    nexusdl web [flags...]    Start the FastAPI backend + WebSocket server
+                              (single worker).
+
+Global options:
+    -h, --help, help          Show this help text and exit.
+    -V, --version, version    Show the version and exit.
+
+Web flags:
+    --host <addr>             Bind address (default: 0.0.0.0).
+    --port <n>                Bind port (default: 8000).
+
+For multi-worker production deployments, use uvicorn directly:
+
+    uvicorn nexusdl.interfaces.web:create_app_from_env \\
+        --factory --workers 4 --host 0.0.0.0 --port 8000
+
+Environment variables:
+    NEXUSDL_API_HOST, NEXUSDL_API_PORT   Equivalent to the flags above.
+    NEXUSDL_FRONTEND_URL                 CORS-allowed frontend origin.
+    NEXUSDL_LOG_LEVEL                    loguru level (trace…critical).
+
+Extras:
+    pip install 'nexusdl[cli]'   Typer CLI + Textual TUI.
+    pip install 'nexusdl[gui]'   CustomTkinter desktop GUI.
+    pip install 'nexusdl[web]'   FastAPI backend + uvicorn + python-jose.
+
+Documentation:
+    https://github.com/Voldigoad-Holdings/nexus-dl
+"""
+    print(text)
+    return 0
+
+
+# ===========================================================================
+# Error reporting
+# ===========================================================================
+
+def _report_missing_extra(dotted: str, exc: ImportError) -> int:
+    """Print a clean hint when an interface extra is not installed."""
+    extra = _extra_for(dotted)
     sys.stderr.write(
-        "NexusDL could not start: the CLI entry point is missing.\n"
-        f"\nUnderlying error: {exc}\n"
-        "\nThis is a bug in the installed NexusDL package, not a "
-        "configuration\n"
-        "issue.  Expected a `main` callable in "
-        "`nexusdl.interfaces.cli.cli_entry`.\n"
-        "Please report this at "
-        "https://github.com/Voldigoad-Holdings/nexus-dl/issues.\n"
+        f"\nnexusdl: cannot start {dotted!r}: {exc}\n"
+        f"Hint: install the matching extras with:\n"
+        f"    pip install 'nexusdl[{extra}]'\n"
     )
+    return 1
 
+
+def _extra_for(dotted: str) -> str:
+    """Map a dispatch module path to the pip extra that installs it."""
+    if dotted.startswith("nexusdl.interfaces.gui"):
+        return "gui"
+    if dotted.startswith("nexusdl.interfaces.web"):
+        return "web"
+    if dotted.startswith("nexusdl.interfaces.cli"):
+        return "cli"
+    return "all"
+
+
+# ===========================================================================
+# Module entrypoint
+# ===========================================================================
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

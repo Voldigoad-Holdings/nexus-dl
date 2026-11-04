@@ -20,8 +20,12 @@ is:
     - run from a source checkout
     - zipped as an egg
 
-The package has **no side effects at import** (no I/O, no logging).
-Files are read lazily on demand and cached with :func:`functools.lru_cache`.
+The package has **no side effects at import** (no I/O, no logging, no
+optional-dependency imports). Files are read lazily on demand and cached
+with :func:`functools.lru_cache`. The one optional dependency,
+PyYAML, is imported **inside** :func:`read_yaml` — so a caller that only
+needs :func:`read_text`, :func:`read_json`, or :func:`read_bytes` does
+not require PyYAML to be installed.
 
 Example:
     >>> from nexusdl import data
@@ -34,10 +38,9 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 # ════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -55,7 +58,7 @@ _ENCODING: str = "utf-8"
 # ════════════════════════════════════════════════════════════════════
 
 
-def _resource_traversable(filename: str) -> Any:
+def _resource_traversable(filename: str) -> Traversable:
     """Return a Traversable for a data file (wheel-aware).
 
     Args:
@@ -63,7 +66,8 @@ def _resource_traversable(filename: str) -> Any:
             ``"sites.yaml"``).
 
     Returns:
-        A ``Traversable`` object that can be opened with ``.open()``.
+        A :class:`Traversable` object that can be opened with
+        ``.read_text()``, ``.read_bytes()``, or ``.open()``.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -97,14 +101,36 @@ def resource_path(filename: str) -> Path:
         The absolute path to the file on disk.
 
     Raises:
-        FileNotFoundError: If the file does not exist.
+        FileNotFoundError: If the file does not exist, **or** if the
+            package was loaded from a non-filesystem source (a zipped
+            wheel) so no real filesystem path exists.
 
     Note:
         This function returns a real filesystem path. For reading the
         file content, prefer :func:`read_text`, :func:`read_json`, or
         :func:`read_yaml`, which work even in zipped environments.
     """
-    return Path(str(_resource_traversable(filename))).resolve()
+    traversable = _resource_traversable(filename)
+
+    # The common case: importlib.resources returned a real Path (wheel
+    # installed to disk, source checkout, editable install). Just
+    # resolve it.
+    if isinstance(traversable, Path):
+        return traversable.resolve()
+
+    # Rare case: importlib.resources returned a Traversable from a
+    # non-filesystem source (zipped wheel). Try to materialise a path;
+    # if that fails, raise a clear error rather than returning a bogus
+    # path that resolves relative to the caller's CWD.
+    candidate = Path(str(traversable))
+    if candidate.is_file():
+        return candidate.resolve()
+
+    raise FileNotFoundError(
+        f"{filename!r} is loaded from a non-filesystem source "
+        f"(zipped wheel) — no real filesystem path is available. "
+        f"Use read_text()/read_bytes()/read_json()/read_yaml() instead."
+    )
 
 
 @lru_cache(maxsize=32)
@@ -125,11 +151,7 @@ def read_text(filename: str) -> str:
         >>> template = read_text("comic_info_template.xml")
         >>> assert template.startswith("<?xml")
     """
-    traversable = _resource_traversable(filename)
-    if isinstance(traversable, Path):
-        return traversable.read_text(encoding=_ENCODING)
-    # Traversable from importlib.resources (wheel, zip)
-    return traversable.read_text(encoding=_ENCODING)
+    return _resource_traversable(filename).read_text(encoding=_ENCODING)
 
 
 @lru_cache(maxsize=32)
@@ -145,6 +167,13 @@ def read_json(filename: str) -> Any:
     Raises:
         FileNotFoundError: If the file does not exist.
         json.JSONDecodeError: If the file is not valid JSON.
+
+    Note:
+        The returned object is **shared**: subsequent calls with the
+        same ``filename`` return the *same* Python object (thanks to
+        :func:`functools.lru_cache`). Do not mutate it — callers that
+        need a private copy should ``copy.deepcopy`` the result, or
+        call :func:`clear_cache` first.
 
     Example:
         >>> schema = read_json("sites_schema.json")
@@ -165,12 +194,28 @@ def read_yaml(filename: str) -> Any:
 
     Raises:
         FileNotFoundError: If the file does not exist.
+        ImportError: If PyYAML is not installed. PyYAML is imported
+            lazily so that callers who only use :func:`read_text`,
+            :func:`read_json`, or :func:`read_bytes` do not need it.
         yaml.YAMLError: If the file is not valid YAML.
+
+    Note:
+        The returned object is **shared**: subsequent calls with the
+        same ``filename`` return the *same* Python object (thanks to
+        :func:`functools.lru_cache`). Do not mutate it — callers that
+        need a private copy should ``copy.deepcopy`` the result, or
+        call :func:`clear_cache` first.
 
     Example:
         >>> sites = read_yaml("sites.yaml")
         >>> assert "sites" in sites
     """
+    # Lazy import: nexusdl.data must remain importable (and usable for
+    # read_text/read_json/read_bytes) in environments where PyYAML is
+    # not installed — e.g. a CLI deployment that only renders the
+    # ComicInfo template and never touches sites.yaml.
+    import yaml  # noqa: PLC0415
+
     return yaml.safe_load(read_text(filename))
 
 
@@ -191,10 +236,7 @@ def read_bytes(filename: str) -> bytes:
         >>> raw = read_bytes("comic_info_template.xml")
         >>> assert raw.startswith(b"<?xml")
     """
-    traversable = _resource_traversable(filename)
-    if isinstance(traversable, Path):
-        return traversable.read_bytes()
-    return traversable.read_bytes()
+    return _resource_traversable(filename).read_bytes()
 
 
 def clear_cache() -> None:

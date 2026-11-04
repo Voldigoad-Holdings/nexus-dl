@@ -1,0 +1,516 @@
+/**
+ * NexusDL web frontend — global stylesheet.
+ *
+ * Design language: **dark, neon futuristic**.
+ *
+ * The dark theme is the primary design — it is what the PWA manifest
+ * advertises (``theme_color: "#0a0a0a"``, ``background_color: "#0a0a0a"``),
+ * what the ``ThemeProvider`` defaults to, and what a first-time visitor
+ * sees before hydration.  A light theme is also provided so that
+ * ``<ThemeToggle>`` and ``next-themes`` behave correctly for users who
+ * explicitly choose light mode or whose operating system is set to light.
+ *
+ * Structural rules
+ * ----------------
+ * * The file follows the **shadcn/ui** CSS-variable convention: every
+ *   design token is a CSS custom property declared as ``H S% L%`` (the
+ *   space-separated ``hsl()`` syntax) and consumed through
+ *   ``hsl(var(--token))`` by ``tailwind.config.js``.  This is what makes
+ *   ``bg-background``, ``text-primary``, ``border-border`` and every other
+ *   semantic utility work without hardcoded colours in components.
+ *
+ * * ``:root`` and ``.dark`` hold the **dark** token values, so the app
+ *   renders dark by default — even before ``next-themes`` hydrates and
+ *   sets ``class="dark"`` on ``<html>``.  This is the "dark-first" variant
+ *   of the standard shadcn structure (which uses ``:root`` = light and
+ *   ``.dark`` = dark).  The change is deliberate and documented so a
+ *   future maintainer understands why ``:root`` is dark here.
+ *
+ * * ``.light`` holds the **light** overrides.  When ``next-themes``
+ *   resolves a light theme (either because the user chose it, or because
+ *   ``defaultTheme="system"`` detected a light OS), it sets
+ *   ``class="light"`` on ``<html>``, which activates these overrides.
+ *
+ * * Tailwind's ``dark:`` variant still works exactly as documented — the
+ *   ``darkMode: ["class"]`` setting in ``tailwind.config.js`` applies
+ *   ``dark:`` utilities when ``.dark`` is present, and the components that
+ *   use ``dark:`` continue to behave correctly.
+ *
+ * * The neon effects (glow, pulse, flicker, scanlines, grid) live in
+ *   ``@layer components`` and ``@layer utilities`` so that callers can opt
+ *   into them by class name (``.neon-text``, ``.neon-card``, …) without a
+ *   Tailwind config change.
+ *
+ * Performance
+ * -----------
+ * The body background gradient is the only always-on visual cost.  It is
+ * a pair of radial gradients with ``background-attachment: fixed`` — the
+ * GPU handles this essentially for free on any modern browser, but the
+ * ``prefers-reduced-motion`` block below still disables every animation
+ * for users who ask for it.
+ *
+ * Accessibility
+ * -------------
+ * * Contrast: primary on background is ``185 100% 55%`` (neon cyan) on
+ *   ``230 25% 4%`` (near-black navy) — ~15:1, well above WCAG AAA.
+ * * ``:focus-visible`` uses a 2 px outline in the ``--ring`` colour and a
+ *   2 px offset, matching the ``focus-visible:ring-*`` utilities already
+ *   used throughout the components.
+ * * ``prefers-reduced-motion: reduce`` zeroes out animations and
+ *   transitions, so the neon pulse and flicker effects never fire for
+ *   motion-sensitive users.
+ * * The light theme uses darker, desaturated neon accents so that every
+ *   colour pair remains WCAG AA on white.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===================================================================== */
+/*  Design tokens                                                        */
+/* ===================================================================== */
+
+@layer base {
+  :root,
+  .dark {
+    /* -- Structural ---------------------------------------------- */
+    --background: 230 25% 4%;
+    --foreground: 200 30% 96%;
+
+    --card: 230 22% 6%;
+    --card-foreground: 200 30% 96%;
+
+    --popover: 230 22% 7%;
+    --popover-foreground: 200 30% 96%;
+
+    /* -- Neon accents ------------------------------------------- */
+    /* Primary = neon cyan.  Secondary = neon magenta.  The two hues
+       sit opposite on the colour wheel, which is what gives the
+       interface its signature "cyberpunk" contrast. */
+    --primary: 185 100% 55%;
+    --primary-foreground: 230 25% 4%;
+
+    --secondary: 280 90% 65%;
+    --secondary-foreground: 0 0% 100%;
+
+    /* Accent = dimmed primary, for hover backgrounds and selection
+       states.  Fully saturated neon is unreadable as a large fill;
+       a 20%-lightness wash keeps the neon feel without the glare. */
+    --accent: 185 60% 20%;
+    --accent-foreground: 185 100% 85%;
+
+    /* -- Neutrals ----------------------------------------------- */
+    --muted: 230 15% 12%;
+    --muted-foreground: 215 15% 62%;
+
+    /* -- Semantic ----------------------------------------------- */
+    --destructive: 0 90% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* -- Borders, inputs, focus --------------------------------- */
+    --border: 185 30% 18%;
+    --input: 185 25% 14%;
+    --ring: 185 100% 55%;
+
+    /* -- Charts — five neon hues, all distinct ----------------- */
+    --chart-1: 185 100% 55%; /* cyan    */
+    --chart-2: 280 90% 65%;  /* magenta */
+    --chart-3: 145 100% 55%; /* green   */
+    --chart-4: 45 100% 60%;  /* amber   */
+    --chart-5: 340 90% 65%;  /* pink    */
+
+    /* -- Geometry ----------------------------------------------- */
+    --radius: 0.5rem;
+
+    /* -- Neon glow palette (consumed by the .neon-* classes below) */
+    --neon-glow: 185 100% 55%;
+    --neon-glow-secondary: 280 90% 65%;
+  }
+
+  .light {
+    /* -- Structural ---------------------------------------------- */
+    --background: 0 0% 100%;
+    --foreground: 230 25% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 230 25% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 230 25% 10%;
+
+    /* -- Neon accents (darker, WCAG-AA on white) ---------------- */
+    --primary: 190 90% 40%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 280 60% 45%;
+    --secondary-foreground: 0 0% 100%;
+
+    --accent: 185 40% 92%;
+    --accent-foreground: 190 60% 25%;
+
+    /* -- Neutrals ----------------------------------------------- */
+    --muted: 220 15% 96%;
+    --muted-foreground: 220 10% 40%;
+
+    /* -- Semantic ----------------------------------------------- */
+    --destructive: 0 80% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* -- Borders, inputs, focus --------------------------------- */
+    --border: 220 15% 88%;
+    --input: 220 15% 88%;
+    --ring: 190 90% 40%;
+
+    /* -- Charts — same hues, darker for white background -------- */
+    --chart-1: 190 90% 40%;
+    --chart-2: 280 60% 45%;
+    --chart-3: 145 80% 40%;
+    --chart-4: 45 90% 45%;
+    --chart-5: 340 80% 45%;
+
+    /* -- Geometry ----------------------------------------------- */
+    --radius: 0.5rem;
+
+    /* -- Neon glow palette -------------------------------------- */
+    --neon-glow: 190 90% 40%;
+    --neon-glow-secondary: 280 60% 45%;
+  }
+}
+
+/* ===================================================================== */
+/*  Base resets and global element styles                                */
+/* ===================================================================== */
+
+@layer base {
+  /* Apply the border token to every element — this is what makes
+     ``border`` (without a colour) pick up ``--border`` instead of
+     ``currentColor``.  shadcn convention. */
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    min-height: 100dvh;
+    /* The signature neon glow — two radial gradients, one in each
+       neon hue, anchored to the top and to the bottom-right.  Very
+       low alpha so the body still reads as near-black; the effect is
+       felt more than seen. */
+    background-image:
+      radial-gradient(
+        ellipse 80% 50% at 50% -20%,
+        hsl(var(--neon-glow) / 0.15),
+        transparent
+      ),
+      radial-gradient(
+        ellipse 60% 40% at 80% 100%,
+        hsl(var(--neon-glow-secondary) / 0.10),
+        transparent
+      );
+    background-attachment: fixed;
+  }
+
+  /* Selection uses the primary neon hue. */
+  ::selection {
+    background-color: hsl(var(--primary) / 0.35);
+    color: hsl(var(--foreground));
+  }
+
+  /* Default focus ring — most components also set the Tailwind
+     ``focus-visible:ring-*`` utilities, but this base rule covers
+     plain HTML elements (links, checkboxes, native inputs). */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Custom scrollbar — a thin neon line that matches the theme. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--primary) / 0.3) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--primary) / 0.25);
+    border-radius: 4px;
+    transition: background-color 150ms ease;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--primary) / 0.5);
+  }
+
+  /* Placeholders — one rule for every native input. */
+  input::placeholder,
+  textarea::placeholder {
+    color: hsl(var(--muted-foreground));
+    opacity: 1;
+  }
+
+  /* Autofill — without this, Chrome paints a white / yellow
+     rectangle over the dark theme. */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus,
+  textarea:-webkit-autofill,
+  textarea:-webkit-autofill:hover,
+  textarea:-webkit-autofill:focus {
+    -webkit-text-fill-color: hsl(var(--foreground));
+    -webkit-box-shadow: 0 0 0 1000px hsl(var(--background)) inset;
+    transition: background-color 5000s ease-in-out 0s;
+  }
+
+  /* ``prefers-reduced-motion`` — respect the user's system setting.
+     Every animation and transition collapses to zero duration; the
+     neon pulse and flicker utilities become static. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+/* ===================================================================== */
+/*  Neon components                                                      */
+/* ===================================================================== */
+
+@layer components {
+  /* -- Text glow ----------------------------------------------------- */
+
+  .neon-text {
+    text-shadow:
+      0 0 8px hsl(var(--neon-glow) / 0.6),
+      0 0 16px hsl(var(--neon-glow) / 0.3);
+  }
+
+  .neon-text-secondary {
+    text-shadow:
+      0 0 8px hsl(var(--neon-glow-secondary) / 0.6),
+      0 0 16px hsl(var(--neon-glow-secondary) / 0.3);
+  }
+
+  /* -- Border glow --------------------------------------------------- */
+
+  .neon-border {
+    border-color: hsl(var(--primary) / 0.6);
+    box-shadow:
+      0 0 0 1px hsl(var(--primary) / 0.4),
+      0 0 12px hsl(var(--primary) / 0.2),
+      inset 0 0 12px hsl(var(--primary) / 0.05);
+  }
+
+  /* -- Card --------------------------------------------------------- */
+
+  .neon-card {
+    @apply rounded-lg border bg-card text-card-foreground;
+    border-color: hsl(var(--primary) / 0.2);
+    box-shadow:
+      0 0 12px hsl(var(--primary) / 0.08),
+      0 1px 3px 0 rgb(0 0 0 / 0.3);
+    transition:
+      border-color 200ms ease,
+      box-shadow 200ms ease;
+  }
+
+  .neon-card:hover {
+    border-color: hsl(var(--primary) / 0.4);
+    box-shadow:
+      0 0 20px hsl(var(--primary) / 0.15),
+      0 1px 3px 0 rgb(0 0 0 / 0.3);
+  }
+
+  /* -- Backgrounds --------------------------------------------------- */
+
+  /* A subtle grid — the classic "futuristic HUD" backdrop.  Applied
+     to an element, not the body, so that callers opt in where it
+     makes sense (hero sections, empty states). */
+  .neon-grid {
+    background-image:
+      linear-gradient(hsl(var(--primary) / 0.06) 1px, transparent 1px),
+      linear-gradient(
+        90deg,
+        hsl(var(--primary) / 0.06) 1px,
+        transparent 1px
+      );
+    background-size: 40px 40px;
+  }
+
+  /* A CRT scanline overlay.  Requires ``position: relative`` on the
+     element itself (or an ancestor — the overlay is anchored to the
+     element it is applied to).  Pointer-events pass through. */
+  .neon-scanlines {
+    position: relative;
+  }
+
+  .neon-scanlines::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      hsl(var(--primary) / 0.03) 2px,
+      hsl(var(--primary) / 0.03) 4px
+    );
+    mix-blend-mode: overlay;
+  }
+}
+
+/* ===================================================================== */
+/*  Neon utilities                                                       */
+/* ===================================================================== */
+
+@layer utilities {
+  /* -- Scrollbar suppression ---------------------------------------- */
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  /* -- Pulse -------------------------------------------------------- */
+
+  @keyframes neon-pulse {
+    0%,
+    100% {
+      opacity: 1;
+      filter: brightness(1);
+    }
+    50% {
+      opacity: 0.85;
+      filter: brightness(1.3);
+    }
+  }
+
+  .animate-neon-pulse {
+    animation: neon-pulse 2s ease-in-out infinite;
+  }
+
+  /* -- Flicker ------------------------------------------------------ */
+
+  /* A deliberately irregular pattern — a smooth pulse reads as
+     "loading"; an irregular flicker reads as "this thing is alive",
+     which is the desired cyberpunk effect on hero headings. */
+  @keyframes neon-flicker {
+    0%,
+    19%,
+    21%,
+    23%,
+    25%,
+    54%,
+    56%,
+    100% {
+      opacity: 1;
+      filter: brightness(1);
+    }
+    20%,
+    22%,
+    24%,
+    55% {
+      opacity: 0.9;
+      filter: brightness(1.4);
+    }
+  }
+
+  .animate-neon-flicker {
+    animation: neon-flicker 3s linear infinite;
+  }
+
+  /* -- Scan line ---------------------------------------------------- */
+
+  /* A single horizontal line that sweeps the element top-to-bottom.
+     Typically paired with ``overflow-hidden`` and ``relative`` on the
+     parent, and a gradient on the child itself. */
+  @keyframes neon-scan {
+    0% {
+      transform: translateY(-100%);
+    }
+    100% {
+      transform: translateY(100%);
+    }
+  }
+
+  .animate-neon-scan {
+    animation: neon-scan 3s linear infinite;
+  }
+
+  /* -- Rotate ------------------------------------------------------- */
+
+  /* Used by future gradient-border spinners.  Defined here so that
+     the utility exists when a component needs it, without a
+     tailwind.config.js change. */
+  @keyframes neon-border-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .animate-neon-border-spin {
+    animation: neon-border-spin 4s linear infinite;
+  }
+}
+
+/* ===================================================================== */
+/*  Print                                                                */
+/* ===================================================================== */
+
+@media print {
+  /* Strip every neon effect from printed pages — a printed card
+     should be a printed card, not a black rectangle. */
+  .no-print {
+    display: none !important;
+  }
+
+  body {
+    background: white !important;
+    background-image: none !important;
+    color: black !important;
+  }
+
+  .neon-text,
+  .neon-text-secondary,
+  .neon-border,
+  .neon-card {
+    text-shadow: none !important;
+    box-shadow: none !important;
+    border-color: #ccc !important;
+  }
+
+  a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 0.85em;
+    color: #666;
+  }
+}

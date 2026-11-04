@@ -1,0 +1,174 @@
+# Configuration Dependabot pour NexusDL.
+#
+# Stratégie globale :
+#   - minor + patch → groupés en une PR par écosystème et par nature
+#     (runtime vs dev), pour ne pas noyer le reviewer sous 40 PRs
+#   - major → non groupés, une PR par dépendance, pour forcer la
+#     revue manuelle de chaque breaking change
+#   - les ignore ne couvrent QUE les migrations actuellement bloquées ;
+#     si une nouvelle major sort et qu'on n'a pas encore décidé, on la
+#     laissera apparaître en PR pour en discuter
+#
+# Docs : https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  # ── 1. Python (uv-managed) ────────────────────────────────────────
+  # Le projet utilise uv comme package manager (uv.lock à la racine).
+  # Dependabot supporte l'ecosystem "uv" depuis 2024 et met à jour
+  # uv.lock + pyproject.toml de façon cohérente.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 10
+
+    groups:
+      # Toutes les deps de production (core, web backend, GUI extras)
+      # en minor/patch → une seule PR par semaine.
+      python-runtime:
+        dependency-type: "production"
+        update-types: ["minor", "patch"]
+      # Toutes les deps de dev (pytest, ruff, mypy, pre-commit, tox,
+      # types-*, respx, hypothesis, pip-audit…) en minor/patch → une
+      # seule PR par semaine.
+      python-dev:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+
+    labels:
+      - "dependencies"
+      - "python"
+
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+
+    ignore:
+      # ── Migrations bloquées (réévaluer tous les 6 mois) ───────────
+      # pydantic v3 : migration majeure (v2 est requis par le PROMPT
+      # MASTER §"Stack technique"). Aucun plan de migration actif.
+      - dependency-name: "pydantic"
+        versions: [">=3.0.0"]
+      # pydantic-settings v3 suit pydantic v3.
+      - dependency-name: "pydantic-settings"
+        versions: [">=3.0.0"]
+      # sqlalchemy v3 : migration majeure (v2 est la cible actuelle).
+      - dependency-name: "sqlalchemy"
+        versions: [">=3.0.0"]
+      # fastapi 1.0 : toujours en 0.x, 1.0 introduira des changements
+      # de contrat (Depends, lifespan, etc.) qui nécessitent une revue
+      # dédiée.
+      - dependency-name: "fastapi"
+        versions: [">=1.0.0"]
+      # playwright : les versions mineures peuvent introduire des
+      # changements de comportement des navigateurs ; chaque bump
+      # nécessite une passe de test manuel des parsers JS-rendered.
+      # Les patchs restent autorisés.
+      - dependency-name: "playwright"
+        versions: [">=1.50.0"]
+
+  # ── 2. GitHub Actions ─────────────────────────────────────────────
+  # workflows/{build,docker,lint,release,test}.yml — toutes les
+  # actions pinnées par SHA ou par tag majeur.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 5
+
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+    labels:
+      - "dependencies"
+      - "ci"
+
+    commit-message:
+      prefix: "ci(deps)"
+
+  # ── 3. Frontend (pnpm, Next.js 14 App Router) ─────────────────────
+  # package-ecosystem "npm" couvre npm / yarn / pnpm. Dependabot
+  # détecte pnpm-lock.yaml automatiquement.
+  - package-ecosystem: "npm"
+    directory: "/src/nexusdl/interfaces/web/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 10
+
+    groups:
+      # Deps de prod (next, react, tailwind, zustand, zod, @tanstack/*…)
+      frontend-runtime:
+        dependency-type: "production"
+        update-types: ["minor", "patch"]
+      # Deps de dev (typescript, eslint, prettier, @types/*, postcss…)
+      frontend-dev:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+
+    labels:
+      - "dependencies"
+      - "frontend"
+
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps-dev)"
+
+    ignore:
+      # ── Migrations bloquées (réévaluer tous les 6 mois) ───────────
+      # next 15 : App Router v15 a un nouveau modèle de caching et de
+      # dynamic routes. Le PROMPT MASTER cible Next.js 14 explicitement.
+      - dependency-name: "next"
+        versions: [">=15.0.0"]
+      # react 19 : nouvelle API concurrente + nouveaux hooks. Nécessite
+      # une migration Next.js d'abord (Next 14 supporte React 18).
+      - dependency-name: "react"
+        versions: [">=19.0.0"]
+      - dependency-name: "react-dom"
+        versions: [">=19.0.0"]
+      - dependency-name: "@types/react"
+        versions: [">=19.0.0"]
+      - dependency-name: "@types/react-dom"
+        versions: [">=19.0.0"]
+      # tailwind 4 : refonte complète du moteur CSS + config CSS-first.
+      # Le projet cible Tailwind 3 (PROMPT MASTER §"Stack technique").
+      - dependency-name: "tailwindcss"
+        versions: [">=4.0.0"]
+      # eslint 9 : flat config obligatoire + suppression de .eslintrc.
+      # Le projet utilise .eslintrc.json ; la migration est planifiée
+      # mais pas encore en cours.
+      - dependency-name: "eslint"
+        versions: [">=9.0.0"]
+
+  # ── 4. Docker (base images) ───────────────────────────────────────
+  # docker/Dockerfile.{base,gui,web} + docker-compose.{yml,dev.yml}.
+  # Pas de grouping : chaque base-image bump (python:3.12-slim,
+  # node:20-alpine, caddy:2, nginx:1.27) doit être testé manuellement
+  # (build multi-stage, compatibilité des dépendances natives).
+  - package-ecosystem: "docker"
+    directory: "/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 5
+
+    labels:
+      - "dependencies"
+      - "docker"
+
+    commit-message:
+      prefix: "chore(docker)"

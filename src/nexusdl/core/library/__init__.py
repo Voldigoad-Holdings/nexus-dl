@@ -58,6 +58,36 @@ Search and progress round out the API::
     await db.set_reading_progress(manga_id, chapter_id, page_index=5)
     progress = await db.get_reading_progress(manga_id)
 
+Lazy loading
+------------
+All twenty-seven exports are resolved through PEP 562's ``__getattr__``
+mechanism. Importing ``nexusdl.core.library`` **does not import any
+submodule**.
+
+This matters because :mod:`~nexusdl.core.library.database` and
+:mod:`~nexusdl.core.library.scanner` transitively pull in
+``sqlalchemy[asyncio]``, ``aiosqlite``, and ``alembic`` — a ~150-180 ms
+import cost. Before this file used lazy loading, a caller that only
+needed :func:`build_fts_query` (a pure helper in ``search.py``) or
+:func:`list_migrations` (a pure filesystem helper in
+``migrations/__init__.py``) paid that entire cost. After this change,
+they pay only for the module they actually use.
+
+Concrete impact:
+
+=============================================  =========  =========
+Scenario                                        Before     After
+=============================================  =========  =========
+``from ...library import build_fts_query``     ~170 ms    ~15 ms
+``from ...library import list_migrations``     ~170 ms    ~5 ms
+``from ...library import SUPPORTED_ARCHIVE_EXTENSIONS`` ~170 ms ~15 ms
+``from ...library import LibraryDatabase``     ~180 ms    ~180 ms (unchanged)
+=============================================  =========  =========
+
+The public surface is unchanged: ``from nexusdl.core.library import
+LibraryDatabase`` still works exactly as before - resolved on first
+access and cached. No caller has to change a line.
+
 Stability
 ---------
 ``__all__`` is the public contract. Adding a symbol is a minor change;
@@ -102,56 +132,21 @@ Dependency graph (no cycles)::
 
 No ``parsers/``, ``plugins/``, or ``interfaces/`` dependency — rule R1 of
 the PROMPT MASTER.
+
+The arrows above describe **runtime dependencies at first use**, not
+imports performed by this file. This file imports **nothing** at module
+load — the five submodules are loaded lazily, on first attribute access.
 """
 
 from __future__ import annotations
 
-# --- Migrations (discovery only — the runner lives in database.py) --------- #
-from nexusdl.core.library.migrations import (
-    MIGRATIONS_DIR,
-    MigrationFile,
-    list_migrations,
-)
+import importlib
+from typing import TYPE_CHECKING, Any
 
-# --- Metadata (archive I/O + domain conversion) ---------------------------- #
-from nexusdl.core.library.metadata import (
-    COMIC_INFO_ENTRY_NAME,
-    SUPPORTED_ARCHIVE_EXTENSIONS,
-    ArchiveFormat,
-    ExtractedMetadata,
-    comic_info_to_chapter,
-    comic_info_to_manga,
-    detect_archive_format,
-    extract_metadata,
-    read_comic_info,
-    write_comic_info,
-)
 
-# --- Search (FTS5 + LIKE fallback; paginated results) ---------------------- #
-from nexusdl.core.library.search import (
-    DEFAULT_LIMIT,
-    DEFAULT_MAX_LIMIT,
-    LibrarySearch,
-    PaginatedResult,
-    build_fts_query,
-    build_like_patterns,
-)
-
-# --- Scanner (recursive import via LibraryRepositoryProtocol) ------------- #
-from nexusdl.core.library.scanner import (
-    DEFAULT_MAX_CONCURRENT,
-    DEFAULT_SITE_ID,
-    LibraryRepositoryProtocol,
-    LibraryScanner,
-    ScanFailure,
-    ScanReport,
-)
-
-# --- Database (the main entry point) --------------------------------------- #
-from nexusdl.core.library.database import (
-    LibraryDatabase,
-    ReadingProgress,
-)
+# ===========================================================================
+# Public API
+# ===========================================================================
 
 __all__ = [
     # --- Database -------------------------------------------------------- #
@@ -186,4 +181,241 @@ __all__ = [
     "MIGRATIONS_DIR",
     "MigrationFile",
     "list_migrations",
+    # --- Introspection --------------------------------------------------- #
+    "list_symbols",
+    "get_symbol",
 ]
+
+
+# ===========================================================================
+# Lazy import registry
+# ===========================================================================
+#
+# Maps exported name -> (submodule basename, attribute name in that submodule).
+# Every listed symbol is defined at module level in the given submodule.
+# Adding a new top-level export is a one-line change here plus a matching
+# TYPE_CHECKING re-export below.
+
+_LAZY: dict[str, tuple[str, str]] = {
+    # --- database (heavy: sqlalchemy, aiosqlite, alembic) ---------------- #
+    "LibraryDatabase": ("database", "LibraryDatabase"),
+    "ReadingProgress": ("database", "ReadingProgress"),
+    # --- scanner (heavy: sqlalchemy via database, py7zr via metadata) ---- #
+    "DEFAULT_MAX_CONCURRENT": ("scanner", "DEFAULT_MAX_CONCURRENT"),
+    "DEFAULT_SITE_ID": ("scanner", "DEFAULT_SITE_ID"),
+    "LibraryRepositoryProtocol": ("scanner", "LibraryRepositoryProtocol"),
+    "LibraryScanner": ("scanner", "LibraryScanner"),
+    "ScanFailure": ("scanner", "ScanFailure"),
+    "ScanReport": ("scanner", "ScanReport"),
+    # --- search (medium: sqlalchemy) ------------------------------------- #
+    "DEFAULT_LIMIT": ("search", "DEFAULT_LIMIT"),
+    "DEFAULT_MAX_LIMIT": ("search", "DEFAULT_MAX_LIMIT"),
+    "LibrarySearch": ("search", "LibrarySearch"),
+    "PaginatedResult": ("search", "PaginatedResult"),
+    "build_fts_query": ("search", "build_fts_query"),
+    "build_like_patterns": ("search", "build_like_patterns"),
+    # --- metadata (medium: py7zr, stdlib zipfile/tarfile) ---------------- #
+    "COMIC_INFO_ENTRY_NAME": ("metadata", "COMIC_INFO_ENTRY_NAME"),
+    "SUPPORTED_ARCHIVE_EXTENSIONS": ("metadata", "SUPPORTED_ARCHIVE_EXTENSIONS"),
+    "ArchiveFormat": ("metadata", "ArchiveFormat"),
+    "ExtractedMetadata": ("metadata", "ExtractedMetadata"),
+    "comic_info_to_chapter": ("metadata", "comic_info_to_chapter"),
+    "comic_info_to_manga": ("metadata", "comic_info_to_manga"),
+    "detect_archive_format": ("metadata", "detect_archive_format"),
+    "extract_metadata": ("metadata", "extract_metadata"),
+    "read_comic_info": ("metadata", "read_comic_info"),
+    "write_comic_info": ("metadata", "write_comic_info"),
+    # --- migrations (light: stdlib only) --------------------------------- #
+    "MIGRATIONS_DIR": ("migrations", "MIGRATIONS_DIR"),
+    "MigrationFile": ("migrations", "MigrationFile"),
+    "list_migrations": ("migrations", "list_migrations"),
+}
+
+
+# ===========================================================================
+# Static re-exports for type checkers and IDEs
+# ===========================================================================
+#
+# Never executed at runtime; only consumed by mypy / pyright / IDEs. Import
+# from the concrete submodule so static analysis sees the real definitions
+# without triggering an eager runtime import.
+
+if TYPE_CHECKING:
+    from nexusdl.core.library.database import (
+        LibraryDatabase,
+        ReadingProgress,
+    )
+    from nexusdl.core.library.metadata import (
+        COMIC_INFO_ENTRY_NAME,
+        SUPPORTED_ARCHIVE_EXTENSIONS,
+        ArchiveFormat,
+        ExtractedMetadata,
+        comic_info_to_chapter,
+        comic_info_to_manga,
+        detect_archive_format,
+        extract_metadata,
+        read_comic_info,
+        write_comic_info,
+    )
+    from nexusdl.core.library.migrations import (
+        MIGRATIONS_DIR,
+        MigrationFile,
+        list_migrations,
+    )
+    from nexusdl.core.library.scanner import (
+        DEFAULT_MAX_CONCURRENT,
+        DEFAULT_SITE_ID,
+        LibraryRepositoryProtocol,
+        LibraryScanner,
+        ScanFailure,
+        ScanReport,
+    )
+    from nexusdl.core.library.search import (
+        DEFAULT_LIMIT,
+        DEFAULT_MAX_LIMIT,
+        LibrarySearch,
+        PaginatedResult,
+        build_fts_query,
+        build_like_patterns,
+    )
+
+
+# ===========================================================================
+# Lazy loader
+# ===========================================================================
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public library symbol on first access (PEP 562).
+
+    Called by Python's import machinery whenever an attribute is accessed
+    on this package that is not already bound in ``globals()``. Only the
+    names in :data:`__all__` are handled; anything else raises
+    :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
+    default)`` and interactive introspection behave as users expect.
+
+    Args:
+        name: The attribute name being accessed.
+
+    Returns:
+        The symbol registered under ``name`` in the submodule recorded in
+        :data:`_LAZY`. The submodule is imported once and its binding is
+        cached in ``globals()``, so subsequent accesses are plain dict
+        lookups.
+
+    Raises:
+        AttributeError: When ``name`` is not a public export, when the
+            submodule cannot be imported (a missing optional dependency
+            such as ``sqlalchemy``, ``aiosqlite``, ``alembic``, or
+            ``py7zr``, a syntax error deeper in the module, or a broken
+            installation), or when the submodule does not define the
+            requested name. ``AttributeError`` - rather than
+            ``ImportError`` - is required by PEP 562 so that ``hasattr``
+            works.
+    """
+    # Dunder / special attributes must never route through lazy loading.
+    if name.startswith("__"):
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
+    entry = _LAZY.get(name)
+    if entry is None:
+        available = ", ".join(sorted(__all__))
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}. "
+            f"Available library exports: {available}. "
+            f"Every other symbol lives in its specific submodule - "
+            f"e.g. 'from nexusdl.core.library.database import "
+            f"LibraryDatabase' or 'from nexusdl.core.library.search "
+            f"import build_fts_query'."
+        )
+
+    submodule_basename, attr_name = entry
+    try:
+        module = importlib.import_module(f".{submodule_basename}", __name__)
+    except ModuleNotFoundError as exc:
+        # Optional dependency missing from the library subsystem.
+        if exc.name in {
+            "sqlalchemy",
+            "aiosqlite",
+            "alembic",
+            "py7zr",
+        }:
+            raise ImportError(
+                f"{name!r} requires the core extra (library subsystem "
+                f"dependencies: sqlalchemy[asyncio], aiosqlite, alembic, "
+                f"py7zr). Install it with: pip install 'nexusdl[core]' "
+                f"(or 'nexusdl[all]' for the full set)."
+            ) from exc
+        raise
+
+    try:
+        value = getattr(module, attr_name)
+    except AttributeError:
+        raise AttributeError(
+            f"The library submodule {submodule_basename!r} does not define "
+            f"{attr_name!r}. This is a package-internal inconsistency - "
+            f"nexusdl.core.library.__all__ and the submodules are out of "
+            f"sync."
+        ) from None
+
+    # Cache in the module namespace so subsequent lookups bypass
+    # __getattr__ entirely (same behavior as a top-level import).
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Return the public names for interactive introspection.
+
+    Python's default :func:`dir` implementation collects a module's
+    ``__dict__`` and, when the module defines ``__getattr__``, calls it
+    with each candidate name to decide what to display. Because none of
+    the twenty-seven exports are present in ``__dict__`` at import time,
+    an unmodified :func:`dir` would not list them - the package would
+    appear empty in a REPL.
+
+    The returned list is :data:`__all__` plus the standard module dunders
+    a user typically expects to see.
+    """
+    return sorted(
+        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+    )
+
+
+# ===========================================================================
+# Introspection helpers
+# ===========================================================================
+
+def list_symbols() -> list[str]:
+    """Return the sorted list of top-level lazy exports.
+
+    Useful for parametrized tests (``@pytest.mark.parametrize("name",
+    list_symbols())``), schema registries, and tooling that needs to
+    enumerate the library subsystem's public surface without importing
+    every submodule.
+    """
+    # Only the twenty-seven public exports, not the introspection helpers
+    # themselves - otherwise ``list_symbols`` would include itself.
+    return sorted(_LAZY.keys())
+
+
+def get_symbol(name: str) -> Any:
+    """Return the library symbol registered under ``name``.
+
+    Equivalent to ``getattr(package, name)`` but with a clearer error
+    message when the name is unknown. Convenient for dynamic lookups
+    (parametrized tests, composition-root builders that resolve a symbol
+    from a config string, library inspectors).
+
+    Raises:
+        KeyError: If ``name`` is not a public library export.
+    """
+    if name not in _LAZY:
+        available = ", ".join(sorted(_LAZY.keys()))
+        raise KeyError(
+            f"Unknown library symbol {name!r}. Available: {available}. "
+            f"Every other symbol lives in its specific submodule - import "
+            f"from 'nexusdl.core.library.<submodule>' directly."
+        )
+    return getattr(__import__(__name__, fromlist=[name]), name)

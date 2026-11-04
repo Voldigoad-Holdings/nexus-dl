@@ -1,0 +1,229 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# NexusDL — CODEOWNERS
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Ce fichier définit qui doit reviewer les changements dans quelles zones
+# du dépôt. GitHub l'applique automatiquement : quand une PR modifie un
+# fichier matché par une règle, les owners correspondants sont ajoutés
+# en reviewers obligatoires (avec "require review from Code Owners" activé
+# dans les branch protection rules).
+#
+# Règles de priorité GitHub :
+#   - La DERNIÈRE règle qui matche un fichier gagne (ordre de lecture
+#     de haut en bas, du moins spécifique au plus spécifique).
+#   - `*` en début de fichier = fallback pour tout ce qui n'est pas
+#     explicitement couvert ci-dessous.
+#   - Un `!` en début de path exclut (rarement utilisé — préférer
+#     redéfinir l'owner à `@Voldigoad-Holdings` pour désactiver une
+#     règle parente).
+#
+# Docs : https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Vue d'ensemble des zones
+# ─────────────────────────────────────────────────────────────────────────
+#
+#   *                                    → reviewers par défaut (tout)
+#   /src/nexusdl/core/                   → architecture, contrats, sécurité
+#   /src/nexusdl/core/exceptions.py      → CRITIQUE : contrat d'erreur public
+#   /src/nexusdl/core/security.py        → CRITIQUE : crypto, auth (si déplacé)
+#   /src/nexusdl/core/config.py          → CRITIQUE : configuration
+#   /src/nexusdl/core/models/enums.py    → CRITIQUE : enums partagés
+#   /src/nexusdl/parsers/                → intégrations sites (FR/EN/KR/ADULT)
+#   /src/nexusdl/plugins/                → API plugin (contrat externe)
+#   /src/nexusdl/interfaces/web/backend/security.py  → CRITIQUE
+#   /src/nexusdl/interfaces/web/backend/middleware/  → CRITIQUE
+#   /src/nexusdl/interfaces/web/frontend/            → frontend
+#   /data/                               → config sites (haute impact)
+#   /config/                             → exemples de config
+#   /.github/                            → CI/CD, workflows
+#   /docs/source/development/decisions/  → ADRs (contrat architectural)
+#   /pyproject.toml, /uv.lock            → dépendances
+#   /CHANGELOG.md                        → journal des changements
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# ── 1. Fallback ────────────────────────────────────────────────────────────
+# Tout ce qui n'est pas listé plus bas est reviewé par défaut par l'org.
+# Ce n'est pas un oubli — c'est intentionnel : un projet à 60+ sites, 4
+# interfaces et 8 sous-systèmes ne peut pas avoir un owner par path dans
+# les 6 premiers mois. La discipline vient de la review, pas de la
+# répartition fine.
+*                               @Voldigoad-Holdings
+
+
+# ── 2. Racine — fichiers transverses ───────────────────────────────────────
+# Config projet, dépendances, versions, licences, README.
+# Une modification ici affecte tout le monde ; elle mérite un oeil.
+/pyproject.toml                 @Voldigoad-Holdings
+/uv.lock                        @Voldigoad-Holdings
+/.python-version                @Voldigoad-Holdings
+/MANIFEST.in                    @Voldigoad-Holdings
+/LICENSE                        @Voldigoad-Holdings
+/CHANGELOG.md                   @Voldigoad-Holdings
+/SECURITY.md                    @Voldigoad-Holdings
+/SECURITY_HALL_OF_FAME.md       @Voldigoad-Holdings
+/CODE_OF_CONDUCT.md             @Voldigoad-Holdings
+/CONTRIBUTING.md                @Voldigoad-Holdings
+/README.md                      @Voldigoad-Holdings
+/nexus.dl                       @Voldigoad-Holdings
+/justfile                       @Voldigoad-Holdings
+/Makefile                       @Voldigoad-Holdings
+
+
+# ── 3. Données & configuration ─────────────────────────────────────────────
+# `sites.yaml` est la source de vérité de 60+ intégrations : une mauvaise
+# entrée casse des parsers, des downloads, la bibliothèque. Haute impact,
+# review systématique.
+#
+# `sites_schema.json` définit le contrat de validation — le modifier
+# invalide potentiellement des entrées existantes.
+#
+# `default_config.yaml` fixe les défauts de `Settings` — un changement
+# subtil de défaut est un breaking change silencieux.
+/data/                          @Voldigoad-Holdings
+/data/sites.yaml                @Voldigoad-Holdings
+/data/sites_schema.json         @Voldigoad-Holdings
+/data/default_config.yaml       @Voldigoad-Holdings
+/data/comic_info_template.xml   @Voldigoad-Holdings
+/data/user_agents.txt           @Voldigoad-Holdings
+/config/                        @Voldigoad-Holdings
+
+
+# ── 4. Cœur du domaine ─────────────────────────────────────────────────────
+# `core/` est le cœur hexagonal. Tout ce qui est en dessous est reviewé
+# par l'org par défaut via `*`, mais ces sous-zones méritent une review
+# ciblée. Les contrats (Protocols, exceptions, modèles) sont les plus
+# coûteux à casser.
+/src/nexusdl/core/              @Voldigoad-Holdings
+
+
+# ── 5. Points critiques du core ────────────────────────────────────────────
+# Ces fichiers sont les CONTRATS les plus durs du projet. Une modification
+# de signature est un breaking change project-wide. Une review explicite
+# est obligatoire.
+#
+#   exceptions.py     → hiérarchie d'erreurs, mappée en HTTP par le backend
+#   config.py         → Settings (Pydantic v2, env vars, hiérarchie)
+#   constants.py      → APP_NAME, APP_SLUG, noms d'events (contrat EventBus)
+#   events.py         → EventBus, contrats d'abonnement
+#   models/enums.py   → Language, DownloadStatus, PackagingFormat, …
+#
+/src/nexusdl/core/exceptions.py @Voldigoad-Holdings
+/src/nexusdl/core/config.py     @Voldigoad-Holdings
+/src/nexusdl/core/constants.py  @Voldigoad-Holdings
+/src/nexusdl/core/events.py     @Voldigoad-Holdings
+/src/nexusdl/core/models/enums.py @Voldigoad-Holdings
+
+
+# ── 6. Parsers ────────────────────────────────────────────────────────────
+# Les parsers sont des adaptateurs secondaires. Chaque nouveau parser =
+# un contrat implicite avec un site externe. `base.py`, `factory.py` et
+# `capabilities.py` sont les vrais points critiques — un changement de
+# `BaseParser` casse les 60+ sous-classes.
+#
+# `mixins/` est partagé par plusieurs parsers — un bug dans un mixin
+# affecte tous ses consommateurs.
+/src/nexusdl/parsers/base.py    @Voldigoad-Holdings
+/src/nexusdl/parsers/factory.py @Voldigoad-Holdings
+/src/nexusdl/parsers/capabilities.py @Voldigoad-Holdings
+/src/nexusdl/parsers/mixins/    @Voldigoad-Holdings
+
+
+# ── 7. Plugins ────────────────────────────────────────────────────────────
+# L'API plugin est un contrat PUBLIC vis-à-vis de la communauté. `api.py`
+# (NexusPlugin Protocol), `hooks.py` (registre des hooks), `loader.py`
+# (chargement) et `validators.py` (validation) sont tous des contrats
+# dont la modification casse les plugins tiers.
+/src/nexusdl/plugins/           @Voldigoad-Holdings
+
+
+# ── 8. Interfaces ─────────────────────────────────────────────────────────
+# La couche interface entière mérite une review soignée — elle est le
+# point de contact utilisateur.
+/src/nexusdl/interfaces/        @Voldigoad-Holdings
+
+
+# ── 9. Backend Web — zones critiques ──────────────────────────────────────
+# Le backend Web expose l'API HTTP + WebSocket. Deux zones sont plus
+# sensibles que le reste :
+#
+#   security.py       → JWT, hash de mots de passe, rotation de refresh,
+#                       révocation, replay detection. Une faille ici est
+#                       une faille de sécurité, pas un bug.
+#   middleware/auth.py → vérification d'identité, enforcement. Même
+#                        criticité.
+#   middleware/rate_limit.py → brute-force protection sur /auth/login.
+/src/nexusdl/interfaces/web/backend/security.py   @Voldigoad-Holdings
+/src/nexusdl/interfaces/web/backend/middleware/   @Voldigoad-Holdings
+
+
+# ── 10. Frontend ──────────────────────────────────────────────────────────
+# TypeScript/Next.js 14. Pas de règle spécifique pour l'instant — l'org
+# review tout. Une fois qu'une équipe frontend existe, cette ligne devient
+# `/src/nexusdl/interfaces/web/frontend/ @Voldigoad-Holdings/frontend`.
+/src/nexusdl/interfaces/web/frontend/ @Voldigoad-Holdings
+
+
+# ── 11. Décisions architecturales (ADRs) ──────────────────────────────────
+# Chaque ADR est un contrat durable. Une PR qui modifie un ADR existant
+# n'est pas un refactor — c'est une décision architecturale. Review
+# obligatoire.
+/docs/source/development/decisions/   @Voldigoad-Holdings
+
+
+# ── 12. CI / CD / GitHub ──────────────────────────────────────────────────
+# Workflows, templates, dependabot, workflows de release. Une erreur ici
+# bloque les PRs ou casse les releases.
+/.github/                       @Voldigoad-Holdings
+/.github/workflows/             @Voldigoad-Holdings
+/.github/dependabot.yml         @Voldigoad-Holdings
+/.github/CODEOWNERS             @Voldigoad-Holdings
+
+
+# ── 13. Docker ────────────────────────────────────────────────────────────
+# Dockerfiles multi-stage, compose files, Caddyfile/nginx.conf. Une
+# modification ici affecte le déploiement production.
+/docker/                        @Voldigoad-Holdings
+
+
+# ── 14. Scripts ───────────────────────────────────────────────────────────
+# Scripts de dev/CI (benchmark, build, check_imports, clean, dev,
+# fetch_cookies, generate_parser, migrate_config, validate_sites).
+# Certains sont exécutés en CI, d'autres par les mainteneurs — review
+# systématique.
+/scripts/                       @Voldigoad-Holdings
+
+
+# ── 15. Tests ─────────────────────────────────────────────────────────────
+# Les tests définissent le contrat implicite du comportement attendu.
+# Un test cassé est aussi grave qu'un bug — review explicite.
+/tests/                         @Voldigoad-Holdings
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Notes pour l'évolution future
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Quand l'équipe grandit, remplacer les entrées par des équipes GitHub :
+#
+#   /src/nexusdl/parsers/fr/     @Voldigoad-Holdings/parsers-fr
+#   /src/nexusdl/parsers/en/     @Voldigoad-Holdings/parsers-en
+#   /src/nexusdl/parsers/kr/     @Voldigoad-Holdings/parsers-kr
+#   /src/nexusdl/parsers/adult/  @Voldigoad-Holdings/parsers-adult
+#   /src/nexusdl/interfaces/web/frontend/ @Voldigoad-Holdings/frontend
+#   /docs/                       @Voldigoad-Holdings/docs
+#   /.github/                    @Voldigoad-Holdings/infra
+#
+# Ne PAS déléguer :
+#   - /src/nexusdl/core/exceptions.py
+#   - /src/nexusdl/core/config.py
+#   - /src/nexusdl/core/models/enums.py
+#   - /src/nexusdl/interfaces/web/backend/security.py
+#   - /src/nexusdl/interfaces/web/backend/middleware/
+#   - /docs/source/development/decisions/
+#   - /data/sites_schema.json
+#
+# Ces fichiers restent sous le contrôle de l'org, quelle que soit la
+# taille de l'équipe.

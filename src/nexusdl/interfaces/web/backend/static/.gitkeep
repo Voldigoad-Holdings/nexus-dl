@@ -1,0 +1,13 @@
+# This file exists only to keep the empty ``static/`` directory tracked by
+# Git.  Git does not track empty directories; an empty placeholder file is
+# the standard idiom for preserving the directory structure in a repository.
+#
+# The directory holds assets served directly by the FastAPI backend (e.g.
+# locally hosted images, custom CSS overrides, or OpenAPI branding).  It is
+# mounted at application startup by ``nexusdl.interfaces.web.backend.main``
+# and is intentionally empty in the source tree — everything it will serve
+# is produced at build or deployment time.
+#
+# Do not delete this file unless the directory is populated with a tracked
+# asset.  Do not add content here: this placeholder must remain harmless if
+# accidentally served by the static file handler.

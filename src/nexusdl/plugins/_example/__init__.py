@@ -40,6 +40,19 @@ import machinery entirely — see
 result is that a user copying this directory gets their own independent
 module instance, with no risk of collision with the reference example.
 
+The re-export below uses a **relative** import (``from .plugin import
+ExamplePlugin``), not an absolute one (``from
+nexusdl.plugins._example.plugin import ExamplePlugin``). This matters for
+the "copy to activate" workflow: when a user copies this directory to
+``my_plugins/my_plugin/``, the copied ``__init__.py`` now resolves
+``.plugin`` against **the copy**, not against the reference example. The
+"own independent module instance" promise above therefore holds on every
+import path — through the loader (via ``importlib.util.spec``) *and*
+through ``from my_plugins.my_plugin import ExamplePlugin``. An absolute
+import would have made the copy's ``__init__.py`` a silent redirect to
+the original reference, which is exactly the kind of footgun a template
+must not ship.
+
 The re-export below is therefore intended for **tests and documentation**,
 which want a stable import path to assert against the reference
 implementation. Production code never imports from this package.
@@ -53,6 +66,7 @@ stubs, tests) do not widen the public surface.
 
 from __future__ import annotations
 
-from nexusdl.plugins._example.plugin import ExamplePlugin
+# Relative import (deliberate — see "Import behaviour" above).
+from .plugin import ExamplePlugin
 
 __all__ = ["ExamplePlugin"]

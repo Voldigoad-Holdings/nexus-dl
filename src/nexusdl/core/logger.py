@@ -124,6 +124,17 @@ Dependency graph (no cycles)::
 :func:`configure_logging_from_settings` signature — the module does not
 import any other ``nexusdl.core`` module at runtime, and could be lifted
 into a standalone package together with ``loguru``.
+
+Type-annotation note
+--------------------
+``loguru`` exposes only the ``logger`` **instance** at the top level —
+the ``Logger`` class is not exported, so ``from loguru import Logger``
+raises :class:`ImportError`. The annotation on :func:`get_logger` needs
+the class, so it is imported from ``loguru._logger`` under
+:data:`typing.TYPE_CHECKING`. Because this module uses
+``from __future__ import annotations``, the annotation is never evaluated
+at runtime — the import is only visible to mypy/pyright, not to the
+interpreter. See the module-level import block for the exact form.
 """
 
 from __future__ import annotations
@@ -132,9 +143,17 @@ import logging
 import sys
 from typing import TYPE_CHECKING, Any, Final, Literal
 
-from loguru import Logger, logger
+from loguru import logger
 
 if TYPE_CHECKING:
+    # ``loguru`` does not re-export ``Logger`` at the top level (only the
+    # ``logger`` instance). The class lives in the private
+    # ``loguru._logger`` module. Importing it under ``TYPE_CHECKING``
+    # keeps the runtime import list minimal while letting mypy resolve
+    # the ``-> Logger`` annotation on :func:`get_logger`. See the module
+    # docstring's "Type-annotation note" section.
+    from loguru._logger import Logger
+
     from pathlib import Path
 
     from nexusdl.core.config import Settings

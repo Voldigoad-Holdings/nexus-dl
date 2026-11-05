@@ -93,7 +93,6 @@ import type {
   CreateDownloadRequest,
   CreateDownloadResponse,
   DownloadListResponse,
-  DownloadStatus,
   DownloadTask,
   ListDownloadsParams,
 } from "../types/download";

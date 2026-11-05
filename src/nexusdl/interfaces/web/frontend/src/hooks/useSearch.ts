@@ -72,7 +72,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 
-import { api, NexusApiError } from "../lib/api";
+import { api, type NexusApiError } from "../lib/api";
 import { useSettingsStore } from "../store/settings";
 import {
   isUsableSiteHealth,

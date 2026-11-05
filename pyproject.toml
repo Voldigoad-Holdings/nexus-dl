@@ -80,6 +80,15 @@ dependencies = [
     # Validation & config
     "pydantic>=2.7,<3",
     "pydantic-settings>=2.3,<3",
+    # ``jsonschema`` validates ``sites.yaml`` against the shipped
+    # ``sites_schema.json``. It is imported at runtime by
+    # ``core/registry/validator.py`` and is a hard requirement for
+    # ``SiteRegistry.initialize()`` — which runs on every command that
+    # touches the registry, including ``nexusdl web``. It was
+    # previously classified as a dev-only dependency; moved here after
+    # the first production deploy failed with
+    # ``ModuleNotFoundError: No module named 'jsonschema'``.
+    "jsonschema[format]>=4.22",
     # ``orjson`` — verify with:
     #     grep -rn "import orjson" src/nexusdl/
     # If unused, remove.  Kept here because ``logger.py`` and
@@ -164,6 +173,11 @@ redis = [
 ]
 
 # Development tooling
+# ``jsonschema[format]`` is deliberately NOT here — it lives in core
+# dependencies because ``SiteRegistry`` requires it at runtime. The
+# dev environment still gets it because core dependencies are always
+# installed; the ``types-jsonschema`` stub stays here because it is
+# only needed by mypy.
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
@@ -177,7 +191,6 @@ dev = [
     "pre-commit>=3.7",
     "tox>=4.15",
     "pip-audit>=2.7",
-    "jsonschema[format]>=4.22",
     "check-manifest>=0.49",
     "build>=1.2",
     "asgi-lifespan>=2.1",
@@ -272,8 +285,8 @@ pattern = '^__version__(\s*:\s*[^=]+)?\s*=\s*"(?P<version>[^"]+)"'
 # every subdirectory, and a ``force-include`` would attempt to add the
 # same files twice — hatchling raises ``ValueError: A second file is
 # being added to the wheel archive at the same path``. This is the
-# exact failure that broke the first Render build; keeping the module
-# comment here so a future contributor does not re-add the block.
+# exact failure that broke an early Render build; the module comment
+# is kept here so a future contributor does not re-add the block.
 [tool.hatch.build.targets.wheel]
 packages = ["src/nexusdl"]
 

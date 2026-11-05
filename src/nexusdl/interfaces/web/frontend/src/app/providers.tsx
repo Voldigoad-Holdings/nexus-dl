@@ -117,7 +117,6 @@ import { ThemeProvider, useTheme } from "next-themes";
 import {
   useCallback,
   useEffect,
-  useRef,
   useState,
   type ReactNode,
 } from "react";

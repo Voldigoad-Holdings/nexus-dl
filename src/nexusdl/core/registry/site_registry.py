@@ -62,13 +62,13 @@ rather than as an empty result set.
 
 Dependency graph (no cycles)::
 
-    core.exceptions               ─┐
-    core.models.enums              │
-    core.models.search             ├──► core.registry.site_registry
-    core.models.site               │
-    core.registry.validator        │
-    core.registry.protocols        │  (ParserFactory + HttpSession types only)
-    nexusdl.data (sites.yaml)     ─┘
+    core.exceptions
+    core.models.enums
+    core.models.search
+    core.models.site
+    core.registry.validator
+    core.registry.protocols
+    nexusdl.data (sites.yaml)
 
 No dependency on ``nexusdl.parsers.*`` at runtime — see
 :mod:`nexusdl.core.registry.protocols` for the injection contract.
@@ -77,9 +77,8 @@ No dependency on ``nexusdl.parsers.*`` at runtime — see
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.resources import files as _resource_files
 from pathlib import Path
@@ -127,8 +126,6 @@ SITES_FILENAME: Final[str] = "sites.yaml"
 _DATA_PACKAGE: Final[str] = "nexusdl.data"
 
 #: Default ceiling on concurrent per-site searches in :meth:`SiteRegistry.search_all`.
-#: Matches the download pipeline's default concurrency — a search fan-out
-#: of 4 saturates a fast network without hammering a slow upstream.
 DEFAULT_MAX_CONCURRENT_SEARCHES: Final[int] = 4
 
 #: Schema key for the sites array in ``sites.yaml``.
@@ -157,25 +154,15 @@ class _RegistryState:
     """Immutable snapshot of everything :meth:`SiteRegistry.reload` produces.
 
     Assigned as a single object so that a concurrent reader never observes
-    a half-built registry: either it sees the pre-reload state or the
-    post-reload state. There is no in-place mutation of a ``_RegistryState``
-    once it has been published on a :class:`SiteRegistry` instance.
+    a half-built registry.
 
     Attributes:
         sites: Canonical site configurations, keyed by
-            :attr:`SiteConfig.id`. Aliases are resolved to these ids
-            before lookup; the map itself never contains an alias key.
-        aliases: Mapping of alias → canonical site id. Populated from
-            the ``aliases:`` section of ``sites.yaml`` and validated so
-            every target exists.
-        categories: Mapping of category name → tuple of canonical site
-            ids. Populated from the ``categories:`` section. A category
-            that lists an unknown id raises at load time.
+            :attr:`SiteConfig.id`.
+        aliases: Mapping of alias → canonical site id.
+        categories: Mapping of category name → tuple of canonical site ids.
         disabled: Union of the ``disabled_sites:`` section in
             ``sites.yaml`` and the ``Settings.sites.disabled`` override.
-            A site in this set is still retrievable via
-            :meth:`get_site`, but :meth:`get_parser` and
-            :meth:`search_all` skip it.
     """
 
     sites: Mapping[str, SiteConfig]
@@ -192,30 +179,18 @@ class _RegistryState:
 class SiteRegistry:
     """Runtime registry of source sites and their parsers.
 
-    See the module docstring for the full contract. The registry is safe
-    to share across concurrent coroutines once :meth:`initialize` has
-    completed: reads are lock-free, mutations (``reload``) publish a
-    fresh immutable snapshot.
+    See the module docstring for the full contract.
 
     Args:
         parser_factory: The factory that resolves a :class:`SiteConfig` to
             a parser instance. Must satisfy
-            :class:`nexusdl.core.registry.protocols.ParserFactory`. Injected
-            at construction time so this module never imports the parser
-            package at runtime (rule R1).
-        sites_path: Optional path to a ``sites.yaml`` file. When ``None``
-            (the default), the schema bundled inside :mod:`nexusdl.data`
-            is used. A user-provided override lets a deployment ship its
-            own ``sites.yaml`` without rebuilding the wheel.
+            :class:`nexusdl.core.registry.protocols.ParserFactory`.
+        sites_path: Optional path to a ``sites.yaml`` file. When ``None``,
+            the schema bundled inside :mod:`nexusdl.data` is used.
         settings: Optional :class:`~nexusdl.core.config.Settings`. When
             provided, ``settings.sites.disabled`` (if present) is merged
-            into the ``disabled`` set on every reload — a runtime switch
-            to disable a site without editing ``sites.yaml``.
+            into the ``disabled`` set on every reload.
         validator: Optional :class:`~nexusdl.core.registry.validator.SitesValidator`.
-            When ``None``, a fresh default validator is constructed. Tests
-            can inject one built against a minimal inline schema so that
-            they exercise :class:`SiteRegistry` without the full
-            production schema.
     """
 
     def __init__(
@@ -233,8 +208,6 @@ class SiteRegistry:
             validator if validator is not None else SitesValidator()
         )
 
-        #: The currently published snapshot. Initially empty; populated by
-        #: :meth:`initialize`. Assigned atomically by :meth:`reload`.
         self._state: _RegistryState = _RegistryState(
             sites={},
             aliases={},
@@ -242,18 +215,10 @@ class SiteRegistry:
             disabled=frozenset(),
         )
 
-        #: Per-site health snapshots. Mutated in place; a single-dict
-        #: assignment is atomic at the C level, which is sufficient for
-        #: the concurrent-read pattern this registry supports.
         self._health: dict[str, SiteHealthSnapshot] = {}
 
-        #: Guards :meth:`initialize` and :meth:`reload` against concurrent
-        #: invocation. Reads do **not** take this lock.
         self._reload_lock = asyncio.Lock()
 
-        #: Set once :meth:`initialize` has successfully loaded the state.
-        #: Read-only lookups check it to produce a clear error message if
-        #: called before initialization.
         self._initialized = False
 
         self._log = logger.bind(component="registry.sites")
@@ -265,14 +230,8 @@ class SiteRegistry:
     async def initialize(self) -> None:
         """Load the sites configuration. Idempotent.
 
-        Must be awaited before any other method. Calling
-        :meth:`initialize` twice is cheap: the second call returns
-        immediately after acquiring the reload lock, without reading
-        disk.
-
         Raises:
-            ConfigError: If loading or validation fails — see
-                :meth:`reload` for the specific failure modes.
+            ConfigError: If loading or validation fails.
         """
         if self._initialized:
             return
@@ -284,15 +243,6 @@ class SiteRegistry:
 
     async def reload(self) -> None:
         """Reload the sites configuration, replacing the current snapshot.
-
-        Safe to call concurrently with lookups: readers keep using the
-        previous snapshot until the new one is ready, then see it
-        immediately. Safe to call concurrently with another ``reload``:
-        the reload lock serialises them.
-
-        Health snapshots for sites whose configuration is **unchanged**
-        are preserved; snapshots for removed or reconfigured sites are
-        discarded so that the next health check starts fresh.
 
         Raises:
             ConfigError: If the YAML cannot be read, fails schema
@@ -312,10 +262,6 @@ class SiteRegistry:
         old_state = self._state
         self._state = new_state
 
-        # Prune health snapshots for sites that no longer exist or whose
-        # configuration changed. A preserved snapshot for an unchanged
-        # site is correct — the site is byte-identical to what it was
-        # when the snapshot was taken.
         new_health: dict[str, SiteHealthSnapshot] = {}
         for site_id, snapshot in self._health.items():
             if site_id not in new_state.sites:
@@ -339,34 +285,13 @@ class SiteRegistry:
         """Return the config for *site_id*, or ``None`` if unknown.
 
         *site_id* may be a canonical site id or one of its aliases.
-        Unknown ids return ``None`` — this method never raises for a
-        missing site, so a caller that wants to distinguish "unknown"
-        from "disabled" uses :meth:`is_disabled`.
-
-        Args:
-            site_id: Canonical site id or alias. Matching is exact, not
-                case-insensitive — site ids are lowercase by
-                construction.
-
-        Returns:
-            The matching :class:`~nexusdl.core.models.site.SiteConfig`,
-            or ``None`` when no such site exists.
         """
         self._ensure_initialized("get_site")
         canonical = self._state.aliases.get(site_id, site_id)
         return self._state.sites.get(canonical)
 
     def is_disabled(self, site_id: str) -> bool:
-        """Return ``True`` iff *site_id* is disabled.
-
-        A site can be disabled either via the ``disabled_sites:`` section
-        of ``sites.yaml`` or via ``Settings.sites.disabled``. Unknown ids
-        return ``False`` — a site that does not exist is not "disabled",
-        it is "absent".
-
-        Args:
-            site_id: Canonical site id or alias.
-        """
+        """Return ``True`` iff *site_id* is disabled."""
         self._ensure_initialized("is_disabled")
         canonical = self._state.aliases.get(site_id, site_id)
         return canonical in self._state.disabled
@@ -378,23 +303,7 @@ class SiteRegistry:
         include_adult: bool = False,
         include_disabled: bool = False,
     ) -> list[SiteConfig]:
-        """Return the site configurations matching the filters, sorted by name.
-
-        Args:
-            language: When provided, restrict to sites whose primary
-                language matches. ``None`` returns all languages.
-            include_adult: When ``False`` (the default), adult sites
-                (``SiteConfig.adult == True``) are excluded. Set to
-                ``True`` to include them — the composition root decides
-                the policy, this method does not.
-            include_disabled: When ``False`` (the default), sites listed
-                in ``disabled_sites`` or ``Settings.sites.disabled`` are
-                excluded. Set to ``True`` to include them — useful for
-                an admin UI that lists every known site with its state.
-
-        Returns:
-            A new list; mutating it does not affect the registry.
-        """
+        """Return the site configurations matching the filters, sorted by name."""
         self._ensure_initialized("list_sites")
         sites: list[SiteConfig] = list(self._state.sites.values())
         if language is not None:
@@ -408,24 +317,7 @@ class SiteRegistry:
         return sorted(sites, key=lambda s: s.name)
 
     def list_categories(self) -> dict[str, tuple[SiteConfig, ...]]:
-        """Return every category and its (existing, non-disabled) sites.
-
-        Categories are declared in the ``categories:`` section of
-        ``sites.yaml``. This method expands them to full
-        :class:`~nexusdl.core.models.site.SiteConfig` instances so a
-        caller can render a category listing without further lookups.
-        Disabled sites and sites that no longer exist are silently
-        excluded — a stale category entry is a config-drift warning, not
-        an error, because the primary state (the sites themselves) is
-        intact.
-
-        Returns:
-            A mapping from category name to a tuple of site configs,
-            ordered by site name within each category. Categories with no
-            surviving sites are still present with an empty tuple, so a
-            UI can show "no sites in this category" without a separate
-            check.
-        """
+        """Return every category and its (existing, non-disabled) sites."""
         self._ensure_initialized("list_categories")
         result: dict[str, tuple[SiteConfig, ...]] = {}
         for category, site_ids in self._state.categories.items():
@@ -450,16 +342,10 @@ class SiteRegistry:
     ) -> ParserProtocol:
         """Build a fresh parser for *site_id*.
 
-        A new parser instance is created on every call — parsers are
-        cheap to construct and the download pipeline benefits from
-        isolation between concurrent tasks. The ``session`` is passed
-        through to the factory unchanged; this method does not inspect it.
-
         Args:
             site_id: Canonical site id or alias.
             session: The HTTP session the parser should use for network
-                I/O. Shared across parsers, so rate limiting, caching,
-                and circuit breaking apply uniformly.
+                I/O.
 
         Returns:
             A ready-to-use parser bound to *site_id* and *session*.
@@ -467,7 +353,7 @@ class SiteRegistry:
         Raises:
             ParserNotFoundError: If *site_id* is unknown or disabled, or
                 if the injected :class:`ParserFactory` cannot produce a
-                parser for it (module missing, class missing, wrong type).
+                parser for it.
         """
         self._ensure_initialized("get_parser")
         site = self.get_site(site_id)
@@ -484,11 +370,6 @@ class SiteRegistry:
         except ParserNotFoundError:
             raise
         except Exception as exc:
-            # Any failure from the factory is a "this site has no working
-            # parser" problem from the caller's point of view. Wrap it so
-            # that the API surface is uniform — a caller catching
-            # ParserNotFoundError does not also need to catch ImportError,
-            # AttributeError, TypeError.
             raise ParserNotFoundError(
                 f"cannot build parser for site {site.id!r}: "
                 f"{type(exc).__name__}: {exc}"
@@ -509,49 +390,24 @@ class SiteRegistry:
     ) -> AsyncIterator[SearchResult]:
         """Search across enabled sites, yielding hits as they arrive.
 
-        Sites are queried with a bounded concurrency ceiling
-        (``max_concurrent``). Results are yielded **in completion order**,
-        not in site order — the goal is to show the user hits as fast as
-        possible, not to produce a deterministic stream. If determinism
-        matters, callers should sort the collected results themselves.
-
-        Per-site error isolation: a failing parser (network error, site
-        blocked, parser bug) is logged at ``WARNING`` level and its
-        contribution to the stream is an empty list. The other sites
-        continue unaffected. If **every** site fails, the stream is
-        simply empty — the caller cannot distinguish "all failed" from
-        "all empty" at this layer; that is intentional (retry policy is
-        above this method).
-
-        Early exit: a caller that breaks out of the ``async for`` loop
-        cancels the pending per-site tasks. This is not a resource leak —
-        the ``finally`` block cancels and awaits every task.
-
         Args:
-            query: The search query string. Passed verbatim to each
-                parser's ``search()`` — no normalisation is applied here.
+            query: The search query string.
             session: The HTTP session shared with every parser.
             languages: When provided, only sites whose
                 :attr:`SiteConfig.language` is in the sequence are
-                queried. ``None`` queries every enabled site. This is a
-                **site-level** filter, not a content-level one — an EN
-                site may still return a FR manga; use a future
-                content-filter API for that.
+                queried.
             include_adult: When ``False`` (the default), adult sites are
-                skipped. Set to ``True`` to include them.
+                skipped.
             max_concurrent: Ceiling on concurrent per-site searches.
-                Must be ``>= 1``.
 
         Yields:
             Every :class:`~nexusdl.core.models.search.SearchResult` from
             every queried site, in completion order.
 
         Raises:
-            ValueError: If ``max_concurrent < 1``. This is a programming
-                error — validate at the composition root, not here.
+            ValueError: If ``max_concurrent < 1``.
             asyncio.CancelledError: If the caller cancels the surrounding
-                task. Pending per-site searches are cancelled as the
-                iterator exits.
+                task.
         """
         self._ensure_initialized("search_all")
         if max_concurrent < 1:
@@ -571,8 +427,15 @@ class SiteRegistry:
             async with semaphore:
                 try:
                     parser = self.get_parser(site.id, session)
-                    page = await parser.search(query, page=1)
-                    return list(page.items)
+                    # ``parser.search`` is an *async generator* — it must
+                    # be iterated with ``async for``, not awaited, and it
+                    # yields individual ``SearchResult`` objects (there is
+                    # no wrapping "page" object with an ``.items``
+                    # attribute).
+                    collected: list[SearchResult] = []
+                    async for hit in parser.search(query, page=1):
+                        collected.append(hit)
+                    return collected
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 — isolation
@@ -597,9 +460,6 @@ class SiteRegistry:
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            # ``return_exceptions=True`` prevents a cancelled task's
-            # ``CancelledError`` from re-raising here, which would be a
-            # bug: we are already cleaning up, not surfacing a new error.
             await asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------ #
@@ -611,30 +471,16 @@ class SiteRegistry:
     ) -> SiteHealthSnapshot:
         """Run a health check for *site_id* and update its snapshot.
 
-        The check is delegated to the parser's ``health_check()`` method
-        (per :class:`~nexusdl.parsers.base.BaseParser`). A successful
-        check produces a :attr:`SiteHealth.HEALTHY` snapshot and resets
-        :attr:`SiteHealthSnapshot.consecutive_failures`. A failure
-        increments the failure counter, preserves
-        :attr:`SiteHealthSnapshot.last_ok_at` from the previous
-        snapshot (if any), and produces a :attr:`SiteHealth.DOWN`
-        snapshot. ``asyncio.CancelledError`` is always propagated.
-
         Args:
-            site_id: Canonical site id or alias. The site must exist;
-                disabled sites are checked normally (an admin may want
-                to know why a disabled site was disabled).
+            site_id: Canonical site id or alias.
             session: The HTTP session the parser should use.
 
         Returns:
             The freshly updated :class:`~nexusdl.core.models.site.SiteHealthSnapshot`.
-            Also stored in the registry, retrievable via
-            :meth:`get_health`.
 
         Raises:
             ParserNotFoundError: If *site_id* is unknown or its parser
-                cannot be constructed. A **disabled** site is *not*
-                rejected here — see the docstring above.
+                cannot be constructed.
         """
         self._ensure_initialized("health_check")
         site = self.get_site(site_id)
@@ -648,8 +494,6 @@ class SiteRegistry:
             parser = self._parser_factory.create(site, session)
             method = getattr(parser, "health_check", None)
             if method is None:
-                # A parser that does not implement ``health_check`` is
-                # treated as UNKNOWN — a valid state, not an error.
                 snapshot = SiteHealthSnapshot(
                     site_id=site.id,
                     status=SiteHealth.UNKNOWN,
@@ -705,17 +549,7 @@ class SiteRegistry:
         return snapshot
 
     def get_health(self, site_id: str) -> SiteHealthSnapshot | None:
-        """Return the last health snapshot for *site_id*, or ``None``.
-
-        Returns the stored snapshot without running a new check. ``None``
-        means either the site is unknown, or a health check has never
-        been performed in this process. Callers rendering a health
-        endpoint should treat ``None`` as :attr:`SiteHealth.UNKNOWN`
-        rather than an error.
-
-        Args:
-            site_id: Canonical site id or alias.
-        """
+        """Return the last health snapshot for *site_id*, or ``None``."""
         self._ensure_initialized("get_health")
         site = self.get_site(site_id)
         if site is None:
@@ -728,9 +562,6 @@ class SiteRegistry:
 
     def _read_and_validate_yaml(self) -> Mapping[str, Any]:
         """Read and structurally validate the sites YAML. Runs in a thread.
-
-        Returns:
-            The parsed and structurally-validated document.
 
         Raises:
             ConfigError: On any read, parse, or schema failure.
@@ -755,8 +586,6 @@ class SiteRegistry:
                 f"got {type(document).__name__}"
             )
 
-        # Structural validation. Semantic per-site validation happens in
-        # SiteConfig.__post_init__ when each entry is built below.
         self._validator.validate(document)
         return document
 
@@ -780,12 +609,6 @@ class SiteRegistry:
         self, document: Mapping[str, Any]
     ) -> _RegistryState:
         """Build a fresh :class:`_RegistryState` from a validated document.
-
-        Args:
-            document: The validated YAML document.
-
-        Returns:
-            A freshly built immutable state object.
 
         Raises:
             ConfigError: On duplicate site ids, on any per-site
@@ -824,19 +647,6 @@ class SiteRegistry:
         raw: Mapping[str, Any], index: int
     ) -> SiteConfig:
         """Translate one ``sites[i]`` entry into a :class:`SiteConfig`.
-
-        Translation is a pure Python dict → :class:`SiteConfig` mapping
-        (lists → tuples, dicts → :class:`SiteCapabilities`, strings →
-        :class:`Language`); every value is re-validated by
-        :class:`SiteConfig.__post_init__`, which is the authoritative
-        semantic check.
-
-        Args:
-            raw: The YAML entry, as a mapping.
-            index: Position in the ``sites`` list, for error messages.
-
-        Returns:
-            The validated site configuration.
 
         Raises:
             ConfigError: If a required key is absent or a value has the
@@ -878,7 +688,11 @@ class SiteRegistry:
                 name=raw["name"],
                 domains=tuple(str(d) for d in raw_domains),
                 parser_class=raw["parser_class"],
-                language=Language(str(raw["language"]).upper()),
+                # ``Language`` members are declared with lowercase values
+                # (``FR = "fr"``); matching is by value.  ``sites.yaml``
+                # uses the same lowercase form, but we lowercase anyway to
+                # tolerate a future YAML that accidentally capitalises.
+                language=Language(str(raw["language"]).lower()),
                 adult=bool(raw["adult"]),
                 capabilities=SiteCapabilities(**dict(raw_capabilities)),
                 default_headers={
@@ -974,7 +788,19 @@ class SiteRegistry:
         document: Mapping[str, Any],
         sites: Mapping[str, SiteConfig],
     ) -> frozenset[str]:
-        """Build the disabled-site set from YAML and settings, merged."""
+        """Build the disabled-site set from YAML and settings, merged.
+
+        ``disabled_sites`` entries accept **two forms**:
+
+        * A bare string — ``- batoto`` — the simple form.
+        * A mapping — ``- {id: batoto, reason: "..."}`` — the documented
+          form, where ``reason`` is preserved as a comment in the YAML
+          and ignored by this loader.
+
+        This dual form lets the YAML carry a human-readable explanation
+        for why a site is disabled without forcing the loader to know
+        anything about the extra keys.
+        """
         raw_disabled = document.get(_KEY_DISABLED_SITES) or ()
         if not isinstance(raw_disabled, (list, tuple)):
             raise ConfigError(
@@ -982,26 +808,48 @@ class SiteRegistry:
                 f"{type(raw_disabled).__name__}"
             )
         yaml_disabled: set[str] = set()
-        for raw_id in raw_disabled:
-            if not isinstance(raw_id, str):
-                raise ConfigError(
-                    f"{_KEY_DISABLED_SITES} entries must be strings, got "
-                    f"{type(raw_id).__name__}"
-                )
+        for entry in raw_disabled:
+            site_id = self._extract_disabled_id(entry)
             # A disabled entry that names an unknown site is a config-
             # drift warning, not an error: the YAML may still be in sync
             # with an older site list, and refusing to load would break
             # a deployment that simply removed a site.
-            if raw_id not in sites:
+            if site_id not in sites:
                 self._log.warning(
                     "disabled_sites references unknown site {!r}; "
                     "ignoring",
-                    raw_id,
+                    site_id,
                 )
                 continue
-            yaml_disabled.add(raw_id)
+            yaml_disabled.add(site_id)
 
         return frozenset(yaml_disabled | self._settings_disabled())
+
+    @staticmethod
+    def _extract_disabled_id(entry: Any) -> str:
+        """Extract the site id from a ``disabled_sites`` entry.
+
+        Accepts either a bare string or a mapping with an ``id`` key.
+        Any other shape is a configuration error.
+
+        Raises:
+            ConfigError: If the entry is neither a string nor a mapping
+                with a string ``id``.
+        """
+        if isinstance(entry, str):
+            return entry
+        if isinstance(entry, Mapping):
+            site_id = entry.get("id")
+            if not isinstance(site_id, str):
+                raise ConfigError(
+                    f"{_KEY_DISABLED_SITES} entry has a non-string 'id': "
+                    f"{site_id!r}"
+                )
+            return site_id
+        raise ConfigError(
+            f"{_KEY_DISABLED_SITES} entries must be strings or mappings "
+            f"with an 'id' key, got {type(entry).__name__}"
+        )
 
     def _settings_disabled(self) -> frozenset[str]:
         """Return ``Settings.sites.disabled`` as a frozen set, or empty."""

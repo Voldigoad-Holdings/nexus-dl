@@ -30,15 +30,45 @@
     },
     "categories": {
       "type": "object",
-      "description": "Per-category overrides (fr, en, kr, adult).",
-      "additionalProperties": { "$ref": "#/$defs/category_overrides" }
+      "description": "Per-category grouping of site IDs (fr, en, kr, adult).",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "uniqueItems": true
+      }
     },
     "disabled_sites": {
       "type": "array",
-      "description": "Sites to disable (removed from registry).",
+      "description": "Sites to disable (removed from registry). Accepts both a bare site id and an object with an id and an optional human-readable reason.",
       "items": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9_-]*$"
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "minLength": 1,
+            "maxLength": 50
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]*$",
+                "minLength": 1,
+                "maxLength": 50
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 500
+              }
+            }
+          }
+        ]
       },
       "uniqueItems": true
     }
@@ -99,12 +129,12 @@
         },
         "language": {
           "type": "string",
-          "description": "Primary language (ISO 639-1 or 'adult').",
-          "enum": ["fr", "en", "ja", "ko", "zh", "es", "pt", "it", "de", "ru", "ar", "adult", "unknown"]
+          "description": "Primary language, matching Language in core/models/enums.py.",
+          "enum": ["fr", "en", "ja", "ko", "zh", "es", "pt", "it", "de", "ru", "ar", "unknown"]
         },
         "adult": {
           "type": "boolean",
-          "description": "Site hosts adult content (18+). Filtered by NEXUSDL_ALLOW_ADULT."
+          "description": "Site hosts adult content (18+). Filtered by NEXUSDL_CONTENT__ALLOW_ADULT."
         },
         "capabilities": {
           "$ref": "#/$defs/capabilities"
@@ -131,6 +161,20 @@
           "uniqueItems": true,
           "examples": [["cf_clearance", "cf_bm"]]
         },
+        "max_concurrent_downloads": {
+          "type": "integer",
+          "description": "Per-site cap on concurrent chapter downloads.",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 4
+        },
+        "rate_limit": {
+          "type": "number",
+          "description": "Per-site request rate, in requests per second.",
+          "exclusiveMinimum": 0,
+          "maximum": 100,
+          "default": 2.0
+        },
         "_comment": {
           "type": "string",
           "description": "Free-form comment (ignored by parsers).",
@@ -140,94 +184,64 @@
     },
     "capabilities": {
       "type": "object",
+      "description": "The nine capability flags, matching SiteCapabilities in core/models/site.py.",
       "additionalProperties": false,
       "required": [
-        "supports_search",
-        "supports_manga_info",
-        "supports_chapters",
-        "supports_pages",
-        "supports_download",
-        "requires_auth",
-        "requires_cloudflare_bypass",
-        "max_concurrent_downloads",
-        "default_rate_limit_per_second"
+        "search",
+        "pagination",
+        "filters",
+        "metadata",
+        "cover_art",
+        "chapter_list",
+        "reader_images",
+        "cloudflare",
+        "js_rendered"
       ],
       "properties": {
-        "supports_search": {
+        "search": {
           "type": "boolean",
-          "default": true
+          "default": true,
+          "description": "Text search is supported."
         },
-        "supports_manga_info": {
+        "pagination": {
           "type": "boolean",
-          "default": true
+          "default": true,
+          "description": "Search results are paginated."
         },
-        "supports_chapters": {
+        "filters": {
           "type": "boolean",
-          "default": true
+          "default": false,
+          "description": "Advanced search filters are supported."
         },
-        "supports_pages": {
+        "metadata": {
           "type": "boolean",
-          "default": true
+          "default": false,
+          "description": "Rich metadata (authors, description, year, status) is available."
         },
-        "supports_download": {
+        "cover_art": {
           "type": "boolean",
-          "default": true
+          "default": true,
+          "description": "Cover image URLs are extracted."
         },
-        "requires_auth": {
+        "chapter_list": {
           "type": "boolean",
-          "default": false
+          "default": true,
+          "description": "The complete chapter list is enumerable."
         },
-        "requires_cloudflare_bypass": {
+        "reader_images": {
           "type": "boolean",
-          "default": false
+          "default": true,
+          "description": "The complete reader image list is enumerable."
         },
-        "max_concurrent_downloads": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 32,
-          "default": 4
+        "cloudflare": {
+          "type": "boolean",
+          "default": false,
+          "description": "The site is behind Cloudflare (parser inherits CloudflareMixin)."
         },
-        "default_rate_limit_per_second": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "maximum": 100,
-          "default": 2.0
-        }
-      }
-    },
-    "category_overrides": {
-      "type": "object",
-      "description": "Overrides applied to all sites of a category.",
-      "additionalProperties": false,
-      "properties": {
-        "enabled": {
-          "type": ["boolean", "null"],
-          "default": null,
-          "description": "null = inherit from NEXUSDL_ALLOW_ADULT."
-        },
-        "capabilities": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "max_concurrent_downloads": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 32
-            },
-            "default_rate_limit_per_second": {
-              "type": "number",
-              "exclusiveMinimum": 0,
-              "maximum": 100
-            }
-          }
-        },
-        "default_headers": {
-          "type": "object",
-          "additionalProperties": { "type": "string" }
-        },
-        "cookies_required": {
-          "type": "array",
-          "items": { "type": "string" }
+        "js_rendered": {
+          "type": "boolean",
+          "default": false,
+          "description": "The site requires JavaScript rendering (parser inherits JsRenderedMixin)."
         }
       }
     }
@@ -239,32 +253,38 @@
         {
           "id": "mangadex",
           "name": "MangaDex",
-          "domains": ["https://mangadex.org", "https://api.mangadex.org"],
+          "domains": ["https://mangadex.org"],
           "parser_class": "nexusdl.parsers.en.mangadex:MangaDexParser",
           "language": "en",
           "adult": false,
           "capabilities": {
-            "supports_search": true,
-            "supports_manga_info": true,
-            "supports_chapters": true,
-            "supports_pages": true,
-            "supports_download": true,
-            "requires_auth": false,
-            "requires_cloudflare_bypass": false,
-            "max_concurrent_downloads": 4,
-            "default_rate_limit_per_second": 4.0
+            "search": true,
+            "pagination": true,
+            "filters": true,
+            "metadata": true,
+            "cover_art": true,
+            "chapter_list": true,
+            "reader_images": true,
+            "cloudflare": false,
+            "js_rendered": false
           },
           "default_headers": {},
-          "cookies_required": []
+          "cookies_required": [],
+          "max_concurrent_downloads": 4,
+          "rate_limit": 4.0
         }
       ],
       "aliases": { "md": "mangadex" },
       "categories": {
-        "fr": {
-          "default_headers": { "Accept-Language": "fr-FR,fr;q=0.9" }
-        }
+        "fr": ["sushiscan", "scan_manga"],
+        "en": ["mangadex", "comick"],
+        "kr": ["manhwa_raw", "manhwaclub"],
+        "adult": ["nhentai", "hentaizone"]
       },
-      "disabled_sites": []
+      "disabled_sites": [
+        "batoto",
+        { "id": "reaperscans", "reason": "Shut down May 2025" }
+      ]
     }
   ]
 }

@@ -73,11 +73,12 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import unquote, urlparse
 
 import aiosqlite
 from loguru import logger
 from sqlalchemy import event, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -111,17 +112,8 @@ __all__ = [
 # Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
-#: Table used by the migration runner to record applied versions. Created by
-#: the runner before any migration is applied; the migrations themselves
-#: never touch it.
 _SCHEMA_VERSION_TABLE: Final[str] = "schema_version"
 
-#: Columns that :meth:`LibraryDatabase.update_manga` is allowed to modify.
-#: ``id``, ``site_id``, ``source_id``, ``created_at``, ``last_read_at``,
-#: ``page_count``, and ``chapter_count`` are excluded — the first four
-#: define identity and are immutable, the last three are maintained by the
-#: database itself (``page_count``/``chapter_count`` by :meth:`add_chapter`,
-#: ``last_read_at`` by :meth:`set_reading_progress`).
 _MANGA_UPDATABLE_FIELDS: Final[tuple[str, ...]] = (
     "title",
     "alt_titles",
@@ -139,10 +131,6 @@ _MANGA_UPDATABLE_FIELDS: Final[tuple[str, ...]] = (
     "tags",
 )
 
-#: Columns that :meth:`LibraryDatabase.add_manga` / :meth:`update_manga`
-#: write, in the order they appear in the table. Kept as a tuple so the
-#: INSERT statement and the params dict stay in lock-step — a unit test
-#: iterates this tuple against the actual INSERT.
 _MANGA_WRITE_FIELDS: Final[tuple[str, ...]] = (
     "id",
     "site_id",
@@ -168,9 +156,6 @@ _MANGA_WRITE_FIELDS: Final[tuple[str, ...]] = (
     "last_read_at",
 )
 
-#: Columns that :meth:`LibraryDatabase.add_chapter` writes. The manga's
-#: counters are not here — they are recomputed or incremented in the same
-#: transaction.
 _CHAPTER_WRITE_FIELDS: Final[tuple[str, ...]] = (
     "id",
     "manga_id",
@@ -191,15 +176,10 @@ _log = logger.bind(component="library.database")
 
 
 # --------------------------------------------------------------------------- #
-# Reading progress model                                                      #
+# ReadingProgress                                                             #
 # --------------------------------------------------------------------------- #
 
 
-# NOTE: ``ReadingProgress`` logically belongs in ``core/models/library.py``.
-# It is defined here because ``database.py`` is the only consumer today and
-# ``models/library.py`` does not yet exist. When that module is written,
-# move this class there and re-export it from ``database.py`` for backward
-# compatibility.
 class ReadingProgress:
     """One row of the ``reading_progress`` table.
 
@@ -285,11 +265,7 @@ class LibraryDatabase:
                 docstring for the reason and the workaround.
 
         Raises:
-            ValueError: If ``database_path`` is ``":memory:"``. This
-                restriction exists because the migration runner uses a
-                separate connection from the runtime engine; with
-                per-connection in-memory storage, the schema created by
-                the runner would not be visible to the engine.
+            ValueError: If ``database_path`` is ``":memory:"``.
         """
         path_str = str(database_path)
         if path_str == ":memory:":
@@ -335,10 +311,7 @@ class LibraryDatabase:
     async def init(self) -> None:
         """Create the database if needed, apply pending migrations.
 
-        Idempotent: calling :meth:`init` twice is safe and cheap. The
-        runner opens a raw aiosqlite connection to execute each pending
-        migration script and then disposes it; the SQLAlchemy engine
-        opens its own connections lazily afterwards.
+        Idempotent: calling :meth:`init` twice is safe and cheap.
 
         Raises:
             LibraryError: If a migration fails to apply. The failure is
@@ -353,9 +326,7 @@ class LibraryDatabase:
     async def close(self) -> None:
         """Dispose the engine and release all pooled connections.
 
-        Safe to call more than once. After :meth:`close`, the database
-        object should not be used; create a new instance if you need to
-        reopen.
+        Safe to call more than once.
         """
         await self._engine.dispose()
         self._log.debug("LibraryDatabase closed")
@@ -363,12 +334,6 @@ class LibraryDatabase:
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
         """Yield an async session, committing on success and rolling back on error.
-
-        This is the only session factory used internally and the one
-        passed to :class:`~nexusdl.core.library.search.LibrarySearch`.
-        Commit is called at the end of the block regardless of whether
-        the body issued any writes; a read-only transaction is cheap and
-        keeps the contract simple.
 
         Yields:
             An :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
@@ -389,15 +354,8 @@ class LibraryDatabase:
         """Insert or update *manga*.
 
         The upsert is keyed on ``manga.id``. On conflict, every
-        caller-editable field (title, description, status, …) is
-        refreshed from *manga*; the DB-managed counters
-        (``page_count``, ``chapter_count``), ``created_at``, and
-        ``last_read_at`` are **preserved** — they belong to the database,
-        not to the caller.
-
-        The returned :class:`Manga` is the input object unchanged. If a
-        caller needs the persisted state (e.g. refreshed ``updated_at``),
-        it should call :meth:`get_manga` afterwards.
+        caller-editable field is refreshed from *manga*; the DB-managed
+        counters, ``created_at``, and ``last_read_at`` are **preserved**.
 
         Args:
             manga: The manga to persist. ``manga.id`` must be set.
@@ -407,17 +365,13 @@ class LibraryDatabase:
 
         Raises:
             LibraryError: If a unique constraint is violated in a way
-                other than the intended id conflict (e.g. two rows with
-                the same ``(site_id, source_id)`` under different ids —
-                a hash collision, which should be investigated).
+                other than the intended id conflict.
         """
         now = _utcnow_iso()
         values = _manga_to_row(manga, now)
         async with self.session() as sess:
             try:
-                await sess.execute(
-                    text(_MANGA_UPSERT_SQL), values
-                )
+                await sess.execute(text(_MANGA_UPSERT_SQL), values)
             except IntegrityError as exc:
                 raise LibraryError(
                     f"cannot upsert manga {manga.id!r}: {exc}"
@@ -427,11 +381,6 @@ class LibraryDatabase:
 
     async def update_manga(self, manga: Manga) -> Manga:
         """Update an existing manga; raise if it does not exist.
-
-        Only the fields in :data:`_MANGA_UPDATABLE_FIELDS` are written.
-        ``created_at``, ``last_read_at``, ``page_count``, and
-        ``chapter_count`` are preserved. ``updated_at`` is refreshed to
-        the current UTC time.
 
         Args:
             manga: The manga to update. Must have a valid ``id`` that
@@ -454,9 +403,7 @@ class LibraryDatabase:
             if existing.scalar_one_or_none() is None:
                 raise LibraryError(f"manga not found: {manga.id}")
             try:
-                await sess.execute(
-                    text(_MANGA_UPDATE_SQL), values
-                )
+                await sess.execute(text(_MANGA_UPDATE_SQL), values)
             except IntegrityError as exc:
                 raise LibraryError(
                     f"cannot update manga {manga.id!r}: {exc}"
@@ -469,19 +416,10 @@ class LibraryDatabase:
     ) -> bool:
         """Delete a manga, its chapters, and its reading progress.
 
-        Cascade is enforced at the database level (``ON DELETE CASCADE``
-        from ``chapters`` to ``mangas``, and from ``reading_progress`` to
-        ``chapters``), so a single ``DELETE FROM mangas`` removes
-        everything.
-
         Args:
             manga_id: The manga to delete.
             delete_files: When ``True``, also delete on-disk artefacts
-                referenced by this manga: its ``cover_path`` (if any) and
-                any chapter whose ``url`` starts with ``file://``
-                (typically locally-scanned archives). Failures to delete
-                individual files are logged as warnings and do not abort
-                the operation — a missing file is not an error.
+                referenced by this manga.
 
         Returns:
             ``True`` iff a row was deleted. ``False`` for an unknown id.
@@ -542,10 +480,6 @@ class LibraryDatabase:
         self, page: int = 1, per_page: int = 50
     ) -> PaginatedResult[Manga]:
         """Return one page of the library, ordered by recency.
-
-        Ordering puts mangas that have been read most recently first;
-        never-opened mangas follow, ordered by creation time descending.
-        ``id`` breaks ties so pagination is stable across queries.
 
         Args:
             page: 1-indexed page number. Must be ``>= 1``.
@@ -613,9 +547,6 @@ class LibraryDatabase:
     ) -> PaginatedResult[Manga]:
         """Full-text search, delegating to :class:`LibrarySearch`.
 
-        See :meth:`LibrarySearch.search` for the full contract, including
-        the FTS5-vs-LIKE fallback and the user query syntax.
-
         Args:
             query: Raw user query string.
             limit: Page size, in ``[1, DEFAULT_MAX_LIMIT]``.
@@ -632,11 +563,6 @@ class LibraryDatabase:
 
     async def add_chapter(self, chapter: Chapter) -> Chapter:
         """Insert or update *chapter*, maintaining the manga's counters.
-
-        On **insert**, the parent manga's ``chapter_count`` and
-        ``page_count`` are incremented in the same transaction. On
-        **update**, both counters are recomputed from scratch to remain
-        consistent if a chapter's ``page_count`` was corrected.
 
         Args:
             chapter: The chapter to persist. ``chapter.id`` and
@@ -716,15 +642,6 @@ class LibraryDatabase:
     async def get_chapters(self, manga_id: str) -> list[Chapter]:
         """Return every chapter of *manga_id*, in reading order.
 
-        Ordering handles numeric and non-numeric chapter numbers:
-
-        * Numeric numbers (``"1"``, ``"10.5"``) sort first, by numeric
-          value.
-        * Non-numeric numbers (``"SP1"``, ``"Omake 3"``) follow, sorted
-          lexicographically.
-        * NULL numbers sort last.
-        * ``id`` breaks ties so pagination is stable.
-
         Args:
             manga_id: The manga whose chapters to return.
 
@@ -763,18 +680,10 @@ class LibraryDatabase:
     ) -> None:
         """Persist the current reading position.
 
-        Atomically upserts the ``reading_progress`` row and updates the
-        manga's ``last_read_at``. Both checks and both writes happen in
-        one transaction, so a failure leaves neither table modified.
-
         Args:
             manga_id: The manga the progress belongs to.
-            chapter_id: The chapter currently being read. Must belong to
-                *manga_id* — enforced by the composite foreign key on
-                ``reading_progress``.
-            page_index: Zero-based page index. Must be ``>= 0`` and
-                ``< chapter.page_count``; upper-bound violations are the
-                caller's responsibility (the schema only checks ``>= 0``).
+            chapter_id: The chapter currently being read.
+            page_index: Zero-based page index. Must be ``>= 0``.
 
         Raises:
             LibraryError: If the manga does not exist, or the chapter does
@@ -866,13 +775,8 @@ class LibraryDatabase:
     def _row_to_manga(self, row: Mapping[str, Any]) -> Manga:
         """Map a row from the ``mangas`` table to a :class:`Manga`.
 
-        Public convention: pass this method to any code that hydrates
-        manga rows from raw SQL. It is the single source of truth for the
-        column-to-model mapping.
-
         Args:
-            row: A mapping (dict or SQLAlchemy ``RowMapping``) with the
-                columns of the ``mangas`` table.
+            row: A mapping with the columns of the ``mangas`` table.
 
         Returns:
             A :class:`Manga` instance.
@@ -928,11 +832,7 @@ class LibraryDatabase:
     # ------------------------------------------------------------------ #
 
     async def _bootstrap_schema_version(self) -> None:
-        """Create ``schema_version`` if it does not exist.
-
-        Run before any migration, because migration files do not assume
-        the table exists. Idempotent.
-        """
+        """Create ``schema_version`` if it does not exist. Idempotent."""
         async with aiosqlite.connect(str(self._database_path)) as db:
             await db.execute(
                 f"CREATE TABLE IF NOT EXISTS {_SCHEMA_VERSION_TABLE} ("
@@ -943,14 +843,7 @@ class LibraryDatabase:
             await db.commit()
 
     async def _apply_pending_migrations(self) -> None:
-        """Apply every migration whose version exceeds the current one.
-
-        Each migration runs in its own connection and its own explicit
-        ``BEGIN ... COMMIT`` block, with the ``schema_version`` insert
-        included *inside* the same script. A failure rolls back both the
-        schema change and the version record, so the same migration is
-        retried on the next :meth:`init`.
-        """
+        """Apply every migration whose version exceeds the current one."""
         async with aiosqlite.connect(str(self._database_path)) as db:
             async with db.execute(
                 f"SELECT COALESCE(MAX(version), 0) FROM {_SCHEMA_VERSION_TABLE}"
@@ -961,9 +854,7 @@ class LibraryDatabase:
         migrations = list_migrations()
         pending = [m for m in migrations if m.version > current]
         if not pending:
-            self._log.debug(
-                "Schema up to date at version {}", current
-            )
+            self._log.debug("Schema up to date at version {}", current)
             return
 
         for migration in pending:
@@ -976,9 +867,7 @@ class LibraryDatabase:
             migration: The migration to apply.
 
         Raises:
-            LibraryError: If the SQL fails. The whole script's effects are
-                rolled back, so the migration can be retried after the
-                caller fixes the cause.
+            LibraryError: If the SQL fails.
         """
         sql = migration.path.read_text(encoding="utf-8")
         applied_at = _utcnow_iso()
@@ -994,9 +883,6 @@ class LibraryDatabase:
             async with aiosqlite.connect(str(self._database_path)) as db:
                 await db.executescript(script)
         except (aiosqlite.Error, OSError) as exc:
-            # sqlite3 aborts the current transaction on error, so the
-            # schema changes and the version insert are both discarded
-            # when the connection closes. Nothing to clean up here.
             self._log.exception(
                 "Migration {} ({}) failed: {}",
                 migration.version,
@@ -1017,11 +903,6 @@ class LibraryDatabase:
 
 # --------------------------------------------------------------------------- #
 # SQL statement constants                                                     #
-# --------------------------------------------------------------------------- #
-# Defined as module-level strings so they are compiled once and so the
-# column lists are visible without scrolling through the methods. Kept in
-# lock-step with :data:`_MANGA_WRITE_FIELDS` and :data:`_CHAPTER_WRITE_FIELDS`
-# by unit tests iterating both.
 # --------------------------------------------------------------------------- #
 
 _MANGA_UPSERT_SQL: Final[str] = (
@@ -1085,14 +966,7 @@ _CHAPTER_UPSERT_SQL: Final[str] = (
 
 
 def _install_sqlite_pragmas(engine: AsyncEngine) -> None:
-    """Attach a ``connect`` listener that enables the required PRAGMAs.
-
-    ``foreign_keys`` is per-connection in SQLite; without this listener,
-    cascade-delete silently becomes a no-op on any pooled connection that
-    was not explicitly initialised. ``WAL`` improves concurrent-read
-    behaviour at negligible cost; ``busy_timeout`` prevents transient
-    ``database is locked`` errors during long transactions.
-    """
+    """Attach a ``connect`` listener that enables the required PRAGMAs."""
 
     @event.listens_for(engine.sync_engine, "connect")
     def _set_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
@@ -1115,8 +989,7 @@ def _parse_iso(value: str | None) -> datetime:
     """Parse an ISO 8601 string produced by :func:`_utcnow_iso` back to UTC.
 
     Accepts both ``Z`` and ``+00:00`` suffixes. A ``None`` or malformed
-    value is treated as the Unix epoch — never expected in practice, but
-    more useful than raising in a mapper.
+    value is treated as the Unix epoch.
     """
     if not value:
         return datetime.fromtimestamp(0, tz=UTC)
@@ -1154,12 +1027,7 @@ def _decode_json_array(raw: str | None) -> list[str]:
 
 
 def _manga_to_row(manga: Manga, now: str) -> dict[str, Any]:
-    """Build the parameter dict for :data:`_MANGA_UPSERT_SQL` / ``_UPDATE_SQL``.
-
-    Uses ``getattr`` defensively for fields the model may not expose.
-    Required fields (id, site_id, source_id, title, url) are accessed
-    directly — a model missing them is a hard error.
-    """
+    """Build the parameter dict for :data:`_MANGA_UPSERT_SQL` / ``_UPDATE_SQL``."""
     created_at = getattr(manga, "created_at", None)
     updated_at = getattr(manga, "updated_at", None)
     last_read_at = getattr(manga, "last_read_at", None)
@@ -1220,10 +1088,69 @@ def _timestamp_or_now(
         return fallback
     if isinstance(value, datetime):
         return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-    # Assume string already in ISO form; store verbatim.
     return str(value)
 
 
 def _string_or_none(value: Any) -> str | None:
-    """Coerce *value* to a string, mapping ``None`` to ``None``."""
-    if value is
+    """Coerce *value* to a string, mapping ``None`` to ``None``.
+
+    Timestamps (``datetime``) are formatted as ISO 8601 with the ``Z``
+    suffix, matching the format used by :func:`_utcnow_iso` and by every
+    other timestamp in the database. Other values are stringified.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, datetime):
+        return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return str(value)
+
+
+def _file_url_to_path(url: str) -> Path:
+    """Convert a ``file://`` URL back to a filesystem path.
+
+    Handles the platform-specific quirks:
+
+    * On POSIX, ``file:///tmp/archive.cbz`` → ``Path("/tmp/archive.cbz")``.
+    * On Windows, ``file:///C:/tmp/archive.cbz`` →
+      ``Path("C:/tmp/archive.cbz")`` (the leading slash before the drive
+      letter is stripped).
+    * Percent-encoded characters (``%20`` for space, etc.) are decoded.
+
+    Args:
+        url: A ``file://`` URL as produced by
+            :meth:`pathlib.Path.as_uri`.
+
+    Returns:
+        The filesystem path the URL refers to.
+    """
+    parsed = urlparse(url)
+    raw_path = unquote(parsed.path)
+    import os as _os
+
+    if _os.name == "nt" and raw_path.startswith("/") and len(raw_path) >= 3:
+        if raw_path[2] == ":":
+            raw_path = raw_path[1:]
+    return Path(raw_path)
+
+
+def _delete_file_quietly(path: Path) -> None:
+    """Delete *path* if it exists, logging any failure as a warning.
+
+    Best-effort: a missing file is not an error, and a permission error is
+    logged but does not abort the caller.
+
+    Args:
+        path: The file to delete.
+    """
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError as exc:
+        _log.warning(
+            "Could not delete {}: {}: {}",
+            path,
+            type(exc).__name__,
+            exc,
+        )

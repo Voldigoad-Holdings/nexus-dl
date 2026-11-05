@@ -16,69 +16,50 @@ Every command follows the same three-rule contract:
 
 1. **Retrieve the state, then the services.** A command does
    ``state: CLIState = ctx.obj`` followed by ``wired = state.ensure()``.
-   ``state.ensure()`` bootstraps every service on first call — see
-   :class:`nexusdl.interfaces.cli.cli_entry.CLIState` — and re-raises
-   the same ``typer.Exit`` on every subsequent call if the bootstrap
-   failed. ``CLIState`` is imported **under** :data:`TYPE_CHECKING`
-   only, so this module and ``cli_entry.py`` do not form a runtime
-   import cycle.
+   ``state.ensure()`` bootstraps every service on first call and
+   re-raises the same ``typer.Exit`` on every subsequent call if the
+   bootstrap failed. ``CLIState`` is imported **under**
+   :data:`TYPE_CHECKING` only, so this module and ``cli_entry.py`` do
+   not form a runtime import cycle.
 
 2. **Wrap the whole command body in** ``with _handle_errors():``. The
    context manager converts any :class:`~nexusdl.core.exceptions.NexusDLError`
    into a clean ``Error: …`` line on stderr and exit code 1; it lets a
-   :class:`typer.Exit` raised by the command itself propagate unchanged
-   (so a command that wants exit code 3 for a specific condition can
-   raise it directly); and it converts ``KeyboardInterrupt`` into the
-   conventional exit code 130.
+   :class:`typer.Exit` raised by the command itself propagate unchanged;
+   and it converts ``KeyboardInterrupt`` into the conventional exit code
+   130.
 
 3. **Print structured output through** :class:`rich.console.Console` —
    never a bare :func:`print`. Every list-producing command supports a
    ``--json`` flag; when set, the command emits one JSON document on
-   stdout and no other output, so a shell script can pipe the result
-   through :mod:`jq` without filtering human-readable noise.
+   stdout and no other output.
 
 Synchronous vs. asynchronous commands
 -------------------------------------
 Commands that need the wired services must be declared **synchronous**
 (``def``), not ``async def``. :meth:`CLIState.ensure` internally creates
-a fresh :class:`asyncio` event loop to run the service initializers
-(``registry.initialize()``, ``database.init()``); calling it from inside
-an already-running loop — which is what Typer does when it dispatches an
-``async def`` command — would raise ``RuntimeError: Cannot run the event
-loop while another loop is running``.
+a fresh :class:`asyncio` event loop to run the service initializers;
+calling it from inside an already-running loop would raise
+``RuntimeError: Cannot run the event loop while another loop is running``.
 
-The pattern therefore is: ``def`` command, ``asyncio.run(...)`` wrapping
-the async body::
-
-    @search_app.command("run")
-    def search_run(ctx: typer.Context, query: str) -> None:
-        with _handle_errors():
-            wired = _services(ctx)
-            asyncio.run(_search_run_async(wired, query))
-
-    async def _search_run_async(wired: WiredServices, query: str) -> None:
-        async for result in wired.registry.search_all(...):
-            ...
+The pattern is: ``def`` command, ``asyncio.run(...)`` wrapping the async
+body.
 
 Commands that need **no** bootstrap (``admin init``) are also ``def``,
-but skip ``_services(ctx)`` entirely — they work before ``.env`` exists,
-which is exactly the point of a bootstrap command.
+but skip ``_services(ctx)`` entirely — they work before ``.env`` exists.
 
 Deferred imports
 ----------------
 :mod:`nexusdl.parsers.factory` (imported transitively by
 ``SiteRegistry.initialize``), :mod:`nexusdl.core.library.scanner`, and
 the :mod:`importlib` machinery used by ``sites check-parsers`` are all
-imported **inside** the commands that need them, so a ``nexusdl config
-show`` invocation does not pay for the parser package or the scanner.
+imported **inside** the commands that need them.
 
 Deterministic output
 --------------------
 Every list command sorts its output deterministically (alphabetical for
 sites and plugins, most-recent-first for library listings, arrival
-order for search results). A CI script that runs the command twice
-against the same state sees the same output — the ordering is part of
-the contract, not an accident of the underlying container.
+order for search results).
 """
 
 from __future__ import annotations
@@ -96,6 +77,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.tree import Tree
 
 from nexusdl.core.constants import APP_NAME, APP_SLUG
 from nexusdl.core.exceptions import NexusDLError
@@ -127,11 +109,6 @@ __all__ = [
 _EXIT_ERROR: int = 1
 _EXIT_KEYBOARD_INTERRUPT: int = 130
 
-#: Two consoles, one per stream. ``_out`` renders to stdout for
-#: successful output, ``_err`` renders to stderr for diagnostics and
-#: error messages. Rich's console object is cheap and the split keeps
-#: ``--json`` output pipeable while error messages still reach a
-#: terminal.
 _out_console = Console()
 _err_console = Console(stderr=True)
 
@@ -142,45 +119,14 @@ _err_console = Console(stderr=True)
 
 
 def _services(ctx: typer.Context) -> WiredServices:
-    """Return the wired services, bootstrapping on first call.
-
-    Retrieves the :class:`CLIState` stored on ``ctx.obj`` by
-    :mod:`nexusdl.interfaces.cli.cli_entry`'s root callback and calls
-    its :meth:`CLIState.ensure` method. On a bootstrap failure,
-    :meth:`ensure` raises :class:`typer.Exit` with the right code and
-    message — the caller does not need to catch or wrap the error.
-
-    Args:
-        ctx: The Typer invocation context.
-
-    Returns:
-        The fully-constructed :class:`~nexusdl.interfaces.cli.cli_entry.WiredServices`.
-
-    Raises:
-        typer.Exit: On a bootstrap failure.
-    """
+    """Return the wired services, bootstrapping on first call."""
     state: CLIState = ctx.obj
     return state.ensure()
 
 
 @contextmanager
 def _handle_errors() -> Iterator[None]:
-    """Convert pipeline exceptions into clean CLI exits.
-
-    * :class:`~nexusdl.core.exceptions.NexusDLError` — printed as
-      ``Error: <message>`` on stderr, exit code 1.
-    * :class:`KeyboardInterrupt` — printed as ``Interrupted.`` on
-      stderr, exit code 130.
-    * :class:`typer.Exit` — re-raised unchanged, so a command that
-      wants a specific exit code raises it directly.
-    * Any other exception — left alone; it propagates to the top and a
-      genuine bug surfaces as a traceback.
-
-    The context manager is idempotent — a nested invocation simply
-    re-raises the same exception through the outer one. This matters
-    for a command that calls another command's helper, though the
-    current design does not.
-    """
+    """Convert pipeline exceptions into clean CLI exits."""
     try:
         yield
     except typer.Exit:
@@ -194,33 +140,12 @@ def _handle_errors() -> Iterator[None]:
 
 
 def _echo_json(payload: Any) -> None:
-    """Print *payload* as one pretty-printed JSON document on stdout.
-
-    Datetime and Path values are serialised via ``default=str`` so the
-    command never raises a :class:`TypeError` from a Pydantic model that
-    happened to keep a non-JSON-native field.
-
-    Args:
-        payload: Any JSON-serialisable structure.
-    """
+    """Print *payload* as one pretty-printed JSON document on stdout."""
     typer.echo(json.dumps(payload, indent=2, default=str))
 
 
 def _parse_format(raw: str | None) -> PackagingFormat | None:
-    """Parse a ``--format`` argument into a :class:`PackagingFormat`.
-
-    Accepts any case; passes ``None`` through unchanged.
-
-    Args:
-        raw: The raw argument, or ``None``.
-
-    Returns:
-        The parsed format, or ``None`` when *raw* is ``None``.
-
-    Raises:
-        typer.Exit: If *raw* is not a known format. The message lists
-            the supported values so the caller sees the fix.
-    """
+    """Parse a ``--format`` argument into a :class:`PackagingFormat`."""
     if raw is None:
         return None
     try:
@@ -234,19 +159,7 @@ def _parse_format(raw: str | None) -> PackagingFormat | None:
 
 
 def _parse_language(raw: str | None) -> Language | None:
-    """Parse a ``--language`` argument into a :class:`Language`.
-
-    Accepts any case; passes ``None`` through unchanged.
-
-    Args:
-        raw: The raw argument, or ``None``.
-
-    Returns:
-        The parsed language, or ``None`` when *raw* is ``None``.
-
-    Raises:
-        typer.Exit: If *raw* is not a known language code.
-    """
+    """Parse a ``--language`` argument into a :class:`Language`."""
     if raw is None:
         return None
     try:
@@ -310,17 +223,7 @@ def search_run(
         ),
     ] = False,
 ) -> None:
-    """Search every enabled site for QUERY and print the results.
-
-    Streams results from each site as they arrive; a slow site does not
-    block the faster ones. ``--limit`` caps the number of printed
-    results, not the number the sites are queried for.
-
-    Examples:
-        nexusdl search run "one piece"
-        nexusdl search run "one piece" --site mangadex --language en
-        nexusdl search run "one piece" --json | jq '.results[].title'
-    """
+    """Search every enabled site for QUERY and print the results."""
     with _handle_errors():
         wired = _services(ctx)
         asyncio.run(
@@ -513,20 +416,7 @@ def download_manga_cmd(
         ),
     ] = False,
 ) -> None:
-    """Download every (or only the selected) chapter(s) of a manga.
-
-    The command resolves the manga through the site's parser, lists its
-    chapters, and submits each one to the shared
-    :class:`~nexusdl.core.downloader.manager.DownloadManager`. Progress
-    is printed chapter by chapter as each one completes; a failure on
-    one chapter does not stop the rest of the batch — the summary at
-    the end names the failed chapters.
-
-    Examples:
-        nexusdl download manga https://mangadex.org/title/xyz
-        nexusdl download manga xyz --site mangadex --chapter 1 --chapter 2
-        nexusdl download manga https://mangadex.org/title/xyz --format cb7
-    """
+    """Download every (or only the selected) chapter(s) of a manga."""
     with _handle_errors():
         wired = _services(ctx)
         asyncio.run(
@@ -629,28 +519,23 @@ async def _download_manga_async(
     started = datetime.now(UTC)
     succeeded = 0
     failed = 0
-    try:
-        async for result in wired.manager.download_manga(
-            manga,
-            chapters=selected,
-            format=packaging_format,
-            skip_existing=skip_existing,
-        ):
-            status = result.status.value
-            if result.status.value == "DONE":
-                succeeded += 1
-                _out_console.print(
-                    f"[green]✓[/green] {result.output_path}",
-                    highlight=False,
-                )
-            else:
-                failed += 1
-                _err_console.print(
-                    f"[red]✗[/red] {result.status.value}: {result.error}"
-                )
-    finally:
-        # Ensure the session closes even if the loop aborts.
-        pass
+    async for result in wired.manager.download_manga(
+        manga,
+        chapters=selected,
+        format=packaging_format,
+        skip_existing=skip_existing,
+    ):
+        if result.status.value == "DONE":
+            succeeded += 1
+            _out_console.print(
+                f"[green]✓[/green] {result.output_path}",
+                highlight=False,
+            )
+        else:
+            failed += 1
+            _err_console.print(
+                f"[red]✗[/red] {result.status.value}: {result.error}"
+            )
 
     elapsed = (datetime.now(UTC) - started).total_seconds()
     _out_console.print()
@@ -1179,20 +1064,12 @@ def config_paths(
 def config_validate(
     ctx: typer.Context,
 ) -> None:
-    """Load the configuration and report any problem.
-
-    Exits 0 when the settings load cleanly; exits 1 with a diagnostic
-    when they do not. This is the command a user runs after editing
-    ``.env`` to check that they did not break anything.
-    """
+    """Load the configuration and report any problem."""
     with _handle_errors():
         wired = _services(ctx)
-        # Reaching ``wired`` means Settings, sites.yaml, plugins, the
-        # database, and the HTTP session all initialized successfully.
-        # A failure would have raised earlier.
         _out_console.print(
             f"[green]✓[/green] Configuration loaded: "
-            f"{APP_NAME} v{wired.settings.app.name} "
+            f"{APP_NAME} "
             f"(debug={wired.settings.app.debug})"
         )
 
@@ -1330,8 +1207,6 @@ def sites_validate(
     """Validate ``sites.yaml`` against its JSON schema and every site's model."""
     with _handle_errors():
         wired = _services(ctx)
-        # The registry already validated everything during bootstrap.
-        # Re-read the count and report.
         sites = wired.registry.list_sites(
             include_adult=True, include_disabled=True
         )
@@ -1347,13 +1222,7 @@ def sites_check_parsers(
         bool, typer.Option("--json", help="Emit machine-readable JSON.")
     ] = False,
 ) -> None:
-    """Verify every ``parser_class`` resolves to an importable class.
-
-    A CI-oriented check: the command fails with exit code 1 when at
-    least one ``parser_class`` in ``sites.yaml`` does not resolve, so a
-    PR that renames a parser module without updating the YAML is
-    rejected before merge.
-    """
+    """Verify every ``parser_class`` resolves to an importable class."""
     with _handle_errors():
         wired = _services(ctx)
         from nexusdl.core.registry.loader import (
@@ -1521,13 +1390,7 @@ async def _plugins_info_async(
 def plugins_check(
     ctx: typer.Context,
 ) -> None:
-    """Load every plugin strictly and report the first failure.
-
-    ``strict=True`` makes the loader abort at the first plugin that
-    fails to load, so a CI pipeline that runs this command catches a
-    broken plugin before it is deployed. Exits 0 when every plugin
-    loads; exits 1 otherwise.
-    """
+    """Load every plugin strictly and report the first failure."""
     with _handle_errors():
         wired = _services(ctx)
         asyncio.run(_plugins_check_async(wired))
@@ -1569,17 +1432,7 @@ def admin_init(
         ),
     ] = False,
 ) -> None:
-    """Create a fresh ``.env`` file with generated secrets.
-
-    The command does **not** bootstrap the services — it works before
-    ``.env`` exists, which is the point. The generated file is written
-    with mode ``0o600`` on POSIX.
-
-    Examples:
-        nexusdl admin init
-        nexusdl admin init --path ~/projects/mylib/.env
-        nexusdl admin init --force
-    """
+    """Create a fresh ``.env`` file with generated secrets."""
     with _handle_errors():
         from nexusdl.core.config import bootstrap_env_file
 
@@ -1611,12 +1464,7 @@ def admin_regenerate_secrets(
         typer.Option("--yes", "-y", help="Skip the confirmation prompt."),
     ] = False,
 ) -> None:
-    """Regenerate the three secrets in an existing ``.env`` file.
-
-    **Destructive**: rotating ``cookie_encryption_key`` invalidates
-    every stored cookie. The command requires an explicit ``--yes`` for
-    that reason.
-    """
+    """Regenerate the three secrets in an existing ``.env`` file."""
     with _handle_errors():
         from nexusdl.core.config import bootstrap_env_file
 
@@ -1652,12 +1500,7 @@ def admin_clean(
         bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")
     ] = False,
 ) -> None:
-    """Delete cached or log data to reclaim disk space.
-
-    Only the directories the pipeline owns are touched. Archives,
-    cookies, and the database are never deleted — those are user data,
-    not caches.
-    """
+    """Delete cached or log data to reclaim disk space."""
     with _handle_errors():
         wired = _services(ctx)
         settings = wired.settings
@@ -1766,17 +1609,88 @@ def _serialize_chapter(chapter: Chapter) -> dict[str, Any]:
     }
 
 
+#: The three root secrets whose values must never appear in CLI output.
+_ROOT_SECRET_FIELDS: tuple[str, ...] = (
+    "secret_key",
+    "jwt_secret",
+    "cookie_encryption_key",
+)
+
+
 def _masked_settings(settings: Any) -> dict[str, Any]:
     """Serialize ``Settings`` for ``--json`` output, with secrets masked.
 
-    Every field of every section is rendered, but the three root
-    secrets become ``"***"`` — the length is deliberately withheld from
-    JSON output (unlike the TUI, a JSON file may be committed).
+    Uses :meth:`pydantic.BaseModel.model_dump` to get the full settings
+    tree (every section and every field), then redacts the three root
+    secrets and the two proxy URL fields. The redaction markers differ
+    deliberately:
+
+    * **Root secrets** → ``"***"`` — the length is withheld because a
+      JSON file may be committed, and a root secret's length narrows a
+      brute-force.
+    * **Proxy URLs** → ``"***"`` — same rationale, applied to every URL
+      in ``proxy.url`` / ``proxy.urls``. ``None`` stays ``None``.
+
+    The generic dump approach (rather than a hand-enumerated dict of
+    sections) means a future config section is automatically included
+    without a code change here, and the function cannot drift out of
+    sync with the config schema.
+
+    Args:
+        settings: A :class:`~nexusdl.core.config.Settings` instance.
+
+    Returns:
+        A JSON-serialisable mapping with the same shape as the settings
+        tree, minus the secret values.
     """
-    return {
-        "app": settings.app.model_dump(mode="json"),
-        "http": settings.http.model_dump(mode="json"),
-        "downloader": settings.downloader.model_dump(mode="json"),
-        "packaging": settings.packaging.model_dump(mode="json"),
-        "image": settings.image.model_dump(mode="json"),
-        "
+    data: dict[str, Any] = settings.model_dump(mode="json")
+
+    for field in _ROOT_SECRET_FIELDS:
+        if field in data:
+            data[field] = "***"
+
+    proxy = data.get("proxy")
+    if isinstance(proxy, dict):
+        if proxy.get("url"):
+            proxy["url"] = "***"
+        urls = proxy.get("urls")
+        if isinstance(urls, list) and urls:
+            proxy["urls"] = ["***"] * len(urls)
+
+    return data
+
+
+def _print_masked_settings(settings: Any) -> None:
+    """Print the effective settings as a Rich tree, with secrets masked.
+
+    Renders one branch per settings section (``app``, ``http``,
+    ``downloader``, …), with each field on its own line. The three
+    root secrets and the proxy URLs are printed as ``"***"`` so a user
+    showing their terminal to a colleague or pasting it into a bug
+    report never leaks credentials.
+
+    Args:
+        settings: A :class:`~nexusdl.core.config.Settings` instance.
+    """
+    data = _masked_settings(settings)
+    tree = Tree(f"[bold]{APP_NAME} configuration[/bold]")
+
+    # Root scalar fields first (secrets, URLs, etc.) — they are not
+    # sections and are useful to see at a glance.
+    root_scalars: dict[str, Any] = {
+        k: v for k, v in data.items() if not isinstance(v, dict)
+    }
+    if root_scalars:
+        root_branch = tree.add("[cyan]root[/cyan]")
+        for key, value in root_scalars.items():
+            root_branch.add(f"{key}: [yellow]{value!r}[/yellow]")
+
+    # Then each section as its own branch.
+    for section, values in data.items():
+        if not isinstance(values, dict):
+            continue
+        branch = tree.add(f"[cyan]{section}[/cyan]")
+        for key, value in values.items():
+            branch.add(f"{key}: [yellow]{value!r}[/yellow]")
+
+    _out_console.print(tree)

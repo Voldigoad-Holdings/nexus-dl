@@ -30,7 +30,7 @@
  *    is documented as optional in :mod:`./manga` at the point of
  *    definition.
  *
- * No business logic lives here.  The three tiny helpers at the bottom —
+ * No business logic lives here.  The two tiny helpers at the bottom —
  * :func:`siteHealthTone`, :func:`indexSites` — are pure derivations of the
  * types above; they are colocated because they are useful precisely when
  * the types are imported, and because moving them to :mod:`../lib/utils`
@@ -49,6 +49,8 @@
 //
 // Duplication is avoided by construction: a re-export does not create a
 // second definition — it is the same symbol, re-surfaced.
+
+import type { Site, SiteHealth } from "./manga";
 
 export type {
   Site,
@@ -174,7 +176,7 @@ export type SiteHealthTone = "ok" | "warn" | "bad" | "neutral";
  * Modelled as ``ReadonlyMap`` rather than an object so that callers
  * cannot accidentally mutate the cache.
  */
-export type SiteIndex = ReadonlyMap<string, import("./manga").Site>;
+export type SiteIndex = ReadonlyMap<string, Site>;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Derived state helpers
@@ -195,9 +197,7 @@ export type SiteIndex = ReadonlyMap<string, import("./manga").Site>;
  * This is the single place the mapping is written.  A theme redesign
  * changes one function, not every badge in the app.
  */
-export function siteHealthTone(
-  health: import("./manga").SiteHealth,
-): SiteHealthTone {
+export function siteHealthTone(health: SiteHealth): SiteHealthTone {
   switch (health) {
     case "healthy":
       return "ok";
@@ -221,10 +221,8 @@ export function siteHealthTone(
  * :class:`Map`.  Callers can safely memoise the result with
  * ``useMemo(() => indexSites(sites), [sites])``.
  */
-export function indexSites(
-  sites: ReadonlyArray<import("./manga").Site>,
-): SiteIndex {
-  const index = new Map<string, import("./manga").Site>();
+export function indexSites(sites: ReadonlyArray<Site>): SiteIndex {
+  const index = new Map<string, Site>();
   for (const site of sites) {
     index.set(site.id, site);
   }

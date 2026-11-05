@@ -242,8 +242,15 @@ Funding = "https://github.com/sponsors/Voldigoad-Holdings"
 # place in the project where the version string is written; everything
 # else (``nexusdl.__version__``, the wheel metadata, ``pip show nexusdl``)
 # derives from it.
+#
+# The custom ``pattern`` is required because ``version.py`` declares the
+# constant with a type annotation (``__version__: Final[str] = "..."``),
+# which hatchling's default regex does not match.  The pattern below
+# accepts both the annotated and non-annotated forms, so the file stays
+# readable and the build stays robust against a future style change.
 [tool.hatch.version]
 path = "src/nexusdl/version.py"
+pattern = '^__version__(\s*:\s*[^=]+)?\s*=\s*"(?P<version>[^"]+)"'
 
 # ────────────────────────────────────────────────────────────────────
 # Wheel (binaire installable via pip)
@@ -276,6 +283,8 @@ include = [
     "/.env.example",
     "/.editorconfig",
     "/.gitattributes",
+    "/.gitignore",
+    "/.dockerignore",
     "/.pre-commit-config.yaml",
     "/.python-version",
     "/Makefile",
@@ -285,6 +294,7 @@ include = [
     "/src/nexusdl",
     # Config exemples
     "/config/*.example.yaml",
+    "/config/*.example.yml",
     "/config/logging.yaml",
     # Documentation
     "/docs",
@@ -294,11 +304,12 @@ include = [
     "/tests",
     # Docker
     "/docker",
-    # GitHub templates
+    # GitHub templates + workflows
     "/.github/CODEOWNERS",
     "/.github/dependabot.yml",
     "/.github/PULL_REQUEST_TEMPLATE.md",
     "/.github/ISSUE_TEMPLATE",
+    "/.github/workflows",
     # Assets légers
     "/assets/banner.png",
     "/assets/banner_dark.png",
@@ -578,10 +589,3 @@ extras = dev
 commands =
     mypy src
 """
-
-# ════════════════════════════════════════════════════════════════════
-# UV — Dependency manager
-# ════════════════════════════════════════════════════════════════════
-[tool.uv]
-# Extras par défaut installés par `uv sync`
-default-groups = ["dev"]

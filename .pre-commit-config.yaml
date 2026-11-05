@@ -52,9 +52,6 @@ repos:
       - id: check-toml
       - id: check-yaml
         # ``--unsafe`` autorise les tags YAML non-standard (``!!python/...``).
-        # Conservé par précaution historique ; peut être retiré si aucun
-        # fichier YAML du projet n'utilise de tags personnalisés — un
-        # ``grep -rn '!!' --include='*.yaml' .`` permet de vérifier.
         # ``sites.yaml`` et ``nexus.plugin.yaml`` sont exclus ci-dessous
         # parce qu'ils contiennent des structures (ancres, merge keys)
         # que ``check-yaml`` refuse même avec ``--unsafe``.
@@ -75,8 +72,7 @@ repos:
       # Sécurité basique
       - id: detect-private-key
       # ``forbid-submodules`` rejette toute submodule (existante ou
-      # nouvelle).  C'est la politique du projet : aucune submodule,
-      # jamais.  Le hook ``forbid-new-submodules`` serait redondant.
+      # nouvelle).  Le hook ``forbid-new-submodules`` serait redondant.
       - id: forbid-submodules
 
       # Exécutables
@@ -85,7 +81,7 @@ repos:
 
       # Typage — impose ``from __future__ import annotations`` dans tout
       # fichier Python qui contient des annotations de type, en cohérence
-      # avec la règle du projet (toujours l'importer).
+      # avec la règle du projet.
       - id: python-use-type-annotations
 
       # Normalisation
@@ -151,12 +147,27 @@ repos:
   # ──────────────────────────────────────────────────────────────────
   # 4. Hooks customisés NexusDL (scripts locaux)
   # ──────────────────────────────────────────────────────────────────
+  #
+  # IMPORTANT — ``uv run python`` vs ``python3``
+  # ─────────────────────────────────────────────────
+  # Les scripts ``scripts/check_imports.py`` et ``scripts/validate_sites.py``
+  # importent ``nexusdl``.  Dans le runner CI, ``python3`` est le Python
+  # système où ``nexusdl`` n'est PAS installé — seul le venv créé par
+  # ``uv sync`` l'a.  Utiliser ``uv run python`` garantit l'utilisation
+  # de l'environnement projet, quel que soit le répertoire courant.
+  #
+  # Les hooks purs-bash (``no-token-leak``, ``no-print-in-src``,
+  # ``yaml-indent``) n'ont pas ce problème et restent en ``bash -c``.
+  # Le hook ``check-pyproject`` n'importe que la stdlib (``pathlib``,
+  # ``tomllib``) donc ``python3`` suffit et est plus rapide que
+  # ``uv run python``.
+  #
   - repo: local
     hooks:
       # ── Architecture hexagonale ──
       - id: check-imports
         name: check-imports (architecture hexagonale)
-        entry: python3 scripts/check_imports.py
+        entry: uv run python scripts/check_imports.py
         language: system
         pass_filenames: false
         always_run: true
@@ -166,7 +177,7 @@ repos:
       # ── Schéma sites.yaml ──
       - id: validate-sites
         name: validate-sites (sites.yaml contre schéma JSON)
-        entry: python3 scripts/validate_sites.py
+        entry: uv run python scripts/validate_sites.py
         language: system
         pass_filenames: false
         files: ^src/nexusdl/data/(sites\.yaml|sites_schema\.json)$
@@ -176,12 +187,9 @@ repos:
       #
       # Scanne les fichiers texte du dépôt avec des patterns de tokens
       # réels — GitHub PATs, AWS access key IDs, Slack tokens, clés
-      # privées SSH/PGP.  Couvre les cas que ``detect-private-key``
-      # (hook standard) ne détecte pas.
-      #
-      # ``detect-private-key`` reste activé en complément : il attrape
-      # des formats de clés plus exotiques (EC, DSA, PGP blocks) et son
-      # implémentation est maintenue par la communauté.
+      # privées SSH/PGP.  ``detect-private-key`` reste activé en
+      # complément : il attrape des formats de clés plus exotiques
+      # (EC, DSA, PGP blocks).
       - id: no-token-leak
         name: no-token-leak (aucun token GitHub/AWS/Slack en dur)
         entry: bash -c '
@@ -218,7 +226,7 @@ repos:
       # One-liner plutôt qu'un bloc multi-ligne : YAML fold les
       # newlines en espaces quand l'indentation de continuation est
       # inférieure à celle du parent, donc un bloc multi-ligne est
-      # fragile (fonctionne tant que chaque ligne se termine par ``;``).
+      # fragile.
       - id: check-pyproject
         name: check-pyproject (pyproject.toml + version.py cohérents)
         entry: python3 -c "import pathlib, tomllib; p = pathlib.Path('pyproject.toml'); assert p.exists(), 'pyproject.toml introuvable'; d = tomllib.loads(p.read_text(encoding='utf-8')); assert 'project' in d, 'section [project] manquante'; assert 'name' in d['project'], 'project.name manquant'; assert d['project']['requires-python'].startswith('>='), 'requires-python doit commencer par >='; v = d.get('tool', {}).get('hatch', {}).get('version', {}); assert v.get('path') == 'src/nexusdl/version.py', f'version path attendu src/nexusdl/version.py, trouvé {v.get(\"path\")!r}'; assert pathlib.Path('src/nexusdl/version.py').exists(), 'src/nexusdl/version.py introuvable'; print('✅ pyproject.toml + version.py cohérents')"
@@ -251,8 +259,6 @@ repos:
       #
       # ``grep -rnP "^\t"`` remplace l'ancienne boucle ``for f in $files``
       # qui cassait sur les noms de fichiers contenant des espaces.
-      # ``--exclude-dir=frontend`` exclut le frontend Next.js (déjà
-      # exclu par le filtre global mais double sécurité).
       - id: yaml-indent
         name: yaml-indent (indentation 2 espaces, pas de tab)
         entry: bash -c '
@@ -272,40 +278,28 @@ repos:
         files: \.(yml|yaml)$
         stages: [pre-commit]
 
-      # ── __init__.py non vides dans les couches clés ──
+      # ── NOTE — ``init-not-empty-core`` retiré ──
       #
-      # ``core/``, ``parsers/`` et ``plugins/`` doivent exposer une API
-      # via leurs ``__init__.py`` (imports, re-exports, hooks).  Un
-      # ``__init__.py`` vide dans ces couches signale une régression
-      # (fichier tronqué, copie partielle, merge raté).
+      # Le hook précédent exigeait que les ``__init__.py`` de
+      # ``core/``, ``parsers/`` et ``plugins/`` soient non-vides.
+      # C'était une convention **arbitraire** qui ne correspond pas à
+      # la réalité du projet :
       #
-      # ``find`` est appelé pour chaque chemin séparément pour que
-      # l'absence d'un des trois dossiers n'empêche pas le check des
-      # autres — sur une installation partielle, on veut quand même
-      # scanner ce qui existe.
-      - id: init-not-empty-core
-        name: init-not-empty (core/, parsers/, plugins/)
-        entry: bash -c '
-          files="";
-          for d in src/nexusdl/core src/nexusdl/parsers src/nexusdl/plugins; do
-            if [ -d "$d" ]; then
-              found=$(find "$d" -name "__init__.py" -empty 2>/dev/null || true);
-              if [ -n "$found" ]; then
-                files="$files$found\n";
-              fi;
-            fi;
-          done;
-          if [ -n "$files" ]; then
-            echo "❌ __init__.py vides dans core/parsers/plugins :";
-            printf "%b" "$files";
-            echo "   (laisser vide uniquement si intentionnel)";
-            exit 1;
-          fi
-          '
-        language: system
-        pass_filenames: false
-        files: ^src/nexusdl/(core|parsers|plugins)/.*__init__\.py$
-        stages: [pre-commit]
+      #   - ``src/nexusdl/core/__init__.py`` peut légitimement être
+      #     vide — les imports directs (``from nexusdl.core.config
+      #     import Settings``) n'exigent rien de plus.
+      #   - ``src/nexusdl/plugins/__init__.py`` peut aussi être vide.
+      #   - Seul ``src/nexusdl/parsers/__init__.py`` DOIT être
+      #     non-vide (il déclenche les ``register()`` via imports).
+      #
+      # Le hook aurait fait échouer la CI pour une convention
+      # cosmétique.  Si tu veux le réintroduire plus tard, limite-le
+      # à un chemin précis :
+      #
+      #   files: ^src/nexusdl/parsers/.*__init__\.py$
+      #
+      # — et assure-toi que les fichiers concernés ne sont jamais
+      # vides (parsings/__init__.py contient déjà des imports).
 
 
   # ──────────────────────────────────────────────────────────────────

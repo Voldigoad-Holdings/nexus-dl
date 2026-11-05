@@ -52,11 +52,15 @@ Exit codes::
 Notes::
 
     - Excludes ``.venv/``, ``build/``, ``dist/``, ``node_modules/``,
-      ``__pycache__/``, ``tests/`` (except ``tests/unit/parsers/``),
-      and the frontend directory.
+      ``__pycache__/``, and the frontend directory.
+    - ``tests/`` is scanned **only** under ``tests/unit/parsers/`` (parser
+      smoke tests); every other test file is skipped.
     - Ignores lines starting with ``#`` (comments).
     - Ignores docstrings (via AST parsing).
     - Ignores ``if TYPE_CHECKING:`` blocks (ADR-003 pattern).
+    - Lines silenced with ``# noqa: S###`` (bandit's hardcoded-password
+      rule) are skipped; unrelated noqa directives do not suppress the
+      secret check.
 """
 from __future__ import annotations
 
@@ -85,6 +89,16 @@ _FORBIDDEN_IMPORTS: Final[dict[str, frozenset[str]]] = {
     "data": frozenset({"nexusdl.core", "nexusdl.parsers", "nexusdl.interfaces", "nexusdl.plugins"}),
 }
 
+#: Stable rule identifiers matching the PROMPT MASTER's R1-R6 table.
+#: ``interfaces`` is deliberately absent — it is the composition root
+#: (R4) and may import anything.
+_RULE_IDS: Final[dict[str, str]] = {
+    "core": "R1",
+    "parsers": "R2",
+    "plugins": "R3",
+    "data": "R5",
+}
+
 #: Forbidden patterns: (label, regex).
 _FORBIDDEN_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("GitHub token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
@@ -100,6 +114,16 @@ _FORBIDDEN_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ),
 )
 
+#: ``# noqa`` directives that silence our secret check. Accepts bare
+#: ``# noqa`` (suppresses all bandit rules) and ``# noqa: S###`` /
+#: ``# noqa:S###`` / ``# noqa: S###, S###``. Unrelated rules such as
+#: ``# noqa: E501`` do **not** suppress the check — the pattern requires
+#: either an end of line right after ``noqa`` or an S-rule identifier.
+_NOQA_S_RULE_RE: Final[re.Pattern[str]] = re.compile(
+    r"#\s*noqa(?::?\s*S\d{3}(?:[,\s]+S\d{3})*)?\s*$",
+    re.IGNORECASE,
+)
+
 #: Files and directories to exclude entirely (matched on the posix path
 #: relative to ``_REPO_ROOT``).
 _EXCLUDED_PATHS: Final[tuple[str, ...]] = (
@@ -107,7 +131,9 @@ _EXCLUDED_PATHS: Final[tuple[str, ...]] = (
     "scripts/validate_sites.py",
 )
 
-#: Directories to skip during recursive walk.
+#: Directories to skip during recursive walk.  ``tests`` is **not** listed
+#: here — it is handled specially by :func:`_iter_python_files` so that
+#: parser smoke tests are still scanned.
 _EXCLUDED_DIRS: Final[frozenset[str]] = frozenset(
     {
         ".git",
@@ -130,11 +156,10 @@ _EXCLUDED_DIRS: Final[frozenset[str]] = frozenset(
         ".idea",
         ".vscode",
         "frontend",
-        "tests",
     }
 )
 
-#: Tests subdirectories that should still be checked (e.g. parser smoke tests).
+#: Tests subdirectories that should still be checked (parser smoke tests).
 _INCLUDED_TEST_SUBDIRS: Final[tuple[str, ...]] = ("unit/parsers",)
 
 
@@ -221,7 +246,11 @@ def _layer_of(path: Path) -> str | None:
     parts = rel.parts
     if not parts:
         return None
-    return parts[0] if parts[0] in _FORBIDDEN_IMPORTS or parts[0] == "interfaces" else None
+    return (
+        parts[0]
+        if parts[0] in _FORBIDDEN_IMPORTS or parts[0] == "interfaces"
+        else None
+    )
 
 
 def _is_test_file(path: Path) -> bool:
@@ -229,7 +258,9 @@ def _is_test_file(path: Path) -> bool:
     rel = _rel(path)
     if not rel.startswith("tests/"):
         return False
-    return any(rel.startswith(f"tests/{sub}/") for sub in _INCLUDED_TEST_SUBDIRS)
+    return any(
+        rel.startswith(f"tests/{sub}/") for sub in _INCLUDED_TEST_SUBDIRS
+    )
 
 
 def _should_skip(path: Path) -> bool:
@@ -246,6 +277,13 @@ def _should_skip(path: Path) -> bool:
 def _iter_python_files(root: Path) -> Iterator[Path]:
     """Yield all ``.py`` files under ``root``, skipping excluded dirs.
 
+    Files under ``tests/`` are yielded only when they live under one of
+    the ``_INCLUDED_TEST_SUBDIRS`` (parser smoke tests); every other test
+    file is skipped. This is what makes the "tests/ except
+    tests/unit/parsers/" rule in the module docstring actually hold — the
+    outer walk cannot filter out ``tests/`` wholesale, or the smoke tests
+    would never be reached.
+
     Args:
         root: Root directory to walk.
 
@@ -253,7 +291,15 @@ def _iter_python_files(root: Path) -> Iterator[Path]:
         Paths to Python files.
     """
     for path in root.rglob("*.py"):
-        if any(part in _EXCLUDED_DIRS for part in path.parts):
+        rel = _rel(path)
+        if rel.startswith("tests/"):
+            # Inside tests/, only yield the parser smoke tests.
+            if not any(
+                rel.startswith(f"tests/{sub}/")
+                for sub in _INCLUDED_TEST_SUBDIRS
+            ):
+                continue
+        elif any(part in _EXCLUDED_DIRS for part in path.parts):
             continue
         yield path
 
@@ -300,7 +346,11 @@ def _collect_docstring_lines(tree: ast.AST) -> set[int]:
     """
     docstrings: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
             start = node.lineno
             end = node.end_lineno or start
             docstrings.update(range(start, end + 1))
@@ -352,7 +402,11 @@ def _extract_imports(tree: ast.AST) -> list[tuple[str, int]]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imports.append((alias.name, node.lineno))
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.level == 0
+        ):
             imports.append((node.module, node.lineno))
     return imports
 
@@ -362,7 +416,9 @@ def _extract_imports(tree: ast.AST) -> list[tuple[str, int]]:
 # ════════════════════════════════════════════════════════════════════
 
 
-def check_imports(path: Path, source: str, tree: ast.AST) -> list[Violation]:
+def check_imports(
+    path: Path, source: str, tree: ast.AST
+) -> list[Violation]:
     """Check that ``path`` respects the hexagonal dependency rules.
 
     Args:
@@ -381,6 +437,7 @@ def check_imports(path: Path, source: str, tree: ast.AST) -> list[Violation]:
     if not forbidden:
         return []
 
+    rule_id = _RULE_IDS[layer]
     type_checking_lines = _collect_type_checking_lines(tree)
     violations: list[Violation] = []
     rel = _rel(path)
@@ -391,13 +448,14 @@ def check_imports(path: Path, source: str, tree: ast.AST) -> list[Violation]:
             continue
 
         for forbidden_prefix in forbidden:
-            if module == forbidden_prefix or module.startswith(forbidden_prefix + "."):
-                rule = f"R{list(_FORBIDDEN_IMPORTS).index(layer) + 1}"
+            if module == forbidden_prefix or module.startswith(
+                forbidden_prefix + "."
+            ):
                 violations.append(
                     Violation(
                         file=rel,
                         line=lineno,
-                        rule=rule,
+                        rule=rule_id,
                         message=(
                             f"layer '{layer}' must not import '{module}' "
                             f"(forbidden: {forbidden_prefix})"
@@ -422,14 +480,18 @@ def _suggest_import_fix(layer: str, module: str) -> str:
             "core/ must remain UI-agnostic. Move the logic to core/ "
             "and expose it via a public API."
         )
-    if layer in ("parsers", "plugins") and module.startswith("nexusdl.interfaces"):
+    if layer in ("parsers", "plugins") and module.startswith(
+        "nexusdl.interfaces"
+    ):
         return (
             "Adapters must not depend on interfaces. Use a core Protocol."
         )
     return "Refactor to break the dependency (see ADR-001)."
 
 
-def check_patterns(path: Path, source: str, tree: ast.AST) -> list[Violation]:
+def check_patterns(
+    path: Path, source: str, tree: ast.AST
+) -> list[Violation]:
     """Check that ``path`` does not contain secrets or prod URLs.
 
     Args:
@@ -454,8 +516,10 @@ def check_patterns(path: Path, source: str, tree: ast.AST) -> list[Violation]:
         if lineno in docstring_lines:
             continue
 
-        # Skip lines with `# noqa: S...` (intentional)
-        if "# noqa" in line.lower() and "s" in line.lower():
+        # Skip lines explicitly silenced for bandit's S-rules. Only an S-rule
+        # noqa (or a bare ``# noqa`` at end of line) suppresses the check;
+        # unrelated rules like ``# noqa: E501`` do not.
+        if _NOQA_S_RULE_RE.search(line):
             continue
 
         for label, pattern in _FORBIDDEN_PATTERNS:
@@ -466,16 +530,26 @@ def check_patterns(path: Path, source: str, tree: ast.AST) -> list[Violation]:
                         file=rel,
                         line=lineno,
                         rule="SECRET",
-                        message=f"{label} detected: {match.group(0)[:40]}...",
-                        suggestion="Remove from source, use .env or SecretStr.",
+                        message=(
+                            f"{label} detected: {match.group(0)[:40]}..."
+                        ),
+                        suggestion=(
+                            "Remove from source, use .env or SecretStr."
+                        ),
                     )
                 )
 
     return violations
 
 
-def check_future_import(path: Path, source: str, tree: ast.AST) -> list[Violation]:
+def check_future_import(
+    path: Path, source: str, tree: ast.AST
+) -> list[Violation]:
     """Check that the file has ``from __future__ import annotations``.
+
+    ``__init__.py`` files and empty files are exempt — the import is
+    harmless there but not required, and requiring it would force a
+    needless touch on every empty package marker.
 
     Args:
         path: Python file.
@@ -485,7 +559,6 @@ def check_future_import(path: Path, source: str, tree: ast.AST) -> list[Violatio
     Returns:
         List of violations (at most one).
     """
-    # Skip __init__.py and empty files
     if path.name == "__init__.py" or not source.strip():
         return []
 
@@ -501,13 +574,21 @@ def check_future_import(path: Path, source: str, tree: ast.AST) -> list[Violatio
             line=1,
             rule="FUTURE",
             message="missing 'from __future__ import annotations'",
-            suggestion="Add at the top of the file (after the module docstring).",
+            suggestion=(
+                "Add at the top of the file (after the module docstring)."
+            ),
         )
     ]
 
 
-def check_spdx(path: Path, source: str, tree: ast.AST) -> list[Violation]:
+def check_spdx(
+    path: Path, source: str, tree: ast.AST
+) -> list[Violation]:
     """Check that the file has an SPDX license header.
+
+    ``__init__.py`` and ``version.py`` are exempt, matching the project
+    convention that those two file kinds carry no SPDX header of their
+    own.
 
     Args:
         path: Python file.
@@ -517,7 +598,6 @@ def check_spdx(path: Path, source: str, tree: ast.AST) -> list[Violation]:
     Returns:
         List of violations (at most one).
     """
-    # Skip __init__.py, version.py, and empty files
     if path.name in {"__init__.py", "version.py"} or not source.strip():
         return []
 
@@ -565,6 +645,7 @@ def run_checks(
         The aggregated report.
     """
     report = CheckReport()
+    violations_by_file: dict[str, int] = defaultdict(int)
 
     for path in sorted(paths):
         if _should_skip(path):
@@ -584,6 +665,8 @@ def run_checks(
             continue
 
         report.files_checked += 1
+        rel = _rel(path)
+        before = len(report.violations)
 
         # Architecture rules
         for v in check_imports(path, source, tree):
@@ -601,9 +684,11 @@ def run_checks(
             for v in check_spdx(path, source, tree):
                 report.add(v)
 
+        violations_by_file[rel] = len(report.violations) - before
+
         if verbose:
-            status = "✓" if not any(v.file == _rel(path) for v in report.violations) else "✗"
-            print(f"  {status} {_rel(path)}")
+            status = "✓" if violations_by_file[rel] == 0 else "✗"
+            print(f"  {status} {rel}")
 
     return report
 
@@ -617,7 +702,9 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="check_imports",
-        description="Enforce NexusDL hexagonal architecture and block secrets.",
+        description=(
+            "Enforce NexusDL hexagonal architecture and block secrets."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -642,12 +729,18 @@ Examples:
     parser.add_argument(
         "--check-future",
         action="store_true",
-        help="Require 'from __future__ import annotations' in every file",
+        help=(
+            "Require 'from __future__ import annotations' in every file "
+            "(except __init__.py and empty files)"
+        ),
     )
     parser.add_argument(
         "--check-spdx",
         action="store_true",
-        help="Require SPDX license header in every file",
+        help=(
+            "Require SPDX license header in every file "
+            "(except __init__.py and version.py)"
+        ),
     )
     parser.add_argument(
         "--suggest",
@@ -703,10 +796,16 @@ def print_report(
         print()
 
     if not report.has_violations:
-        print(f"✅ Architecture OK — {report.files_checked} file(s) checked, 0 violation.")
+        print(
+            f"✅ Architecture OK — {report.files_checked} file(s) "
+            f"checked, 0 violation."
+        )
         return
 
-    print(f"❌ {len(report.violations)} violation(s) detected:", file=sys.stderr)
+    print(
+        f"❌ {len(report.violations)} violation(s) detected:",
+        file=sys.stderr,
+    )
     print(file=sys.stderr)
 
     for v in report.violations:
@@ -760,7 +859,9 @@ def main() -> int:
             traceback.print_exc()
         return 3
 
-    print_report(report, suggest=args.suggest, verbose=args.verbose)
+    print_report(
+        report, suggest=args.suggest, verbose=args.verbose
+    )
     return 1 if report.has_violations else 0
 
 

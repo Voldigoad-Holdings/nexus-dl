@@ -471,6 +471,15 @@ def ensure_all_directories(settings: Settings) -> None:
     ends in ``.enc`` or ``.db`` would be a bug, since the file is
     written by the corresponding service, not by this helper.
 
+    The list of directories to create comes from **two** config
+    sections: :class:`~nexusdl.core.config.PathsSection` (which holds
+    every path except ``downloads_dir``) and
+    :class:`~nexusdl.core.config.StorageSection` (which owns
+    ``downloads_dir``). This split is documented in
+    :mod:`nexusdl.core.config`; a future config refactor that
+    consolidates the two sections into one would remove the two-source
+    lookup below, but the helper's behaviour would be identical.
+
     Idempotent — a second call is a no-op. Intended for the composition
     root's startup sequence, right after :class:`Settings` is loaded::
 
@@ -493,7 +502,6 @@ def ensure_all_directories(settings: Settings) -> None:
         settings.paths.user_config_dir,
         settings.paths.user_cache_dir,
         settings.paths.user_log_dir,
-        settings.paths.downloads_dir,
         settings.paths.cache_dir,
         settings.paths.logs_dir,
         settings.paths.plugins_dir,

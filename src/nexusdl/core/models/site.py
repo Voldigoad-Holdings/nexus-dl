@@ -16,8 +16,8 @@ the objects defined here and never the reverse.
 Three classes, three concerns
 -----------------------------
 * :class:`SiteCapabilities` — the nine booleans describing *what the site
-  can do* (search, latest, filters, …). A pure value object; its only job
-  is to be readable and to validate its own field types.
+  can do* (search, pagination, chapter list, …). A pure value object; its
+  only job is to be readable and to validate its own field types.
 * :class:`SiteConfig` — the immutable configuration of a site, matching the
   per-site schema validated against ``sites_schema.json``. Every field the
   YAML can carry is represented here, with the same constraints the schema
@@ -119,54 +119,58 @@ class SiteCapabilities:
     block in ``sites.yaml`` advertises no optional features. The loader is
     expected to relax this default for sites that *must* have a capability
     (e.g. a parser that cannot work without JS rendering should declare
-    ``requires_js_rendering: true`` and reject loading if the runtime
-    cannot provide it — but that check happens at the loader, not here).
+    ``js_rendered: true`` and reject loading if the runtime cannot provide
+    it — but that check happens at the loader, not here).
 
-    The nine flags are stable across the framework. Renaming a flag is a
-    breaking change requiring a schema migration; adding one requires
+    The nine flags are stable across the framework and align with the
+    mixin names used by :mod:`nexusdl.parsers.mixins` and the abstract
+    methods of :class:`~nexusdl.parsers.base.BaseParser`. Renaming a flag
+    is a breaking change requiring a schema migration; adding one requires
     bumping :data:`~nexusdl.core.registry.loader.CONFIG_VERSION`.
 
     Attributes:
         search: Text search is supported. When ``False``, the site's search
             entry point is disabled in every UI and
             :meth:`SiteRegistry.search_all` skips it.
-        search_by_id: The site supports an "exact match by source id"
-            endpoint, used for fast path lookups (e.g. resolving a
-            bookmarked ``manga_id`` without a text search).
-        latest: The site exposes a "recent updates" listing — required for
-            any UI surface that shows "what's new".
-        filters: The site supports advanced search filters (tags, status,
-            year, …). Metadata-only; the UI may show a filter panel.
         pagination: Search results are paginated. When ``False``, the
             parser is expected to return the entire result set in one
             response, and UIs should not show page navigation.
-        requires_auth: The site requires a logged-in session for at least
-            some content. The parser is expected to check
-            ``CookieManager`` before every request and raise
-            :class:`~nexusdl.core.exceptions.SessionError` if cookies are
-            missing.
-        requires_cloudflare_bypass: The site is behind a Cloudflare
-            interstitial. The parser should use the Cloudflare mixin.
-        requires_js_rendering: The site requires JavaScript execution to
-            fetch chapter pages (or sometimes even the manga detail page).
-            The parser should use the JS-rendering mixin and depend on
+        filters: The site supports advanced search filters (tags, status,
+            year, …). Metadata-only; the UI may show a filter panel.
+        metadata: The parser returns rich metadata on manga pages —
+            authors, description, publication year, status, alternative
+            titles. Sites that only expose a title and a cover are marked
+            ``False``.
+        cover_art: The parser extracts a cover image URL from the search
+            results and/or the manga page.
+        chapter_list: The parser enumerates the complete chapter list of a
+            manga. Universally required by :class:`BaseParser`, so this
+            flag is effectively always ``True`` in practice — but declared
+            explicitly so a future non-standard site (e.g. one that only
+            serves a single archive per manga) can opt out without
+            overriding the abstract method.
+        reader_images: The parser enumerates the page images of a chapter.
+            Same universal-requirement note as ``chapter_list``.
+        cloudflare: The site is behind a Cloudflare interstitial. The
+            parser inherits
+            :class:`~nexusdl.parsers.mixins.cloudflare.CloudflareMixin`.
+        js_rendered: The site requires JavaScript execution to fetch
+            chapter pages (or sometimes even the manga detail page). The
+            parser inherits
+            :class:`~nexusdl.parsers.mixins.js_rendered.JsRenderedMixin`
+            and depends on
             :class:`~nexusdl.core.session.playwright_pool.PlaywrightPool`.
-        bulk_download: The site offers a per-chapter bulk download (e.g. a
-            generated ZIP). The downloader can request the site's
-            pre-packaged archive instead of fetching pages individually,
-            which is dramatically cheaper for the source site and often
-            for the user.
     """
 
     search: bool = False
-    search_by_id: bool = False
-    latest: bool = False
-    filters: bool = False
     pagination: bool = False
-    requires_auth: bool = False
-    requires_cloudflare_bypass: bool = False
-    requires_js_rendering: bool = False
-    bulk_download: bool = False
+    filters: bool = False
+    metadata: bool = False
+    cover_art: bool = False
+    chapter_list: bool = False
+    reader_images: bool = False
+    cloudflare: bool = False
+    js_rendered: bool = False
 
     def __post_init__(self) -> None:
         """Validate that every flag is a genuine ``bool``.

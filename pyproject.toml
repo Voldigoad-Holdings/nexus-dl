@@ -262,6 +262,18 @@ pattern = '^__version__(\s*:\s*[^=]+)?\s*=\s*"(?P<version>[^"]+)"'
 # ────────────────────────────────────────────────────────────────────
 # Wheel (binaire installable via pip)
 # ────────────────────────────────────────────────────────────────────
+# ``packages = ["src/nexusdl"]`` already includes **everything** under
+# ``src/nexusdl/`` — Python modules, non-Python data files, migrations,
+# ``py.typed``, translations, etc. Hatchling walks the tree and adds
+# every file that is not excluded. The only exclusions that matter are
+# the ones below (build artefacts, the Next.js frontend).
+#
+# DO NOT add a ``force-include`` table: ``packages`` already includes
+# every subdirectory, and a ``force-include`` would attempt to add the
+# same files twice — hatchling raises ``ValueError: A second file is
+# being added to the wheel archive at the same path``. This is the
+# exact failure that broke the first Render build; keeping the module
+# comment here so a future contributor does not re-add the block.
 [tool.hatch.build.targets.wheel]
 packages = ["src/nexusdl"]
 
@@ -386,16 +398,6 @@ exclude = [
     "/**/*.orig",
     "/**/*.rej",
 ]
-
-# ────────────────────────────────────────────────────────────────────
-# Force-include — files that hatchling might otherwise skip
-# ────────────────────────────────────────────────────────────────────
-# ``packages = ["src/nexusdl"]`` already includes everything under
-# ``src/nexusdl/`` (non-Python files included).  These entries are
-# explicit for clarity, not strictly necessary.
-[tool.hatch.build.targets.wheel.force-include]
-"src/nexusdl/data" = "nexusdl/data"
-"src/nexusdl/core/library/migrations" = "nexusdl/core/library/migrations"
 
 # ════════════════════════════════════════════════════════════════════
 # RUFF — Lint + format

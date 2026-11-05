@@ -203,18 +203,25 @@ all = [
 # ────────────────────────────────────────────────────────────────────
 # Entry points (console scripts)
 # ────────────────────────────────────────────────────────────────────
-# All four scripts resolve to ``main`` callables that the backend team is
-# responsible for keeping in place.  Verify each after any refactor:
+# Single entry point. Every interface is reachable via a Typer
+# sub-command on ``nexusdl``:
 #
-#   python -c "from nexusdl.interfaces.cli.cli_entry import main, tui; print(main, tui)"
-#   python -c "from nexusdl.interfaces.gui.app import main; print(main)"
-#   python -c "from nexusdl.interfaces.web.backend.main import main; print(main)"
+#   nexusdl search run "one piece"       — CLI search
+#   nexusdl tui                          — launch the Textual TUI
+#   nexusdl web                          — launch the FastAPI + Next.js server
+#   nexusdl --help                       — full command list
 #
+# Do **not** add per-interface console scripts (``nexusdl-tui``,
+# ``nexusdl-gui``, ``nexusdl-web``) — a Typer sub-command is the
+# standard and only-maintainable form, and the intermediate module
+# requirements for the GUI and Web backends are not stable enough to
+# expose as separate entry points. If a future requirement demands
+# them, add a wrapper function in ``cli_entry.py`` and reference it
+# here — never reference a Typer command function directly (it takes
+# ``ctx: typer.Context`` as its first argument and would raise
+# ``TypeError`` when invoked without one).
 [project.scripts]
 nexusdl = "nexusdl.interfaces.cli.cli_entry:main"
-nexusdl-tui = "nexusdl.interfaces.cli.cli_entry:tui"
-nexusdl-gui = "nexusdl.interfaces.gui.app:main"
-nexusdl-web = "nexusdl.interfaces.web.backend.main:main"
 
 # ────────────────────────────────────────────────────────────────────
 # Project URLs

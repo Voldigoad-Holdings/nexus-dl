@@ -7,14 +7,14 @@
  * library card.  Its single job is to help them **start a download**: it
  * presents the metadata (cover, synopsis, tags, status), enumerates every
  * chapter, and lets the user select the chapters they want and submit them
- * as a single :type:`~../../types/download.CreateDownloadRequest`.
+ * as a single :type:`~../../../types/download.CreateDownloadRequest`.
  *
  * Data flow
  * ---------
  * Two independent server queries, both cached by TanStack Query:
  *
- * * ``api.getManga(id)`` — the :type:`~../../types/manga.Manga` resource.
- * * ``api.getMangaChapters(id)`` — every :type:`~../../types/manga.Chapter`
+ * * ``api.getManga(id)`` — the :type:`~../../../types/manga.Manga` resource.
+ * * ``api.getMangaChapters(id)`` — every :type:`~../../../types/manga.Chapter`
  *   for the series, oldest first.
  *
  * The two queries are treated separately: if the manga loads but the
@@ -25,7 +25,7 @@
  * Live download status
  * --------------------
  * The "Downloads for this series" section and the per-chapter status
- * indicators both read from :class:`~../../store/downloads.DownloadsStore`.
+ * indicators both read from :class:`~../../../store/downloads.DownloadsStore`.
  * Two **distinct subscriptions** keep them fast:
  *
  * * The section subscribes to the full task objects for this manga
@@ -38,7 +38,7 @@
  * Selection and submission
  * ------------------------
  * Selection is local state, cleared on successful submission.  Submission
- * calls :meth:`~../../hooks/useDownload.useDownload`'s ``create`` action
+ * calls :meth:`~../../../hooks/useDownload.useDownload`'s ``create`` action
  * with the user's default packaging preferences (read from the settings
  * store) — the user's choice is remembered on ``/settings``, not repeated
  * on every download.

@@ -781,11 +781,24 @@ export class NexusWebSocketClient {
   }
 
   private _dispatchEvent(event: NexusEvent): void {
+    // Narrow the widened ``NexusEvent`` back to its typed form.
+    //
+    // ``NexusEvent<T, P>`` defaults ``P`` to ``unknown``, and the
+    // ``_handlers`` map is keyed only by the event-type string, so the
+    // type relationship between ``event.type`` and the payload shape is
+    // lost at this point.  That relationship was guaranteed when the
+    // handler was registered in :meth:`subscribe` — the only way to add
+    // to a set at ``type`` is through ``subscribe<T>(type, handler)``,
+    // which enforces ``EventHandler<T>`` at the call site.  Re-asserting
+    // the relationship here is safe and restores the compiler's ability
+    // to check the handler invocation below.
+    const typedEvent = event as NexusEvent<EventType, EventTypeMap[EventType]>;
+
     const handlers = this._handlers.get(event.type);
     if (handlers !== undefined) {
       for (const handler of handlers) {
         try {
-          handler(event.payload, event);
+          handler(typedEvent.payload, typedEvent);
         } catch (err) {
           // A throwing handler must not take down the client or prevent
           // other handlers from running.  Log and move on.

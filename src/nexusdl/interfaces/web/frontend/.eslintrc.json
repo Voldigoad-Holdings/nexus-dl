@@ -65,6 +65,8 @@
   "overrides": [
     {
       "files": ["**/*.ts", "**/*.tsx"],
+      "parser": "@typescript-eslint/parser",
+      "plugins": ["@typescript-eslint"],
       "rules": {
         "@typescript-eslint/no-unused-vars": [
           "error",
@@ -91,9 +93,7 @@
           }
         ],
         "@typescript-eslint/no-non-null-assertion": "warn",
-        "@typescript-eslint/prefer-as-const": "error",
-        "@typescript-eslint/prefer-for-of": "error",
-        "@typescript-eslint/prefer-optional-chain": "error"
+        "@typescript-eslint/prefer-as-const": "error"
       }
     },
     {

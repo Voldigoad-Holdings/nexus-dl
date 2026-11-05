@@ -72,7 +72,7 @@
  * immediately after hydration.  The skeleton mirrors the page's structure,
  * so there is no layout shift when the real content replaces it.
  */
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   Check,
@@ -89,7 +89,6 @@ import {
   useCallback,
   useEffect,
   useId,
-  useMemo,
   useState,
   type ReactNode,
 } from "react";
@@ -106,7 +105,6 @@ import { resetWebSocketClient } from "../../lib/ws";
 import { cn } from "../../lib/utils";
 import { useDownloadsStore } from "../../store/downloads";
 import {
-  DEFAULT_SETTINGS,
   UI_LOCALES,
   useSettingsHydrated,
   useSettingsStore,
@@ -552,7 +550,7 @@ function ServerSettingsSection() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
 
-  const queryClient = useQueryClient_();
+  const queryClient = useQueryClient();
 
   const settingsQuery = useQuery<SettingsSnapshot, NexusApiError>({
     queryKey: ["server-settings"],
@@ -1184,20 +1182,3 @@ function SettingsPageSkeleton() {
     </div>
   );
 }
-
-// ───────────────────────────────────────────────────────────────────────────
-// Local hook alias
-// ───────────────────────────────────────────────────────────────────────────
-//
-// ``useQueryClient`` is imported lazily inside the admin section rather
-// than at the top of the module.  The admin section is the only consumer,
-// and pulling the provider hook out of the top-level import keeps the
-// page's import surface minimal for the 99 % of users who never expand it.
-// The wrapper below caches the hook reference so it is still called as a
-// hook (React requires hooks to be called unconditionally at the top of a
-// component — this is a re-export, not an indirection, and the component
-// that uses it still calls the real hook at its own top level).
-import { useQueryClient as useQueryClientImpl } from "@tanstack/react-query";
-
-/** Re-export of TanStack Query's ``useQueryClient`` for the admin section. */
-const useQueryClient_ = useQueryClientImpl;

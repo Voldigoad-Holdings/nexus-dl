@@ -90,7 +90,6 @@ import {
   Loader2,
   Search,
   X,
-  type LucideIcon,
 } from "lucide-react";
 import { useId, useMemo, useState } from "react";
 
@@ -793,9 +792,3 @@ export function ChapterList({
     </div>
   );
 }
-
-// Suppress unused warnings for the type-only import — ``LucideIcon`` is
-// used implicitly through the icon components above; importing it is a
-// documentation signal of what the sub-component expects.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-type _LucideIconRef = LucideIcon;

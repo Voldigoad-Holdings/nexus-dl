@@ -114,6 +114,17 @@ Every command in those groups receives ``ctx: typer.Context`` and reads
 the wired services via ``ctx.obj.ensure()``. See the :class:`CLIState`
 docstring for the exact contract.
 
+``--version`` handling
+----------------------
+Typer's :class:`~typer.Typer` constructor does **not** accept ``version``
+or ``version_option`` arguments — those never existed in the API. The
+``--version`` flag is implemented as an **eager option on the root
+callback** (:data:`_root_callback`): it declares ``--version`` with
+``is_eager=True`` and prints the version before any sub-command runs.
+A user who invokes ``nexusdl --version`` gets the version and a clean
+exit; ``nexusdl search run foo`` runs the callback first (with
+``version=False``) then dispatches to the sub-command.
+
 Localisation
 ------------
 The CLI prints technical errors on stderr in English, matching the Unix
@@ -657,6 +668,12 @@ def _raise_bootstrap_error(exc: Exception) -> None:
 #: renderer because the CLI has its own error presentation (see
 #: :func:`_raise_bootstrap_error` and the ``on_error`` hook installed by
 #: :func:`main`). Enabling both would double up on tracebacks.
+#:
+#: ``--version`` is **not** a constructor argument of :class:`typer.Typer`
+#: (that parameter has never existed in the API). The flag is implemented
+#: as an eager option on :data:`_root_callback` below — the standard
+#: Typer pattern for it. See the module docstring's "--version handling"
+#: section for the reasoning.
 app: Final[typer.Typer] = typer.Typer(
     name="nexusdl",
     help=(
@@ -665,8 +682,6 @@ app: Final[typer.Typer] = typer.Typer(
     ),
     no_args_is_help=True,
     pretty_exceptions_enable=False,
-    version=NEXUSDL_VERSION,
-    version_option=True,
     add_completion=True,
 )
 
@@ -692,6 +707,15 @@ app.add_typer(admin_app, name="admin")
 @app.callback()
 def _root_callback(
     ctx: typer.Context,
+    version: Annotated[
+        bool,
+        typer.Option(
+            "--version",
+            "-V",
+            is_eager=True,
+            help="Show the NexusDL version and exit.",
+        ),
+    ] = False,
     debug: Annotated[
         bool,
         typer.Option(
@@ -718,19 +742,41 @@ def _root_callback(
 ) -> None:
     """Prepare the invocation context for every sub-command.
 
-    Runs **before** the requested command, but the heavy bootstrap (see
-    :meth:`CLIState.ensure`) is deferred until the command actually
-    asks for services. This makes ``nexusdl version`` and ``nexusdl
-    admin init`` work in an environment where ``.env`` has not been
-    created yet, while still giving every other command a single
-    injection point.
+    Handles three concerns:
+
+    * **``--version``** — printed and exits before any sub-command
+      runs. Implemented here (rather than as a constructor argument
+      of :class:`typer.Typer`, which does not support it) because
+      Typer's eager-option mechanism is the standard way to
+      short-circuit the callback.
+
+    * **``--debug`` / ``--quiet``** — forwarded to
+      :class:`CLIState` so the bootstrap knows what logging verbosity
+      to apply.
+
+    * **State injection** — stores the :class:`CLIState` on
+      ``ctx.obj`` so every sub-command can retrieve it and call
+      ``.ensure()``.
+
+    Runs **before** the requested command, but the heavy bootstrap
+    (see :meth:`CLIState.ensure`) is deferred until the command
+    actually asks for services. This makes ``nexusdl version`` and
+    ``nexusdl admin init`` work in an environment where ``.env`` has
+    not been created yet, while still giving every other command a
+    single injection point.
 
     Args:
         ctx: Typer's invocation context. The state is stored on
             ``ctx.obj`` and retrieved by every sub-command.
+        version: Set by ``--version``. When ``True``, prints the
+            version and exits before any sub-command runs.
         debug: Forwarded to :class:`CLIState`.
         quiet: Forwarded to :class:`CLIState`.
     """
+    if version:
+        typer.echo(f"{APP_NAME} v{NEXUSDL_VERSION}")
+        raise typer.Exit(code=0)
+
     ctx.obj = CLIState(debug=debug, quiet=quiet)
 
 

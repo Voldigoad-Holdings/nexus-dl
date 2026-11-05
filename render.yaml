@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: nexus-dl
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: pip install --upgrade pip && pip install .
+    startCommand: python -m nexusdl web
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: NEXUSDL_PLAYWRIGHT__ENABLED
+        value: "false"
+      - key: NEXUSDL_FLARESOLVERR__ENABLED
+        value: "false"
+      - key: NEXUSDL_DATABASE_FILE
+        value: "/tmp/nexusdl/library.db"
+      - key: NEXUSDL_LOGGING__FORMAT
+        value: "json"
+      - key: NEXUSDL_SECRET_KEY
+        sync: false    # à renseigner dans le dashboard
+      - key: NEXUSDL_JWT_SECRET
+        sync: false
+      - key: NEXUSDL_COOKIE_ENCRYPTION_KEY
+        sync: false

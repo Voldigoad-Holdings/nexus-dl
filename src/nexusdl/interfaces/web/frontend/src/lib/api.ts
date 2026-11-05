@@ -111,6 +111,33 @@ import type {
 } from "../types/manga";
 
 // ───────────────────────────────────────────────────────────────────────────
+// Wire-type re-exports
+// ───────────────────────────────────────────────────────────────────────────
+//
+// ``api.ts`` imports the wire shapes from ``../types/manga`` for use in its
+// own method signatures.  Re-exporting them here lets callers import every
+// response envelope from a single module (``lib/api``) instead of chasing
+// the shape back to ``types/manga`` — matching how ``download.ts`` and
+// ``site.ts`` work.
+//
+// This is the same pattern the backend's ``parsers.exceptions`` module uses:
+// the definition lives in its canonical location (``types/manga.ts``); the
+// re-export is a convenience so that a page importing ``getManga`` and its
+// response type from one place does not need two import lines.
+export type {
+  ChapterPagesResponse,
+  ChapterResponse,
+  Manga,
+  MangaChaptersResponse,
+  MangaResponse,
+  SearchRequest,
+  SearchResponse,
+  SiteHealthResponse,
+  SiteListResponse,
+  SiteResponse,
+} from "../types/manga";
+
+// ───────────────────────────────────────────────────────────────────────────
 // Constants
 // ───────────────────────────────────────────────────────────────────────────
 

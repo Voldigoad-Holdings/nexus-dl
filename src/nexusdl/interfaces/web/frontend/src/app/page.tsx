@@ -29,12 +29,12 @@
  *
  * Reuse over duplication
  * ----------------------
- * * Recent downloads reuse :class:`~../../components/DownloadItem.DownloadItem`
+ * * Recent downloads reuse :class:`~../components/DownloadItem.DownloadItem`
  *   with the same action wiring as ``/downloads`` — pause, resume,
  *   cancel, remove are all available from the home page, because a user
  *   who notices a stuck download on the dashboard should not have to
  *   navigate to ``/downloads`` to fix it.
- * * Recently added entries reuse :class:`~../../components/MangaCard.MangaCard`
+ * * Recently added entries reuse :class:`~../components/MangaCard.MangaCard`
  *   in a small two-column grid, so the tile looks identical to what the
  *   library page shows.
  *
@@ -49,7 +49,7 @@
  *   WebSocket events invalidate the ``["library"]`` prefix, so both
  *   entries are refreshed).
  * * Downloads — read from the downloads store via
- *   :func:`~../../hooks/useDownload.useDownload`.  Because the provider
+ *   :func:`~../hooks/useDownload.useDownload`.  Because the provider
  *   wires WebSocket events into the store and every page uses the same
  *   store, a download started on ``/manga/{id}`` is immediately visible
  *   here, without a refetch.
@@ -98,18 +98,18 @@ import {
 import Link from "next/link";
 import { useMemo } from "react";
 
-import { DownloadItem } from "../../components/DownloadItem";
-import { MangaCard } from "../../components/MangaCard";
+import { DownloadItem } from "../components/DownloadItem";
+import { MangaCard } from "../components/MangaCard";
 import {
   api,
   type LibraryEntry,
   type LibraryListResponse,
   type NexusApiError,
   type SiteListResponse,
-} from "../../lib/api";
-import { cn, formatNumber } from "../../lib/utils";
-import { useDownload } from "../../hooks/useDownload";
-import type { DownloadTask } from "../../types/download";
+} from "../lib/api";
+import { cn, formatNumber } from "../lib/utils";
+import { useDownload } from "../hooks/useDownload";
+import type { DownloadTask } from "../types/download";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Constants
@@ -396,7 +396,7 @@ function StatCard({
 /**
  * The "Recent downloads" panel.
  *
- * Wraps :class:`~../../components/DownloadItem.DownloadItem` — every
+ * Wraps :class:`~../components/DownloadItem.DownloadItem` — every
  * action the downloads page exposes is available here, because the user
  * should not have to navigate away from the dashboard to unblock a stuck
  * task.  The header carries a "View all" link into ``/downloads``.

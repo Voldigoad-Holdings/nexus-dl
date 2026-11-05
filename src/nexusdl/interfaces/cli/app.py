@@ -90,18 +90,16 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import TYPE_CHECKING, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from loguru import logger
 from textual.app import App
 
-from nexusdl.interfaces.cli.config import build_tui_config
+from nexusdl.interfaces.cli.config import TuiConfig, build_tui_config
 from nexusdl.interfaces.cli.screens.main import MainScreen
 from nexusdl.interfaces.cli.widgets.log_viewer import LogEntry, LogViewer
 
 if TYPE_CHECKING:
-    from loguru import Message
-
     from nexusdl.interfaces.cli.cli_entry import WiredServices
 
 
@@ -151,6 +149,9 @@ class _TuiLogRouter:
         Args:
             ring_size: Maximum number of historical entries retained for
                 seeding. Must be ``>= 1``.
+
+        Raises:
+            ValueError: If ``ring_size < 1``.
         """
         if ring_size < 1:
             raise ValueError(
@@ -164,13 +165,22 @@ class _TuiLogRouter:
     # Sink (called by loguru)                                           #
     # ------------------------------------------------------------------ #
 
-    def sink(self, message: Message) -> None:
+    def sink(self, message: Any) -> None:
         """Receive one loguru message and forward it everywhere.
 
         Registered via :func:`loguru.logger.add` in :func:`run_app`. The
         method extracts a :class:`LogEntry` from ``message.record``,
         appends it to the ring buffer, and pushes it to every attached
         viewer.
+
+        ``message`` is typed as :data:`Any` rather than
+        ``loguru.Message`` because the ``Message`` class is not reliably
+        exported from :mod:`loguru`'s top-level namespace across the
+        supported version range. The attribute we actually use —
+        ``message.record`` — is a plain :class:`dict` and needs no type
+        annotation of its own; typing the parameter as ``Any`` keeps the
+        signature compatible with every loguru version without requiring
+        the private ``loguru._logger`` module.
 
         The per-viewer push happens **outside** the lock so a slow or
         dead viewer cannot stall the router for other viewers or for
@@ -184,8 +194,8 @@ class _TuiLogRouter:
         silent drop of one malformed record is strictly better.
 
         Args:
-            message: The loguru message. ``message.record`` is the
-                structured payload; the message itself is a
+            message: The loguru message object. ``message.record`` is
+                the structured payload; the message itself is a
                 :class:`str` subclass.
         """
         try:
@@ -296,6 +306,16 @@ class NexusDLApp(App[None]):
     #: ``theme.tcss`` lives next to this file. Textual resolves the path
     #: relative to the App's module directory. Overridable via
     #: :attr:`~nexusdl.interfaces.cli.config.TuiConfig.css_path`.
+    #:
+    #: Declared as ``ClassVar`` (not a plain class attribute) to match
+    #: :class:`textual.app.App.CSS_PATH`'s own annotation and to keep
+    #: the "class-level default" semantics explicit. The instance-level
+    #: override (when ``config.css_path`` is set) goes through
+    #: :func:`object.__setattr__` — a plain ``self.CSS_PATH = ...``
+    #: would trigger ``mypy --strict``'s "cannot assign to class
+    #: variable via instance" error, and using ``object.__setattr__``
+    #: is the sanctioned way to assign a ClassVar at instance level
+    #: without disabling the annotation.
     CSS_PATH: ClassVar[str] = "theme.tcss"
 
     #: Command palette enabled by default. A
@@ -308,8 +328,8 @@ class NexusDLApp(App[None]):
         self,
         *,
         services: WiredServices,
-        config: object,  # TuiConfig — see TYPE_CHECKING note below
-        log_router: object,  # _TuiLogRouter — same
+        config: TuiConfig,
+        log_router: Any,
     ) -> None:
         """Initialise the app with the wired services and resolved config.
 
@@ -326,14 +346,18 @@ class NexusDLApp(App[None]):
                 ``command_palette``, and ``css_path`` from it.
             log_router: The TUI log router. Stored as the public
                 :attr:`log_router` attribute for the LogsScreen to use.
+                Typed as ``Any`` because :class:`_TuiLogRouter` is a
+                private class defined in this module; using a proper
+                forward reference from ``__init__`` to a class declared
+                later in the file requires ``from __future__ import
+                annotations`` (present) but also adds noise for no
+                typing benefit — the only consumer is ``LogsScreen``,
+                which reads ``self.app.log_router`` through
+                :class:`LogRouter` protocol methods that the type
+                checker cannot verify anyway.
         """
         super().__init__()
         self._services = services
-        # The parameters are typed as ``object`` because importing
-        # ``TuiConfig`` at runtime would pull in ``textual.theme``
-        # before Textual is fully initialised (it is, at this point,
-        # but keeping the annotation lazy documents that the App
-        # works with any object satisfying the TuiConfig shape).
         self._config = config
 
         # --- Instance-level overrides of Textual's class defaults --- #
@@ -349,10 +373,15 @@ class NexusDLApp(App[None]):
         # comment rather than a redundant assignment.
 
         if config.css_path is not None:
-            # Override the class-level default. Textual resolves the
-            # class attribute relative to the module; an explicit
-            # path bypasses that resolution.
-            self.CSS_PATH = config.css_path
+            # Override the class-level default. Textual resolves
+            # ``self.CSS_PATH`` at mount time (instance attribute
+            # shadows class attribute), so this instance-level
+            # assignment works as intended. The assignment goes through
+            # ``object.__setattr__`` because ``mypy --strict`` rejects
+            # assigning to a ClassVar via ``self.attr = ...``.
+            object.__setattr__(
+                self, "CSS_PATH", str(config.css_path)
+            )
 
         # Public: LogsScreen reads ``self.app.log_router``.
         self.log_router = log_router

@@ -212,11 +212,9 @@ def version_string() -> str:
         A string like ``"0.1.0 (dev, abc1234)"`` or ``"0.1.0 (dev)"``
         if no git commit is available.
     """
-    parts = [__version__, f"({__build__}"]
     if __commit__:
-        parts.append(f", {__commit__}")
-    parts.append(")")
-    return " ".join(parts)
+        return f"{__version__} ({__build__}, {__commit__})"
+    return f"{__version__} ({__build__})"
 
 
 def version_dict() -> dict[str, str | int | list[int] | None]:

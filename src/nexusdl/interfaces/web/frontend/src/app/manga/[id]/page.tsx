@@ -77,16 +77,16 @@ import {
 import { DownloadItem } from "../../../components/DownloadItem";
 import {
   api,
-  NexusApiError,
   type MangaChaptersResponse,
   type MangaResponse,
+  type NexusApiError,
 } from "../../../lib/api";
 import { cn } from "../../../lib/utils";
 import { useDownload } from "../../../hooks/useDownload";
 import { useDownloadsStore } from "../../../store/downloads";
 import { useSettingsStore } from "../../../store/settings";
 import type { DownloadTask } from "../../../types/download";
-import type { Chapter, Manga } from "../../../types/manga";
+import type { Manga } from "../../../types/manga";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Chapter status derivation

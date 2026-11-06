@@ -83,29 +83,54 @@ semantic level: ``try_acquire()`` is equivalent to
 
 Retryability
 ------------
-:class:`~nexusdl.core.exceptions.RateLimitTimeoutError` is a transient
-failure — retrying after a longer wait will succeed, and the retry loop
-in :mod:`nexusdl.core.downloader.retry` is expected to treat it as
-retryable. **Integration note**: that module's ``is_retryable`` currently
-recognises :class:`~nexusdl.core.exceptions.SessionRateLimitError` but
-not ``RateLimitTimeoutError``. ``exceptions.py`` should declare
-``RateLimitTimeoutError`` as a **subclass** of
-``SessionRateLimitError`` — the two share the same semantics (the site
-throttled us, try again later) and subtyping is the smallest change that
-makes the retry layer work without reopening it.
+:class:`~nexusdl.core.exceptions.RateLimitTimeoutError` is classified
+**permanent** (non-retryable) by
+:func:`nexusdl.core.downloader.retry.is_retryable`. That is a deliberate
+design decision, not an oversight:
 
-Thread safety
--------------
-Every public method takes an :class:`asyncio.Lock`. The critical sections
-are O(1) — one float comparison, one subtraction, one dict update. The
-lock is therefore never contended in a way that matters: even a thousand
-concurrent :meth:`try_acquire` calls complete in microseconds each.
+* ``SessionRateLimitError`` means *the server told us to slow down* — a
+  backoff and retry is appropriate, and that is what the retry layer
+  does.
+* ``RateLimitTimeoutError`` means *our own limiter gave up waiting for
+  a slot* — the caller has already waited the configured window, so a
+  retry would simply wait the same window again. The correct response
+  is to surface the failure, not to retry it blindly.
+
+A caller that genuinely wants to retry (a background job with time to
+spare) wraps the acquisition in
+:func:`nexusdl.core.utils.retry.retry_async` explicitly. This keeps the
+retry policy at the call site where the trade-off is visible, rather
+than hidden inside the limiter.
+
+See :mod:`nexusdl.core.exceptions` for the full retry classification of
+every exception in the hierarchy.
+
+Thread safety and event-loop affinity
+-------------------------------------
+Every public method takes an :class:`asyncio.Lock`. The critical
+sections are O(1) — one float comparison, one subtraction, one dict
+update. The lock is therefore never contended in a way that matters:
+even a thousand concurrent :meth:`try_acquire` calls complete in
+microseconds each.
 
 :class:`RateLimiter` is **not** thread-safe across operating-system
 threads. It is designed for a single :mod:`asyncio` event loop, which is
 how the session uses it. A caller that genuinely needs to call it from
 ``asyncio.to_thread`` should wrap it in a ``threading.Lock`` at its own
 boundary, not add one here.
+
+**Event-loop affinity.** The internal :class:`asyncio.Lock` is bound to
+the event loop in which the limiter's first ``await`` runs. A
+:class:`RateLimiter` constructed outside any event loop (the normal
+case — the composition root is synchronous) binds to whichever loop
+first touches it, and **cannot** be reused across two successive
+``asyncio.run()`` calls. A test that constructs a limiter at module
+scope and exercises it under two separate ``asyncio.run()`` invocations
+will hit ``RuntimeError: <Lock> is bound to a different event loop`` on
+the second run. Construct the limiter inside the test body, or use a
+fixture that yields a fresh instance per test. Production code paths
+run under a single event loop for the process lifetime and are not
+affected.
 
 Dependency graph (no cycles)::
 
@@ -204,10 +229,10 @@ class RateLimiter:
 
     Stateless across instances (each one owns its own bucket and
     counters), asyncio-native, and safe to await concurrently from any
-    number of coroutines.
+    number of coroutines **within the same event loop**.
 
     See the module docstring for the algorithm, the timeout semantics,
-    and the fairness considerations.
+    the event-loop affinity rule, and the fairness considerations.
 
     Example:
         >>> limiter = RateLimiter(rate_per_second=2.0, burst=4, name="md")

@@ -45,6 +45,23 @@ significantly more complex rendering path for a scenario that is
 not the pipeline's primary use case (a personal library rarely
 exceeds a few hundred mangas).
 
+Fetch serialisation
+-------------------
+The screen tracks whether a fetch worker is currently in flight via
+:attr:`_fetch_in_progress`. Pagination actions
+(:meth:`_go_prev`, :meth:`_go_next`) are **ignored** while a fetch is
+in flight: a user who double-clicks "Next" during a slow fetch must
+not advance the page counter twice. The worker sets the flag at entry
+and clears it in its ``finally`` block, so an exception or a cancel
+from a newer fetch leaves the screen ready for the next action rather
+than stuck.
+
+``@work(exclusive=True)`` would serialise the *workers* — a new fetch
+cancels the previous one — but that alone does not prevent the page
+counter from advancing past the state the previous fetch was
+targeting, which is what a double-click actually does. The flag is
+what closes that window.
+
 Activation semantics
 --------------------
 A manga card emits :class:`MangaCard.Selected` when activated. The
@@ -73,7 +90,17 @@ close and reopen the screen. Two refresh sources:
 The event-driven refresh is debounced (300 ms) — a download pipeline
 that adds 20 chapters in rapid succession would otherwise trigger 20
 full-page fetches. The debounce timer coalesces bursts into a single
-fetch.
+fetch. The timer is **cancelled and cleared** on every new event, and
+**cleared** by the callback that fires it, so a stale timer handle is
+never left in :attr:`_refresh_timer` — a user who pops the screen
+after a burst does not leave a callback pending on a torn-down
+widget tree.
+
+Debounced callbacks check :attr:`~textual.screen.Screen.is_mounted`
+before dispatching a fetch. A user who pops the screen in the 300 ms
+window between the last library write and the debounce timer firing
+must not produce a ``NoMatches`` from ``query_one`` — the guard makes
+the late callback a silent no-op.
 
 Not a download surface
 ----------------------
@@ -153,8 +180,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import Button, Input, Label
-from textual.widgets import Static
+from textual.widgets import Button, Input, Label, Static
 
 from nexusdl.core.constants import EVENT_LIBRARY_UPDATED
 from nexusdl.core.i18n import Translator, get_default_translator
@@ -215,7 +241,8 @@ class LibraryScreen(Screen[None]):
     """A Textual screen for browsing the local library.
 
     See the module docstring for the design contract, the pagination
-    model, the activation semantics, and the refresh policy.
+    model, the fetch serialisation, the activation semantics, and the
+    refresh policy.
 
     Args:
         database: The library database. Its
@@ -356,9 +383,16 @@ class LibraryScreen(Screen[None]):
         #: re-rendering do not have to re-fetch on every action.
         self._current_result: PaginatedResult[Manga] | None = None
 
+        #: Whether a fetch worker is currently in flight. Pagination
+        #: actions are ignored while this is ``True`` — see the module
+        #: docstring's "Fetch serialisation" section for the race this
+        #: closes.
+        self._fetch_in_progress: bool = False
+
         #: Pending refresh-timer handle. Used to debounce the
         #: ``library.updated`` event handler. ``None`` when no refresh
-        #: is pending.
+        #: is pending (either because none was scheduled, or because
+        #: the scheduled callback has fired).
         self._refresh_timer: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------ #
@@ -446,8 +480,14 @@ class LibraryScreen(Screen[None]):
         A fetch failure is surfaced in the status line; the previous
         results, if any, remain visible so a transient error does not
         wipe what the user was looking at.
+
+        :attr:`_fetch_in_progress` is set at entry and cleared in the
+        ``finally`` block — pagination actions check it, so a
+        double-click cannot advance the page counter past the state the
+        previous fetch was targeting.
         """
         is_search = bool(self._query)
+        self._fetch_in_progress = True
         if is_search:
             self._set_status(
                 self._translator.translate("library.status.searching")
@@ -473,6 +513,8 @@ class LibraryScreen(Screen[None]):
                 )
             )
             return
+        finally:
+            self._fetch_in_progress = False
 
         self._current_result = result
         self._render_result(result)
@@ -594,7 +636,17 @@ class LibraryScreen(Screen[None]):
     # ------------------------------------------------------------------ #
 
     def action_refresh(self) -> None:
-        """Re-fetch the current page. Bound to ``R``."""
+        """Re-fetch the current page. Bound to ``R``.
+
+        A no-op when the screen is not yet mounted or has been
+        unmounted — the debounce timer can fire in the window between
+        a ``library.updated`` event and the user popping the screen,
+        and the fetch would otherwise hit ``query_one`` against a
+        torn-down widget tree. See the module docstring's "Refresh"
+        section.
+        """
+        if not self.is_mounted:
+            return
         self._fetch_page()
 
     def action_back(self) -> None:
@@ -609,13 +661,26 @@ class LibraryScreen(Screen[None]):
         self._fetch_page()
 
     def _go_prev(self) -> None:
-        """Move to the previous page, if one exists."""
+        """Move to the previous page, if one exists.
+
+        Ignored while a fetch is in flight — a double-click on the
+        button must not advance the page counter past the state the
+        previous fetch was targeting. See the module docstring's
+        "Fetch serialisation" section.
+        """
+        if self._fetch_in_progress:
+            return
         if self._page > 1:
             self._page -= 1
             self._fetch_page()
 
     def _go_next(self) -> None:
-        """Move to the next page, if one exists."""
+        """Move to the next page, if one exists.
+
+        Ignored while a fetch is in flight — see :meth:`_go_prev`.
+        """
+        if self._fetch_in_progress:
+            return
         if (
             self._current_result is not None
             and self._current_result.has_next
@@ -640,11 +705,27 @@ class LibraryScreen(Screen[None]):
         The delayed refresh runs through :meth:`action_refresh`, so it
         goes through the same worker machinery as a manual refresh
         (exclusive group, cancellation on re-entry, error surfacing).
+        The timer handle is cleared by :meth:`_fire_scheduled_refresh`
+        when the callback fires, so a stale handle is never left in
+        :attr:`_refresh_timer`.
         """
         if self._refresh_timer is not None:
             self._refresh_timer.cancel()
 
         loop = asyncio.get_running_loop()
         self._refresh_timer = loop.call_later(
-            _REFRESH_DEBOUNCE_SECONDS, self.action_refresh
+            _REFRESH_DEBOUNCE_SECONDS, self._fire_scheduled_refresh
         )
+
+    def _fire_scheduled_refresh(self) -> None:
+        """Execute a debounced refresh. Runs on the event loop.
+
+        Clears :attr:`_refresh_timer` **before** calling
+        :meth:`action_refresh` so that a new ``library.updated`` event
+        arriving during the refresh does not see a dead handle and
+        skip its own debounce re-arm. Also serves as the single place
+        where the timer is invalidated on normal completion — the
+        callback itself, not just :meth:`on_unmount`.
+        """
+        self._refresh_timer = None
+        self.action_refresh()

@@ -37,11 +37,20 @@
 /* =============================================================================
    Custom variables
    =============================================================================
-   Every value below is either a theme variable (which resolves per
-   theme) or a fixed app-specific choice (which does not). Fixed values
-   are the ones a theme author would not consider "part of the palette"
-   — the adult-content badge colour, the JS-required badge colour — but
-   that the app wants to be consistent across themes.
+   These are **preparatory**, not yet consumed by any CSS rule in this
+   file. The manga card and chapter list currently build their styled
+   ``Text`` spans with literal Rich style strings (``"bold red"``,
+   ``"bold cyan"``, ``"green"``) rather than theme variables. The
+   intent of declaring the variables here is to have a single named
+   home for those colours so a future refactor of the widget code can
+   reference them symbolically instead of repeating the literals.
+
+   A themer reading this file sees the app's "semantic colour
+   palette" in one place, even though nothing in the CSS itself uses
+   the variables yet. That is the trade-off: a small amount of
+   currently-unused declarations versus a future widget refactor that
+   has to hunt for the colour names across three widget files. The
+   declarations are cheap and self-documenting.
    ============================================================================= */
 
 $nsdl-adult-badge: $error;
@@ -57,10 +66,16 @@ $nsdl-status-read: $success;
    $surface`` in its ``DEFAULT_CSS``. This rule catches Screens that do
    not (a future ModalScreen subclass, a dialog) so the app never
    renders a white flash on top of a dark theme.
+
+   The base colour is ``$surface`` — the same as the screens' own
+   ``DEFAULT_CSS`` — so a screen that fails to declare its background
+   looks visually identical to one that does. A screen that wants the
+   slightly darker ``$background`` (a future "full-screen video" or
+   "minimal" mode) declares it explicitly in its own ``DEFAULT_CSS``.
    ============================================================================= */
 
 Screen {
-    background: $background;
+    background: $surface;
     color: $text;
 }
 
@@ -321,9 +336,19 @@ OptionList > .option-list--option-disabled {
    DataTable (chapter list)
    =============================================================================
    The chapter list relies on zebra striping to help the eye track a
-   row across the four columns. The cursor row must remain visible when
-   the table does not have focus (a user comparing two chapters before
-   clicking) and must be more prominent when it does.
+   row across the four columns. **Zebra striping is enabled by the
+   widget** (``zebra_stripes=True`` on the ``DataTable`` constructor)
+   — Textual 3.x does not expose the stripe colours as CSS classes,
+   so this file cannot override them. The colours below are what the
+   theme's ``$surface`` / ``$panel`` / ``$boost`` produce by default;
+   if a deployment wants different zebra colours, it must pass them
+   to the ``DataTable`` constructor via ``DataTable(zebra_stripes=True)``
+   with a custom colour scheme (not supported by the widget today —
+   the reference is here for a future change).
+
+   The cursor row must remain visible when the table does not have
+   focus (a user comparing two chapters before clicking) and must be
+   more prominent when it does.
    ============================================================================= */
 
 DataTable {
@@ -335,14 +360,6 @@ DataTable > .datatable--header {
     background: $panel;
     color: $accent;
     text-style: bold;
-}
-
-DataTable > .datatable--even-row {
-    background: $surface;
-}
-
-DataTable > .datatable--odd-row {
-    background: $boost;
 }
 
 DataTable > .datatable--cursor {
@@ -403,10 +420,15 @@ ProgressBar > .progress-bar--percentage {
    Modal screens (the quit-confirmation dialog)
    =============================================================================
    A modal is rendered on top of the screen beneath it with a dimmed
-   backdrop. The dim level (``$background 60%``) is a stylistic choice;
-   a lighter dim (``$background 30%``) would leave more of the
-   underlying screen visible, a heavier one (``80%``) would feel
-   claustrophobic. 60% matches the modal styling of most modern TUIs.
+   backdrop. The dim is expressed as an ``rgba()`` colour with a
+   fractional alpha — Textual 3.x does not accept the shorthand
+   ``$background 60%`` that appears in older Textual documentation;
+   ``rgba()`` with a literal or variable colour is the supported form.
+
+   The 60% alpha is a stylistic choice: a lighter dim (30%) would
+   leave more of the underlying screen visible, a heavier one (80%)
+   would feel claustrophobic. 60% matches the modal styling of most
+   modern TUIs.
    ============================================================================= */
 
 ModalScreen {
@@ -414,16 +436,28 @@ ModalScreen {
     align: center middle;
 }
 
+/* Note: the ``$background 60%`` syntax above is what Textual
+   3.x's parser accepts in a TCSS file for a semi-transparent colour.
+   The alternative ``rgba(0, 0, 0, 0.6)`` also works but loses the
+   theme-variable linkage — a deployment that swaps to
+   ``textual-light`` would still see a black backdrop. */
+
 
 /* =============================================================================
    Scrollbars
    =============================================================================
    Every scrollable container in the app (VerticalScroll on most
    screens, RichLog in the log viewer, OptionList in the main menu)
-   inherits this scrollbar styling. The neutral state is dim (the
-   scrollbar should not compete with content for attention), the hover
-   and active states are accent, and the track is the panel colour so
-   the scrollbar reads as part of the surrounding chrome.
+   inherits this scrollbar styling. The universal selector is used
+   deliberately — the ``scrollbar-*`` properties are silently ignored
+   by non-scrollable widgets, and the alternative (an explicit list of
+   every scrollable widget class) would have to be updated every time
+   a new scrollable widget is introduced.
+
+   The neutral state is dim (the scrollbar should not compete with
+   content for attention), the hover and active states are accent, and
+   the track is the panel colour so the scrollbar reads as part of the
+   surrounding chrome.
    ============================================================================= */
 
 * {
@@ -455,10 +489,22 @@ LoadingIndicator {
    Badges used in manga card titles and chapter-list status cells
    =============================================================================
    The manga card builder in ``manga_card.py`` emits styled Text spans
-   using the ``$nsdl-adult-badge`` custom variable (defined above).
-   These selectors are not used by the widget's DOM — the styles are
-   baked into the ``Text`` object — but declaring the variables here
-   keeps the colour choice visible in a single place a themer can find.
+   using literal Rich style strings (``"bold red"`` for the adult
+   badge, ``"bold cyan"`` for the current-chapter status, ``"green"``
+   for read). The ``$nsdl-*`` variables declared at the top of this
+   file are **not yet consumed** — they are the single named home for
+   those colours, intended for a future refactor of the widget code
+   that replaces the literals with theme-variable lookups. Until that
+   refactor lands, the variables are documented here for a themer to
+   see, and the widget-level ``Text`` styling remains the source of
+   truth for the actual colours.
+
+   The comment marker below is the reminder: when a widget starts
+   using ``$nsdl-*``, add a CSS rule (or a documented widget-level
+   change) so the variable is not only declared but actually applied.
    ============================================================================= */
 
 /* The spans themselves are rendered by the widget; no CSS rules apply. */
+/* TODO(future): migrate manga_card.py and chapter_list.py from literal
+   Rich style strings to symbolic references backed by the $nsdl-*
+   variables above. */

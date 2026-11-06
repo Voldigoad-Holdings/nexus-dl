@@ -58,6 +58,24 @@ The two fields that are **not** derived from Settings are deliberate:
   or for a deployment that ships its own theme file. In production, the
   field is ``None`` and Textual resolves the default.
 
+The ``animations`` → ``App.animation_level`` transformation
+-----------------------------------------------------------
+:attr:`TuiConfig.animations` is a :class:`bool`; Textual's
+:attr:`~textual.app.App.animation_level` is a
+:class:`~typing.Literal` of ``"none"``, ``"basic"``, or ``"full"``.
+The mapping is performed by :mod:`nexusdl.interfaces.cli.app` at
+construction time::
+
+    app.animation_level = "full" if config.animations else "none"
+
+The field is a :class:`bool` rather than a Textual ``Literal`` because
+the pipeline's :attr:`~nexusdl.core.config.TuiSection.animations` field
+is a :class:`bool`, and a simple on/off toggle is what the TUI actually
+needs. A caller that wants the ``"basic"`` level (which is rarely
+useful — it only disables *decorative* animations, not functional ones)
+sets ``app.animation_level`` directly after construction; the
+:class:`TuiConfig` does not expose a level-3 knob.
+
 Theme name validation
 ---------------------
 Textual's :attr:`~textual.app.App.theme` setter raises
@@ -82,6 +100,35 @@ themes every supported Textual version has shipped since 0.86
 a no-op (any name is passed through). That is intentional: refusing to
 launch because the theme registry is missing would be worse than
 letting Textual's own validation run at mount.
+
+Custom themes and the fallback
+------------------------------
+The fallback replaces an unknown theme name with
+:data:`_FALLBACK_THEME` **before** the :class:`TuiConfig` is constructed
+— so a user who has registered a custom theme on the
+:class:`~textual.app.App` **after** calling :func:`build_tui_config` and
+**before** ``app.run_async()`` will see their theme applied normally,
+because the App's own theme setter runs after the fallback was chosen.
+
+The scenario where the custom theme **does not** work is different and
+worth naming: a caller that wants the App to start with the custom
+theme applied must register it **and** set ``App.theme`` explicitly
+after construction. :class:`TuiConfig.theme` is a **default**, not a
+binding: it is what ``app.py`` assigns to ``App.theme`` at
+construction time, and a subsequent ``app.theme = "my-custom-theme"``
+(from the composition root's ``on_mount``, or from a test) overrides
+it cleanly.
+
+Put differently: :func:`build_tui_config` cannot know about themes
+registered by a plugin or a future release, so it treats an unknown
+name as a "likely typo". The correct way for a deployment to use a
+custom theme is to (a) let ``build_tui_config`` fall back to
+``"textual-dark"``, (b) register the custom theme on the App, and (c)
+set ``App.theme`` to the custom name after construction. The
+``WARNING`` that ``build_tui_config`` logs is the only signal that the
+custom theme was not picked up by the default path — an operator who
+wants to silence it sets ``NEXUSDL_TUI__THEME=textual-dark`` (or any
+built-in name) and overrides at the App level.
 
 CSS path resolution
 -------------------
@@ -161,8 +208,8 @@ _FALLBACK_THEME: Final[str] = "textual-dark"
 #: though it is not in this set. :func:`build_tui_config` treats an
 #: unknown name as a "likely typo" (falls back to the default and warns)
 #: rather than as an error — the user has a clear, actionable message
-#: and can still override at runtime. A theme registered on the App
-#: silently works because the fallback is transparent.
+#: and can still override at runtime. See the module docstring's
+#: "Custom themes and the fallback" section for the correct pattern.
 def _discover_known_themes() -> frozenset[str]:
     """Return the set of theme names Textual recognises at import time.
 
@@ -203,22 +250,32 @@ class TuiConfig:
     configuration builds a new :class:`TuiConfig`; there is no mutation
     path.
 
-    The fields map one-to-one to properties the App exposes:
+    The fields map to properties the App exposes:
 
-    * :attr:`title` → :attr:`textual.app.App.TITLE`
-    * :attr:`sub_title` → :attr:`textual.app.App.SUB_TITLE`
-    * :attr:`theme` → :attr:`textual.app.App.theme`
-    * :attr:`animations` → the inverse of
-      :attr:`textual.app.App.animation_level` (``False`` when
-      animations are disabled)
+    * :attr:`title` → :attr:`textual.app.App.TITLE` (direct mapping)
+    * :attr:`sub_title` → :attr:`textual.app.App.SUB_TITLE` (direct
+      mapping)
+    * :attr:`theme` → :attr:`textual.app.App.theme` (direct mapping;
+      the App's setter re-validates, so an unknown custom theme set
+      after construction still works — see the module docstring's
+      "Custom themes and the fallback" section)
+    * :attr:`animations` → **inverse of**
+      :attr:`textual.app.App.animation_level` (``"full"`` when
+      ``True``, ``"none"`` when ``False``); the transformation is
+      performed by ``app.py``, not by this module — see the module
+      docstring's "The ``animations`` → ``App.animation_level``
+      transformation" section
     * :attr:`command_palette` → :attr:`textual.app.App.ENABLE_COMMAND_PALETTE`
+      (direct mapping)
     * :attr:`css_path` → :attr:`textual.app.App.CSS_PATH` when not
       ``None``; the class attribute when ``None``
 
     Attributes:
         title: The window title. Derived from
             ``settings.app.name`` — the display name a deployment can
-            override via ``NEXUSDL_APP__NAME``.
+            override via ``NEXUSDL_APP__NAME``. An empty name is
+            replaced by :data:`nexusdl.core.constants.APP_NAME` so the
+            App always has a non-empty title.
         sub_title: The sub-title (rendered next to the title in the
             app's footer). Typically ``"v{version}"``. Empty string
             when the version is not available — matching the
@@ -226,10 +283,13 @@ class TuiConfig:
         theme: The Textual theme name. Validated against
             :data:`_KNOWN_THEMES` at build time; an unknown name is
             replaced by :data:`_FALLBACK_THEME` before this object is
-            returned.
+            returned. The App's own theme setter runs **after**
+            construction, so a caller that assigns a custom theme
+            explicitly still applies it.
         animations: Whether Textual's animations are enabled. The App
             sets ``animation_level = "full"`` when this is ``True``,
-            ``"none"`` when ``False``.
+            ``"none"`` when ``False`` — the mapping is done in
+            ``app.py``, not here.
         command_palette: Whether Textual's ``Ctrl+P`` command palette is
             enabled. Always ``True`` in this release — see the module
             docstring for the rationale.
@@ -265,7 +325,8 @@ def build_tui_config(
     derived from Settings" table. The theme name is validated against
     :data:`_KNOWN_THEMES`; an unknown name is replaced by
     :data:`_FALLBACK_THEME` and a ``WARNING`` is logged — see the
-    module docstring's "Theme name validation" section.
+    module docstring's "Theme name validation" and "Custom themes and
+    the fallback" sections.
 
     Args:
         settings: The application settings. Only
@@ -307,6 +368,13 @@ def _resolve_theme(requested: str) -> str:
     and the fallback — and :data:`_FALLBACK_THEME` is returned. See the
     module docstring's "Theme name validation" section for why a
     warning rather than an error.
+
+    The fallback is a **default**, not a binding: an App that registers
+    a custom theme and then sets ``App.theme`` explicitly after
+    construction still applies the custom theme. The warning is the
+    signal that the custom theme was not picked up by the default
+    path; see the module docstring's "Custom themes and the fallback"
+    section for the correct deployment pattern.
 
     Args:
         requested: The theme name from

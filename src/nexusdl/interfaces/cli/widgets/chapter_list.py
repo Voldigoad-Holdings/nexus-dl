@@ -50,6 +50,15 @@ reader (Mihon, Komga, Tachiyomi) — "progress" means "how far along",
 not "which chapters were opened". A caller that wants a more precise
 model passes ``read_chapter_ids`` explicitly, overriding the inference.
 
+The **cursor** is *not* the current chapter. The current chapter is a
+data property supplied by the parent (from ``ReadingProgress``); the
+cursor is the transient focus of the user's arrow keys. A user who
+navigates to chapter 20 without reading it sees ``▶`` stay on
+chapter 15 (the "current" chapter), and the cursor move on chapter 20.
+Conflating the two would make "which chapter did the user last read"
+and "which row is focused" indistinguishable, and would surprise the
+user in both directions.
+
 What the widget does **not** do
 -------------------------------
 * **No sorting.** The parent supplies chapters in the order it wants
@@ -68,6 +77,30 @@ What the widget does **not** do
   parent screen decides what to do with it (open a reader, enqueue a
   download, display a preview). The widget is a picker, not a
   dispatcher.
+
+Instance freshness across ``set_chapters``
+------------------------------------------
+:meth:`ChapterList.set_chapters` accepts a new list and rebuilds the
+display. The **marked set** is preserved by id — a chapter the user
+marked stays marked after the refresh, as long as its id is still in
+the new list. But the :class:`~nexusdl.core.models.chapter.Chapter`
+**instances** the widget holds are now the new instances, not the old
+ones.
+
+This matters for a parent that keeps a reference to the tuple returned
+by a previous :attr:`ChapterList.selected_chapters` (or a previous
+:class:`SelectionChanged` event). The ids may be the same, but the
+``Chapter`` objects have new ``url`` / ``title`` / ``page_count``
+fields — the ones a download would use.
+
+The safe pattern for a parent is to read
+:attr:`ChapterList.selected_chapters` **after** a
+:meth:`ChapterList.set_chapters` call, not to cache it across the
+call. The widget does **not** post a :class:`SelectionChanged` on a
+``set_chapters`` that preserves the set of ids, because from the
+user's point of view the selection did not change — posting one would
+be noise. The public accessor is the authoritative source, and it
+returns the freshest instances.
 
 Message handler names
 ---------------------
@@ -215,7 +248,8 @@ class ChapterList(Vertical):
     """A Textual widget displaying one manga's chapters as a selectable table.
 
     See the module docstring for the design contract, the two selection
-    states, the status column, and the empty-state behaviour.
+    states, the status column, the instance-freshness contract, and the
+    empty-state behaviour.
 
     Args:
         chapters: The chapters to display, in **display order**. The
@@ -408,7 +442,17 @@ class ChapterList(Vertical):
         Marked chapters whose ids are not in the new list are dropped
         from the marked set — the user's mark on a chapter that no
         longer exists is not preserved. A :class:`SelectionChanged`
-        message is posted when the marked set actually changes.
+        message is posted **only when** the marked set actually lost
+        ids (a chapter the user marked was removed from the list).
+
+        A ``set_chapters`` that preserves the set of ids — a refresh
+        that re-fetched the same chapters from the database, with new
+        ``Chapter`` instances — does **not** post a
+        :class:`SelectionChanged`. From the user's point of view the
+        selection is unchanged. A parent that needs the freshest
+        instances reads :attr:`selected_chapters` after the call — see
+        the module docstring's "Instance freshness across
+        ``set_chapters``" section.
 
         Args:
             chapters: The new list, in display order.
@@ -430,6 +474,11 @@ class ChapterList(Vertical):
         When the new current chapter is in the displayed list, the
         table's cursor is moved to it so the user's view stays anchored
         on where they left off.
+
+        Does **not** post a :class:`SelectionChanged` — moving the
+        current chapter changes the visual status column (which
+        chapters render as ``✓``), but does not change what the user
+        has marked for bulk actions.
 
         Args:
             chapter_id: The chapter id, or ``None`` to clear the current
@@ -470,6 +519,12 @@ class ChapterList(Vertical):
         A snapshot — mutating the returned tuple does not affect the
         widget's marked set. Empty when the user has not marked
         anything.
+
+        The returned ``Chapter`` instances are the ones the widget
+        currently holds — see the module docstring's "Instance
+        freshness across ``set_chapters``" section. A parent that
+        caches this result across a :meth:`set_chapters` call will
+        hold stale instances; read it again after the call.
         """
         return tuple(
             chapter
@@ -512,12 +567,16 @@ class ChapterList(Vertical):
     def action_select_all(self) -> None:
         """Mark every chapter currently displayed.
 
-        Bound to ``A``. Posts a :class:`SelectionChanged` message even
-        when the marked set was already complete — a caller that wants
-        to react to the "select all" gesture (a toast, a status line
-        update) receives the message unconditionally.
+        Bound to ``A``. Posts a :class:`SelectionChanged` message only
+        when the marked set actually changed — pressing ``A`` twice in
+        a row does not spam the parent with a redundant message. The
+        rule is symmetric with :meth:`action_deselect_all`, which is
+        already a no-op on an empty set.
         """
-        self._selected_ids = set(self._by_id.keys())
+        new_ids = set(self._by_id.keys())
+        if new_ids == self._selected_ids:
+            return
+        self._selected_ids = new_ids
         self._rebuild()
         self.post_message(self.SelectionChanged(self.selected_chapters))
 
@@ -547,7 +606,16 @@ class ChapterList(Vertical):
         and on row double-click. The event's ``row_key`` is the chapter
         id the widget supplied when it added the row; mapping it back
         to the :class:`Chapter` is a dictionary lookup.
+
+        A ``RowSelected`` whose ``row_key.value`` is ``None`` — which
+        cannot happen through the widget's own ``add_row`` calls (they
+        always pass ``key=chapter.id``) but is possible if a future
+        change adds a row without a key — is ignored rather than
+        converted to the literal string ``"None"`` and looked up
+        fruitlessly.
         """
+        if event.row_key.value is None:
+            return
         chapter_id = str(event.row_key.value)
         chapter = self._by_id.get(chapter_id)
         if chapter is not None:

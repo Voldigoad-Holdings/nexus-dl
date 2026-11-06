@@ -5,7 +5,7 @@ Cloudflare interstitial and returns the resulting cookies, User-Agent,
 and (optionally) the resolved HTML. NexusDL uses it as a **last-resort
 bypass** for sites the plain HTTP path cannot reach, when the deployment
 prefers a shared external service over running Playwright in-process.
-
+ 
 Where it fits
 -------------
 ::

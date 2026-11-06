@@ -169,8 +169,13 @@ class CORSRule:
         path_patterns: Glob patterns matching the request path. ``("*",)``
             matches every path. Applied to the ASGI ``path`` (already
             percent-decoded and rooted at ``/``).
-        methods: HTTP methods the rule allows. Preflight requests for
-            methods outside this set are rejected.
+        methods: HTTP methods the rule allows. Normalized to uppercase in
+            :meth:`__post_init__` so callers can pass lowercase. Preflight
+            requests are validated against the actual method advertised
+            in ``Access-Control-Request-Method`` (not ``OPTIONS``) — a
+            rule listing ``{"GET", "POST"}`` correctly accepts a
+            preflight for ``POST`` even though it does not list
+            ``OPTIONS`` explicitly.
         allow_headers: Headers permitted in the ``Access-Control-Allow-
             Headers`` preflight response. ``"*"`` echoes the browser's
             ``Access-Control-Request-Headers`` (except for the forbidden
@@ -217,6 +222,13 @@ class CORSRule:
                 f"CORSRule {self.name!r}: allow_headers must be '*' or a "
                 "frozenset of header names"
             )
+        # Normalize method casing so callers may supply either case. Uses
+        # ``object.__setattr__`` because the dataclass is frozen — a
+        # deliberate, documented exception to immutability for
+        # normalization at construction time.
+        normalized = frozenset(str(m).upper() for m in self.methods)
+        if normalized != self.methods:
+            object.__setattr__(self, "methods", normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,7 +237,14 @@ class CORSConfig:
 
     Attributes:
         rules: Ordered list of :class:`CORSRule`. The first match wins —
-            order them from most specific to least specific.
+            order them from most specific to least specific. Ignored when
+            :attr:`disabled` is ``True``.
+        disabled: When ``True``, the middleware is a pure pass-through:
+            no origin is checked, no header is added, no preflight is
+            intercepted. Used by :func:`disabled_cors` for deployments
+            that terminate CORS at the edge. Cannot be combined with a
+            non-empty ``on_cors_allowed`` / ``on_cors_rejected`` intent —
+            those callbacks never fire in disabled mode.
         allow_null_origin: Whether to accept the ``"null"`` origin.
             Default ``False`` — it is a common attack vector (sandboxed
             iframes, ``file://``). Enable only when the deployment
@@ -249,6 +268,7 @@ class CORSConfig:
     """
 
     rules: tuple[CORSRule, ...]
+    disabled: bool = False
     allow_null_origin: bool = False
     reject_unknown_origin: bool = False
     emit_preflight_body: bool = True
@@ -256,6 +276,10 @@ class CORSConfig:
     on_cors_rejected: Callable[[CORSRejectedEvent], Any] | None = None
 
     def __post_init__(self) -> None:
+        # When disabled, ``rules`` may legitimately be empty — the
+        # middleware short-circuits before consulting them.
+        if self.disabled:
+            return
         if not self.rules:
             raise ValueError(
                 "CORSConfig.rules must contain at least one rule. "
@@ -334,14 +358,18 @@ class CORSMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Explicit no-op mode — the deployment terminates CORS at the
+        # edge. Delegates every request unchanged.
+        if self.config.disabled:
+            await self.app(scope, receive, send)
+            return
+
         origin_raw = _get_origin(scope)
         if origin_raw is None:
             # No Origin header — not a CORS request. Pass through.
             await self.app(scope, receive, send)
             return
 
-        # Handle multiple origins in a single header (non-standard but
-        # seen in wild). Use the first, log a warning.
         origin = _normalize_origin(origin_raw, allow_null=self.config.allow_null_origin)
         if origin is None:
             # Invalid or forbidden origin (e.g. "null" not allowed).
@@ -363,9 +391,14 @@ class CORSMiddleware:
             method == "OPTIONS"
             and _has_header(scope, b"access-control-request-method")
         )
+        requested_method = _get_acrm(scope) if is_preflight else None
 
         rule = self._find_matching_rule(
-            origin=origin, path=path, method=method, is_preflight=is_preflight
+            origin=origin,
+            path=path,
+            method=method,
+            is_preflight=is_preflight,
+            requested_method=requested_method,
         )
 
         if rule is None:
@@ -380,7 +413,12 @@ class CORSMiddleware:
         self._emit_allowed(rule, origin, path, method, is_preflight)
 
         if is_preflight:
-            await self._handle_preflight(scope, send, origin=origin, rule=rule)
+            await self._handle_preflight(
+                scope, send,
+                origin=origin,
+                rule=rule,
+                requested_method=requested_method,
+            )
             return
 
         # Actual request — add CORS headers to the response (without
@@ -400,25 +438,29 @@ class CORSMiddleware:
         path: str,
         method: str,
         is_preflight: bool,
+        requested_method: str | None,
     ) -> CORSRule | None:
-        """Return the first rule matching all three criteria."""
-        # Preflight matches the *requested* method, not "OPTIONS".
-        effective_method = method
-        if is_preflight:
-            # Extracted by the caller via ``_get_acrm`` for the preflight
-            # path; we also accept the recorded method here for direct
-            # unit tests.
-            pass
+        """Return the first rule matching all criteria.
+
+        For **preflight** requests, the effective method is the actual
+        method the browser intends to use (extracted from the
+        ``Access-Control-Request-Method`` header), **not** ``OPTIONS``.
+        A rule listing ``{"GET", "POST"}`` correctly accepts a preflight
+        for ``POST`` even though it does not list ``OPTIONS``.
+
+        For **actual** requests, the effective method is the HTTP method
+        itself.
+        """
+        if is_preflight and requested_method:
+            effective_method = requested_method.upper()
+        else:
+            # Non-preflight, or a preflight that somehow lacks ACRM
+            # (defensive — should not happen given the ``is_preflight``
+            # gate in ``__call__``). Fall back to the raw method.
+            effective_method = method.upper()
 
         for rule in self.config.rules:
-            if method not in rule.methods and not (
-                is_preflight and "OPTIONS" in rule.methods
-            ):
-                # For preflight, the rule must at least allow the actual
-                # requested method. The middleware checks that separately
-                # via the Access-Control-Request-Method header, but a
-                # rule with `methods={"GET"}` cannot accept an OPTIONS
-                # preflight for a POST — reject here for clarity.
+            if effective_method not in rule.methods:
                 continue
             if not _match_origin(origin, rule, self._compiled_patterns):
                 continue
@@ -438,11 +480,16 @@ class CORSMiddleware:
         *,
         origin: str,
         rule: CORSRule,
+        requested_method: str | None,
     ) -> None:
         """Answer an OPTIONS preflight locally with a 204 + CORS headers."""
-        # The rule must allow the requested method.
-        requested_method = _get_acrm(scope) or ""
-        if requested_method.upper() not in rule.methods:
+        # Defense in depth: the rule matcher already validated this via
+        # ``_find_matching_rule``, but a re-check costs nothing and
+        # guards against future refactors of the matcher.
+        if (
+            requested_method is None
+            or requested_method.upper() not in rule.methods
+        ):
             await self._reject(
                 scope, _null_receive, send,
                 origin=origin,
@@ -679,8 +726,15 @@ def _normalize_origin(
     if stripped == _NULL_ORIGIN:
         return _NULL_ORIGIN if allow_null else None
 
-    # Non-standard multi-origin header — keep the first, ignore the rest.
+    # Non-standard multi-origin header — keep the first, log the rest.
+    # This is technically not allowed by the CORS spec (browsers send
+    # exactly one origin), but some clients send it. Warn so the
+    # operator can investigate.
     if " " in stripped:
+        _log.warning(
+            "Multi-origin header received: {!r} — using first origin",
+            stripped,
+        )
         stripped = stripped.split(" ", 1)[0].strip()
         if not stripped:
             return None
@@ -1054,27 +1108,17 @@ def dev_cors(
 
 
 def disabled_cors() -> CORSConfig:
-    """Return a :class:`CORSConfig` with no active rules.
+    """Return a :class:`CORSConfig` that makes the middleware a no-op.
 
     Used when CORS is terminated at the edge (nginx, Cloudflare Workers,
     an API gateway) and the application should not add or check any
-    origin. Requests from any origin pass through — the middleware
-    short-circuits and delegates to the app for **every** request.
+    origin. The middleware short-circuits for **every** HTTP request —
+    no origin is inspected, no header is added, no preflight is
+    intercepted or rejected. This is a strict pass-through.
 
-    Any request with an ``Origin`` header still gets **no** CORS headers
-    added, which is the intent: the edge is authoritative.
+    See :attr:`CORSConfig.disabled` for the flag this helper sets.
     """
-    return CORSConfig(
-        rules=(
-            # A rule that never matches — provides a valid non-empty
-            # rules tuple while ensuring the middleware short-circuits.
-            CORSRule(
-                name="disabled",
-                origin_patterns=("never-match-this-origin",),
-                path_patterns=("never-match-this-path",),
-            ),
-        ),
-    )
+    return CORSConfig(rules=(), disabled=True)
 
 
 # ===========================================================================

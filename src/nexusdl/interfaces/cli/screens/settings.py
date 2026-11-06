@@ -51,7 +51,8 @@ mapping is deliberate, not incidental:
 * **Downloads** — downloader, packaging, image sections. The knobs
   a user tunes to control download behaviour.
 * **Network** — http, rate limits, session cache and circuit breaker,
-  proxy. Everything a user needs when a site starts behaving badly.
+  proxy, and the session-level ``user_agent_sticky_ttl``. Everything
+  a user needs when a site starts behaving badly.
 * **Content** — content filtering and robots.txt compliance. The two
   sections a user consults when deciding what the app is allowed to
   fetch.
@@ -69,6 +70,15 @@ mapping is deliberate, not incidental:
   remaining knobs, grouped so a user who does not need them never
   needs to scroll through them.
 
+The ``session`` section is **decomposed** across two panels in the
+Network view (``session.circuit_breaker`` and ``session.cache``), plus
+a single ``user_agent_sticky_ttl`` row — the user does not see a
+"Session" group because the individual fields are more meaningful in
+their consumer context (circuit breaker tuning next to HTTP timeouts,
+cache tuning next to rate limits). Every ``session`` field is rendered
+somewhere; the decomposition is by semantic use, not by section
+boundary.
+
 Secret masking
 --------------
 The screen displays three classes of secret:
@@ -81,7 +91,10 @@ The screen displays three classes of secret:
   URL-safe base64 strings) the length is diagnostic; for
   ``jwt_secret``, which has no fixed length, the displayed length is
   informational only and does not narrow an attacker's search any
-  more than the fact that the value exists.
+  more than the fact that the value exists. (A future release may add
+  a ``settings.tui.show_secret_lengths`` toggle for deployments that
+  prefer a uniform ``***`` for all root secrets — see "Not a security
+  boundary" below.)
 * **Proxy URLs** — ``proxy.url`` and each ``proxy.urls`` entry (also
   :class:`~pydantic.SecretStr`). Shown as ``"***"`` regardless of
   length; a proxy URL can embed credentials, and a "length" hint would
@@ -97,19 +110,39 @@ user who has not run ``nexusdl admin init`` sees immediately that the
 configuration is incomplete, instead of seeing a working-looking screen
 that crashes on the first signature operation.
 
+Not a security boundary
+-----------------------
+The masked display is a **convenience for the legitimate user**, not a
+defence against a determined attacker:
+
+* The user who sees the screen already has access to the ``.env`` file
+  (same machine, same user account).
+* The masked length is a plausible clue about the secret's entropy
+  (a 32-char ``jwt_secret`` vs a 64-char one), but any user who can
+  read this screen can also read the plaintext secret.
+* The screen never renders the plaintext value of any secret; the
+  masked form is the only representation it can produce.
+
+The design is intentionally simple: rendering "*** (44 chars)" is
+enough to confirm "yes, the key is set" without ever risking an
+accidental full-value render in a terminal log or a shared screen.
+
 Action surface
 --------------
-Two bindings, one action:
+Three bindings, two actions:
 
 * ``Escape`` and ``q`` — return to the previous screen. The screen
   itself is **never** the last one on the stack (the main screen is
   pushed at app startup and the settings screen is pushed on demand),
   so the action is always valid.
-* ``r`` — no-op today. Reserved for a future "reload from disk"
-  capability that would reload :class:`Settings` and re-render without
-  restarting the app. Not implemented because :class:`Settings` is
-  frozen and reloading would require restarting the process, which the
-  TUI cannot do.
+* ``r`` — re-render the current section. The screen reads paths via
+  live ``stat()`` calls in the Paths section; a user who creates a
+  directory in another terminal, or deletes a download, can press
+  ``r`` to see the existence marker update without leaving and
+  reopening the screen. The refresh re-renders from the same
+  :class:`Settings` object — it does not reload from disk (which
+  would require restarting the process, since ``Settings`` is
+  frozen).
 
 There is no save action, no cancel action, and no confirmation dialog —
 because there is nothing to save. The screen is a viewer.
@@ -159,6 +192,25 @@ report it, while the other nine sections render normally.
    ``validate_on_download``, and this screen reads
    ``settings.image.validate_on_download`` — see
    :class:`~nexusdl.core.config.ImageSection`.
+
+Network filesystem note
+-----------------------
+The ``Paths`` section calls ``Path.is_file()`` / ``Path.stat()`` on
+every configured path, twice per path (one ``is_file`` check, one
+``stat`` for the size). On a local filesystem that is a few
+microseconds; on a network-mounted directory (NFS, SMB, sshfs) each
+syscall can take 10–50 ms, so opening the Paths section on a slow
+share can freeze the screen for a second or more. This is a known
+limitation, not a bug:
+
+* A deferred / async path-existence check would fix the freeze, but
+  it would complicate the render dispatch (``_render_section`` is
+  synchronous, called from a Textual event handler).
+* A user on a slow share can press ``r`` to refresh after the freeze
+  — the freeze is one-time per Paths visit, not continuous.
+
+The limitation is documented here rather than worked around, because
+the fix is disproportionate to the (rare) scenario.
 
 Dependency graph (no cycles)::
 
@@ -251,12 +303,17 @@ class SettingsScreen(Screen[None]):
         classes: Optional Textual CSS classes.
     """
 
-    #: Bindings for the screen. Both the exit binding and the reserved
-    #: reload binding are declared here; the reload action is a no-op
-    #: today.
+    #: Bindings for the screen.
+    #:
+    #: * ``Escape`` / ``q`` — pop the screen.
+    #: * ``r`` — re-render the currently highlighted section. The
+    #:   ``Paths`` section does live ``stat()`` calls, so a filesystem
+    #:   change (a directory created or removed) is visible after a
+    #:   refresh without leaving the screen.
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "back", "Back"),
         Binding("q", "back", "Back", show=False),
+        Binding("r", "refresh", "Refresh", show=False),
     ]
 
     #: Default CSS. The application's ``theme.tcss`` may override any
@@ -365,6 +422,29 @@ class SettingsScreen(Screen[None]):
     def action_back(self) -> None:
         """Pop this screen off the stack, returning to the previous one."""
         self.app.pop_screen()
+
+    def action_refresh(self) -> None:
+        """Re-render the currently highlighted section. Bound to ``R``.
+
+        Does **not** reload :class:`Settings` from disk — that would
+        require restarting the process, since the model is frozen. What
+        the refresh re-reads is the **live filesystem state** that the
+        ``Paths`` section queries via ``stat()``. A user who creates
+        the ``downloads_dir`` directory in another terminal, or deletes
+        a download, sees the existence marker update without leaving
+        the screen.
+
+        A no-op when the screen is not mounted (the action can only be
+        invoked through a key press, which requires the screen to be
+        on the stack; the guard is defensive).
+        """
+        if not self.is_mounted:
+            return
+        sections = self.query_one(f"#{_ID_SECTIONS}", OptionList)
+        highlighted = sections.highlighted
+        if highlighted is None:
+            return
+        self._render_into_content(_SECTION_IDS[highlighted])
 
     # ------------------------------------------------------------------ #
     # Content dispatch                                                   #
@@ -577,7 +657,29 @@ class SettingsScreen(Screen[None]):
             )
         self._append_group(text, "Rate limits", rate_items)
 
-        cb = self._settings.session.circuit_breaker
+        session = self._settings.session
+        # The ``session`` section is decomposed: its
+        # ``user_agent_sticky_ttl`` field is rendered as a single row
+        # in the session group, while the ``circuit_breaker`` and
+        # ``cache`` sub-sections get their own groups below (their
+        # fields are more meaningful next to the HTTP tuning they
+        # affect). Every ``session`` field is visible somewhere.
+        self._append_group(
+            text,
+            "Session",
+            [
+                (
+                    "user_agent_sticky_ttl",
+                    (
+                        f"{session.user_agent_sticky_ttl}s"
+                        if session.user_agent_sticky_ttl is not None
+                        else self._t("settings.value.none")
+                    ),
+                ),
+            ],
+        )
+
+        cb = session.circuit_breaker
         self._append_group(
             text,
             "Circuit breaker",
@@ -595,7 +697,7 @@ class SettingsScreen(Screen[None]):
             ],
         )
 
-        c = self._settings.session.cache
+        c = session.cache
         self._append_group(
             text,
             "HTTP cache",

@@ -127,6 +127,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import warnings
 from importlib.resources import files as _resource_files
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -749,12 +750,22 @@ class ImageSection(_Section):
     downloader.
 
     Attributes:
-        validate: When ``True`` (the default), every downloaded page is
-            passed through
+        validate_on_download: When ``True`` (the default), every
+            downloaded page is passed through
             :func:`~nexusdl.core.image.validator.validate_file` before
             being accepted. Disabling is strongly discouraged — the
-            validator is the only line of defence against HTML/Cloudflare
-            pages masquerading as images.
+            validator is the only line of defence against
+            HTML/Cloudflare pages masquerading as images.
+
+            The field is exposed under the name
+            ``validate_on_download`` in Python, with the alias
+            ``validate`` retained for YAML/env compatibility with
+            earlier configurations. The alias exists because a field
+            literally named ``validate`` shadows
+            :meth:`pydantic.BaseModel.validate` (still present as a
+            deprecated v1 compatibility shim in Pydantic v2) and
+            triggers a ``UserWarning`` at import time.
+
         optimize: When ``True``, the optimizer re-encodes each validated
             image in the same format to save bytes. Disabled by default
             because optimization is CPU-expensive and often saves only a
@@ -768,7 +779,22 @@ class ImageSection(_Section):
             re-encode. ``85`` is the same visually-lossless default.
     """
 
-    validate: bool = True
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        str_strip_whitespace=True,
+        populate_by_name=True,
+    )
+
+    validate_on_download: bool = Field(
+        default=True,
+        alias="validate",
+        description=(
+            "Validate every downloaded page before accepting it. "
+            "Strongly recommended — the validator is the only defence "
+            "against HTML/Cloudflare pages masquerading as images."
+        ),
+    )
     optimize: bool = False
     optimize_jpeg_quality: int = Field(default=85, ge=1, le=95)
     optimize_png_compress_level: int = Field(default=9, ge=0, le=9)
@@ -972,11 +998,32 @@ class PluginsSection(_Section):
         data_dir: Root directory for per-plugin data directories. When
             ``None``, the loader falls back to
             ``platformdirs.user_data_path(_APP_NAME) / "plugins"``.
+        timeout_seconds: Per-hook execution budget, in seconds. A hook
+            that exceeds this budget is cancelled and treated as a
+            failure by the loader; the plugin is not unloaded on the
+            first overrun, but repeated overruns trip the loader's
+            circuit breaker.
+        max_memory_mb: Soft memory budget per plugin process, in MiB.
+            Enforced where the plugin loader supports it (a subprocess
+            plugin), advisory otherwise (an in-process plugin can only
+            be profiled, not capped, by the CPython allocator).
     """
 
     dirs: list[Path] = Field(default_factory=list)
     disabled: list[str] = Field(default_factory=list)
     data_dir: Path | None = None
+    timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=600,
+        description="Timeout for a single plugin hook invocation, in seconds.",
+    )
+    max_memory_mb: int = Field(
+        default=256,
+        ge=16,
+        le=8192,
+        description="Soft memory budget for a plugin, in MiB.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -999,11 +1046,72 @@ class PerformanceSection(_Section):
             ``asyncio.to_thread`` calls. Matches the default of
             :func:`concurrent.futures.ThreadPoolExecutor`; a
             deployment with more cores can raise it.
+        gc_threshold: Value passed to :func:`gc.set_threshold` for the
+            *first* generation. ``700`` is the CPython default; a
+            higher value reduces GC pauses at the cost of memory.
+            ``0`` disables the cyclic GC entirely — only appropriate
+            for a short-lived process.
+        uvloop: When ``True`` (the default), replace the asyncio event
+            loop with :mod:`uvloop` if installed. Ignored on Windows,
+            where uvloop is not supported. Adds 2–4× to loop throughput
+            on Linux and macOS; the project's ``pyproject.toml`` pins
+            ``uvloop`` for those platforms.
+        use_orjson: When ``True`` (the default), use :mod:`orjson` for
+            JSON serialization where available, falling back to the
+            stdlib :mod:`json` otherwise. ``orjson`` is 2–5× faster and
+            produces smaller output; the fallback keeps the project
+            installable on a platform without wheels.
+        batch_page_downloads: Number of pages downloaded per batch
+            before the worker flushes progress to the event bus.
+            Distinct from ``downloader.max_concurrent_pages`` — the
+            latter bounds *concurrency* within a chapter, this bounds
+            the *reporting granularity* and the retry scope.
+        prefetch_pages: How many pages to download ahead of the
+            packager. ``0`` disables prefetching entirely; the default
+            of ``3`` keeps the packager fed without wasting bandwidth
+            on a chapter that may be aborted.
+        streaming_chunk_size_kb: Chunk size for
+            :meth:`HttpSession.stream_download`, in KiB. Ignored for
+            small responses that are buffered in memory; matters for
+            large files where a bigger chunk reduces syscall overhead.
+            ``64`` matches :data:`httpx._config.DEFAULT_CHUNK_SIZE`
+            while being explicit at the config layer.
     """
 
     asyncio_debug: bool = False
     http_pool_size: int = Field(default=100, ge=1)
     image_workers: int = Field(default=4, ge=1)
+    gc_threshold: int = Field(
+        default=700,
+        ge=0,
+        description="First-generation GC threshold; 0 disables cyclic GC.",
+    )
+    uvloop: bool = Field(
+        default=True,
+        description="Use uvloop as the event loop if installed (Linux/macOS).",
+    )
+    use_orjson: bool = Field(
+        default=True,
+        description="Use orjson for JSON serialisation if installed.",
+    )
+    batch_page_downloads: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description="Pages per progress-flush batch within a chapter.",
+    )
+    prefetch_pages: int = Field(
+        default=3,
+        ge=0,
+        le=32,
+        description="Number of pages to download ahead of the packager.",
+    )
+    streaming_chunk_size_kb: int = Field(
+        default=64,
+        ge=4,
+        le=4096,
+        description="HTTP stream_download chunk size, in KiB.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1029,11 +1137,55 @@ class DevelopmentSection(_Section):
             built-in mock parser for any site id, producing stable fake
             data. Used by parser tests and by a future ``--mock`` CLI
             flag; ignored by production code paths.
+        reload_on_change: When ``True`` (the default), watch the source
+            tree and reload modules that change while the CLI/TUI/GUI
+            is running. Requires ``is_development=True``; a no-op in
+            production regardless of the flag's value.
+        profile_enabled: When ``True``, start a :mod:`cProfile`
+            session around the CLI/TUI/GUI entry point and write a
+            ``.pstats`` file on exit. Useful for contributors; noisy
+            and slow for anyone else.
+        mock_network: When ``True``, :class:`HttpSession` returns
+            recorded fixtures instead of hitting the network. The
+            fixtures are produced by ``scripts/record_fixtures.py``
+            against a real site and committed to ``tests/fixtures/``.
+            Intended for integration tests and for offline development.
+        debug_endpoints: When ``True`` *and* ``is_development=True``,
+            the API backend mounts the ``/debug/*`` router (config
+            dump, parser registry dump, cache statistics). The
+            backend's composition root additionally refuses to mount
+            these routes when the environment looks like production
+            (``NEXUSDL_PUBLIC_URL`` set to a non-localhost value),
+            regardless of this flag.
+        seed_db_on_startup: When ``True``, the library database is
+            seeded with a small fixture dataset on startup. Destructive
+            if the DB already exists; the seeder checks the
+            ``is_development`` flag and refuses to run otherwise.
     """
 
     is_development: bool = False
     show_traceback: bool = False
     mock_sites: bool = False
+    reload_on_change: bool = Field(
+        default=True,
+        description="Reload modules on change (requires is_development).",
+    )
+    profile_enabled: bool = Field(
+        default=False,
+        description="Start a cProfile session around the entry point.",
+    )
+    mock_network: bool = Field(
+        default=False,
+        description="Serve HTTP responses from recorded fixtures.",
+    )
+    debug_endpoints: bool = Field(
+        default=False,
+        description="Mount the /debug/* router (requires is_development).",
+    )
+    seed_db_on_startup: bool = Field(
+        default=False,
+        description="Seed the library database with fixture data on startup.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1253,6 +1405,22 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="forbid",
         frozen=True,
+    )
+
+    # --- Schema version ---------------------------------------------- #
+    # Mirrors the `config_version` key in `default_config.yaml`. A
+    # future migration script reads this field to decide what to
+    # migrate; a mismatch between the YAML's value and this field's
+    # default is logged as a WARNING at startup, not raised — the
+    # pipeline runs with a mismatched version rather than refusing to
+    # boot.
+    config_version: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Version of the configuration schema. Must match "
+            "`config_version` in default_config.yaml."
+        ),
     )
 
     # --- Root secrets (required, no default) -------------------------- #
@@ -1505,11 +1673,15 @@ def bootstrap_env_file(
     path.write_text(generate_env_content(), encoding="utf-8")
     try:
         os.chmod(path, 0o600)
-    except OSError:
+    except OSError as exc:
         # Non-POSIX filesystems may reject the chmod; the write itself
         # already succeeded, and the secrets are still in the file.
-        # The operator's filesystem permissions are their own concern.
-        pass
+        # The operator's filesystem permissions are their own concern,
+        # but the failure should be visible, not silently swallowed.
+        warnings.warn(
+            f"Could not set 0600 permissions on {path}: {exc}",
+            stacklevel=2,
+        )
     return path
 
 

@@ -140,6 +140,12 @@ _log = _logger.bind(component="web.backend.main")
 _DEFAULT_HOST: str = "0.0.0.0"
 _DEFAULT_PORT: int = 8000
 
+#: Dotted import path of this module's zero-arg factory. Used by ``main()``
+#: in reload mode — uvicorn requires an import string in that case.
+_FACTORY_IMPORT_STRING: str = (
+    "nexusdl.interfaces.web.backend.main:create_app_from_env"
+)
+
 #: Mapping of status code → default error code, used by the HTTPException
 #: handler for exceptions raised by FastAPI/Starlette internals (routers
 #: always set their own code).
@@ -587,19 +593,33 @@ def _install_exception_handlers(app: FastAPI) -> None:
 def _map_nexusdl_error(exc: BaseException) -> tuple[str, int]:
     """Map a domain exception to ``(error_code, http_status)``.
 
-    Uses :func:`isinstance` when possible (for the typed exceptions in
-    :mod:`nexusdl.core.exceptions`), falls back to class-name matching
-    for hosts that raise their own subclasses.
+    Matching is done on the exception **class name**. The class hierarchy
+    in :mod:`nexusdl.core.exceptions` is designed so that class names
+    reflect error categories (e.g. ``ParserResponseError`` contains
+    ``"Parser"``, ``SessionRateLimitError`` contains ``"RateLimit"``), so
+    name-based matching handles subclasses correctly without importing
+    every concrete exception class. Ordering is significant — the most
+    specific category wins.
     """
     name = type(exc).__name__
 
-    # Class-name matching — robust to subclassing.
     if "Compliance" in name or "Blocked" in name:
         return "FORBIDDEN", 403
     if "NotFound" in name:
         return "NOT_FOUND", 404
     if "InvalidStateTransition" in name or "StateTransition" in name:
         return "CONFLICT", 409
+    # Rate-limit failures must be checked before the generic ``Session``
+    # fallback and before ``Timeout`` — otherwise ``SessionRateLimitError``
+    # would land on 500 and ``RateLimitTimeoutError`` would land on 504.
+    # Both belong on 429 so clients back off.
+    if "RateLimit" in name:
+        return "RATE_LIMIT_EXCEEDED", 429
+    # An open circuit breaker means the upstream site is unavailable, not
+    # that this server has an internal error. 503 tells clients to retry
+    # later.
+    if "CircuitBreaker" in name:
+        return "SERVICE_UNAVAILABLE", 503
     if "Timeout" in name:
         return "INTERNAL_ERROR", 504
     if "Unavailable" in name or "Retry" in name:
@@ -809,7 +829,11 @@ def _log_startup(
     """Emit a compact startup summary."""
     _log.info("NexusDL web backend configured (version {})", __version__)
     _log.info("Environment: {}", "development" if is_dev else "production")
-    _log.info("Mounted routers ({}): {}", len(mounted), ", ".join(mounted))
+    _log.info(
+        "Mounted routers ({}): {}",
+        len(mounted),
+        ", ".join(mounted) if mounted else "<none>",
+    )
     _log.info(
         "WebSocket endpoint: /ws/v1/events "
         "(JWT via ?token= or Authorization: Bearer)"
@@ -842,7 +866,11 @@ def _get_request_id(request: Request) -> str | None:
         rid = state.get("request_id")
         if isinstance(rid, str) and rid:
             return rid
-    for name, value in request.scope.get("headers", ()):
+    # ``scope.get("headers")`` returns ``None`` if the key exists with a
+    # ``None`` value (some third-party middleware do this), which would
+    # raise ``TypeError`` on iteration. ASGI guarantees a list of bytes
+    # tuples in practice, but we defend anyway.
+    for name, value in (request.scope.get("headers") or ()):
         if name.lower() == b"x-request-id":
             try:
                 return value.decode("latin-1").strip() or None
@@ -900,11 +928,17 @@ def create_app_from_env() -> FastAPI:
 def main() -> None:
     """Single-worker dev/staging entrypoint: ``python -m ...main``.
 
-    For production multi-worker, use ``uvicorn --factory`` (see
-    :func:`create_app_from_env`). This function intentionally does not
-    shell out to a subprocess or re-import the module — it builds the
-    services and the app in-process and hands them to uvicorn directly,
-    which is the simplest, most debuggable pattern for local work.
+    In **non-reload** mode (production / staging), builds the services
+    and the app in-process and hands the instance directly to uvicorn —
+    the simplest, most debuggable pattern for local work. Breakpoints in
+    :func:`create_app` fire immediately.
+
+    In **reload** mode (development), uvicorn requires an import string
+    — it rejects an app instance with ``RuntimeError: You must pass the
+    application as an import string to enable 'reload' or 'workers'.``.
+    We therefore hand uvicorn the dotted path of
+    :func:`create_app_from_env` and let each worker build its own
+    services (which is the correct semantics for hot-reload anyway).
     """
     try:
         import uvicorn  # noqa: PLC0415
@@ -918,8 +952,6 @@ def main() -> None:
     from nexusdl.core.bootstrap import build_services  # noqa: PLC0415
 
     services = build_services()
-    app = create_app(services)
-
     settings = services.settings
     host = str(_get(settings, "api", "host", default=_DEFAULT_HOST))
     port = int(_get(settings, "api", "port", default=_DEFAULT_PORT))
@@ -930,13 +962,33 @@ def main() -> None:
 
     _print_banner(host=host, port=port, reload_enabled=reload_enabled)
 
+    if reload_enabled:
+        # uvicorn's ``reload`` and ``workers`` modes require an import
+        # string, not an app instance. Each reload-spawned worker will
+        # call ``create_app_from_env`` and build its own services, which
+        # is exactly what hot-reload wants.
+        uvicorn.run(
+            _FACTORY_IMPORT_STRING,
+            factory=True,
+            host=host,
+            port=port,
+            reload=True,
+            log_config=None,       # we use loguru everywhere
+            access_log=False,      # LoggingMiddleware handles it
+            log_level=log_level,
+        )
+        return
+
+    # Non-reload: keep everything in the parent process so breakpoints
+    # in ``create_app`` fire directly, and diagnostics are simple.
+    app = create_app(services)
     uvicorn.run(
         app,
         host=host,
         port=port,
-        reload=reload_enabled,
-        log_config=None,       # we use loguru everywhere
-        access_log=False,      # LoggingMiddleware handles it
+        reload=False,
+        log_config=None,
+        access_log=False,
         log_level=log_level,
     )
 

@@ -21,7 +21,25 @@ Universal design notes:
       from the injected :class:`ProgressState` or the :class:`Labels` map.
     * Safe against out-of-order updates: the latest ``set_state`` wins.
     * Cleans up after itself on ``<Destroy>`` (stops the indeterminate
-      animation, cancels pending ``after`` callbacks).
+      animation, cancels pending ``after`` callbacks). The destroy handler
+      is idempotent: a second `<Destroy>` event on the same widget
+      (rare, but possible when Tk re-fires the binding during teardown)
+      short-circuits before touching the (partially-torn-down) child
+      widgets.
+
+Bar mode transitions
+--------------------
+:meth:`ProgressWidget._render_bar` switches the underlying
+:class:`customtkinter.CTkProgressBar` between ``"determinate"`` and
+``"indeterminate"`` based on whether the total is known. The switch is
+performed in two steps — configure the mode, then update
+``self._bar_mode`` — so that a failed configure (a Tcl error, a
+CustomTkinter version mismatch) leaves the widget in the previous mode
+and the next render retries. An earlier version updated
+``self._bar_mode`` unconditionally, which would leave the bar in the old
+mode forever after a single failed configure — the failure was silent
+because the ``except: pass`` swallowed it, and no subsequent render
+retried the transition.
 """
 from __future__ import annotations
 
@@ -171,7 +189,7 @@ def _format_speed(value: float, unit: str) -> str:
     """Format a speed value for the given unit."""
     if unit in ("B/s", "bytes/s"):
         return f"{_format_bytes(int(value))}/s"
-    return f"{value:.1f} {unit}"
+    return f"{value:.1f} {unit}".rstrip()
 
 
 def _clamp01(x: float) -> float:
@@ -263,7 +281,10 @@ class ProgressWidget(ctk.CTkFrame):
         self._build()
         self._render(force=True)
 
-        self.bind("<Destroy>", self._on_destroy)
+        # ``add="+"`` preserves any ``<Destroy>`` binding a future
+        # subclass might add — the widget itself has none today, but
+        # this method may be subclassed.
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
     # ------------------------------------------------------------------
     # Public API
@@ -518,10 +539,16 @@ class ProgressWidget(ctk.CTkFrame):
                 except Exception:
                     pass
                 self._animating = False
+            # Configure the mode **before** updating ``_bar_mode``. If
+            # configure raises (a Tcl error, a CustomTkinter version
+            # mismatch), the widget stays in the previous mode and the
+            # next render retries — the bar does not silently stop
+            # switching modes for the rest of the session.
             try:
                 self._main_bar.configure(mode=desired)
             except Exception:
-                pass
+                # Keep the previous mode; next render retries.
+                return
             self._bar_mode = desired
 
         if indeterminate:
@@ -631,6 +658,12 @@ class ProgressWidget(ctk.CTkFrame):
 
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._destroyed:
+            # A second ``<Destroy>`` event on the same widget (rare, but
+            # possible when Tk re-fires the binding during teardown)
+            # would re-enter the cleanup below on a partially-torn-down
+            # widget tree. Guarding makes the handler idempotent.
             return
         self._destroyed = True
 

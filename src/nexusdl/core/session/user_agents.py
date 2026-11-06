@@ -52,7 +52,9 @@ Three sources, in priority order:
 Format of the file
 ------------------
 One UA per line. Empty lines and lines starting with ``#`` are ignored.
-Whitespace around each line is stripped. Duplicates are removed while
+Whitespace around each line is stripped **before** the emptiness check,
+so a line of only whitespace is treated the same as an empty line and is
+not added to the pool. Duplicates (after trimming) are removed while
 preserving the first occurrence's position.
 
 Thread safety
@@ -239,13 +241,23 @@ def load_user_agents(
 def _parse_lines(text: str) -> tuple[str, ...]:
     """Parse a UA pool file into a deduplicated tuple, preserving order.
 
+    The parser is deliberately simple:
+
+    * Each line is trimmed of leading/trailing whitespace **first**.
+    * A line that is empty *after* trimming is skipped — this includes
+      lines that consisted only of whitespace, which the docstring of
+      :func:`load_user_agents` promises is "ignored".
+    * A line starting with ``#`` (after trimming) is a comment and is
+      skipped.
+    * Duplicates (after trimming) are collapsed to their first
+      occurrence; the returned tuple preserves the order of first
+      appearance.
+
     Args:
         text: Raw file content.
 
     Returns:
         The list of unique, trimmed, non-comment, non-empty lines.
-        Duplicates are collapsed to their first occurrence; the order is
-        the order of first appearance.
     """
     seen: set[str] = set()
     unique: list[str] = []
@@ -404,6 +416,13 @@ class UserAgentRotator:
         a new window. When ``sticky_ttl`` is ``None`` or ``0.0``, this
         method is equivalent to :meth:`next`.
 
+        The expiry decision is taken with a clock read **under the
+        lock**, so two concurrent calls for the same domain see the
+        same window boundary — the earlier pattern of reading the clock
+        before acquiring the lock let a fresh cache entry be judged
+        against a stale ``now``, extending the effective TTL beyond the
+        configured value by the caller's scheduling latency.
+
         Args:
             domain: The domain key. Conventionally the request URL's
                 hostname (``urlparse(url).netloc``), but any string works
@@ -415,11 +434,23 @@ class UserAgentRotator:
         Returns:
             A User-Agent string, stable for the domain during the TTL.
         """
-        if not domain or self._sticky_ttl is None or self._sticky_ttl == 0:
+        if not domain:
+            # An empty domain is not a domain — fall through to the
+            # per-request strategy rather than poisoning the cache with
+            # a "" key. Debug-logged so a caller can trace the fallback
+            # if the empty key was unexpected.
+            _log.debug(
+                "for_domain() called with an empty domain; falling back "
+                "to next()"
+            )
+            return self.next()
+        if self._sticky_ttl is None or self._sticky_ttl == 0:
             return self.next()
 
-        now = self._clock()
         with self._lock:
+            # Clock is read under the lock so concurrent callers see a
+            # consistent now relative to the cache entries they observe.
+            now = self._clock()
             cached = self._domain_cache.get(domain)
             if cached is not None and cached[1] > now:
                 return cached[0]

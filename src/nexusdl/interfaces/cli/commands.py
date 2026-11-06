@@ -60,6 +60,17 @@ Deterministic output
 Every list command sorts its output deterministically (alphabetical for
 sites and plugins, most-recent-first for library listings, arrival
 order for search results).
+
+Language and format parsing
+---------------------------
+Both ``Language`` and ``PackagingFormat`` are ``StrEnum`` subclasses
+whose values are **lowercase** (``Language.EN.value == "en"``,
+``PackagingFormat.CBZ.value == "cbz"``). The two parsing helpers
+lowercase the user input before constructing the enum member, so
+``--language en``, ``--language EN``, and ``--language En`` all resolve
+to ``Language.EN``. A prior version uppercased the language input and
+silently rejected every ``--language`` value the user could reasonably
+type — see the module docstring's history for the fix.
 """
 
 from __future__ import annotations
@@ -145,7 +156,12 @@ def _echo_json(payload: Any) -> None:
 
 
 def _parse_format(raw: str | None) -> PackagingFormat | None:
-    """Parse a ``--format`` argument into a :class:`PackagingFormat`."""
+    """Parse a ``--format`` argument into a :class:`PackagingFormat`.
+
+    The enum's values are lowercase (``"cbz"``, ``"cb7"``, …); the
+    input is lowercased before construction so ``--format CBZ`` and
+    ``--format cbz`` both resolve to the same member.
+    """
     if raw is None:
         return None
     try:
@@ -159,14 +175,23 @@ def _parse_format(raw: str | None) -> PackagingFormat | None:
 
 
 def _parse_language(raw: str | None) -> Language | None:
-    """Parse a ``--language`` argument into a :class:`Language`."""
+    """Parse a ``--language`` argument into a :class:`Language`.
+
+    The enum's values are lowercase ISO 639-1 codes (``"en"``,
+    ``"fr"``, …); the input is lowercased before construction so
+    ``--language en``, ``--language EN``, and ``--language En`` all
+    resolve to the same member. A prior version uppercased the input,
+    which silently rejected every value a user could reasonably type —
+    see the module docstring's "Language and format parsing" section.
+    """
     if raw is None:
         return None
     try:
-        return Language(raw.upper())
+        return Language(raw.lower())
     except ValueError as exc:
         _err_console.print(
-            f"[red]Unknown language:[/red] {raw!r}"
+            f"[red]Unknown language:[/red] {raw!r}. "
+            f"Supported: en, fr, es, de, ja, ko, zh, pt, it, ru, ar."
         )
         raise typer.Exit(_EXIT_ERROR) from exc
 
@@ -249,15 +274,38 @@ async def _search_run_async(
     limit: int,
     json_output: bool,
 ) -> None:
-    """Async body of ``nexusdl search run``."""
-    if site_id is not None and wired.registry.get_site(site_id) is None:
-        _err_console.print(
-            f"[red]Unknown site:[/red] {site_id!r}. "
-            f"Run `nexusdl sites list` to see the registered sites."
-        )
-        raise typer.Exit(_EXIT_ERROR)
+    """Async body of ``nexusdl search run``.
 
+    When ``site_id`` is provided, the search goes **directly to that
+    site's parser** instead of fanning out through
+    :meth:`SiteRegistry.search_all`. Fanning out and filtering
+    afterwards was the previous behaviour, and it was both wasteful
+    (60 requests to yield one site's results) and impolite (every
+    other site was hit for a search the user had explicitly scoped
+    out). See the module docstring's "Deterministic output" section
+    for the ordering guarantee, which holds either way.
+    """
     lang_filter = _parse_language(language)
+
+    if site_id is not None:
+        site_config = wired.registry.get_site(site_id)
+        if site_config is None:
+            _err_console.print(
+                f"[red]Unknown site:[/red] {site_id!r}. "
+                f"Run `nexusdl sites list` to see the registered sites."
+            )
+            raise typer.Exit(_EXIT_ERROR)
+        results_iter = _search_single_site(
+            wired, site_id, query, lang_filter
+        )
+    else:
+        results_iter = wired.registry.search_all(
+            query,
+            session=wired.session,
+            languages=[lang_filter] if lang_filter is not None else None,
+            include_adult=adult,
+        )
+
     results: list[SearchResult] = []
     sites_queried: set[str] = set()
     started = datetime.now(UTC)
@@ -267,14 +315,7 @@ async def _search_run_async(
             f"Searching for [bold]{query}[/bold]…", highlight=False
         )
 
-    async for result in wired.registry.search_all(
-        query,
-        session=wired.session,
-        languages=[lang_filter] if lang_filter is not None else None,
-        include_adult=adult,
-    ):
-        if site_id is not None and result.site_id != site_id:
-            continue
+    async for result in results_iter:
         sites_queried.add(result.site_id)
         results.append(result)
         if not json_output:
@@ -305,6 +346,29 @@ async def _search_run_async(
         f"in {elapsed:.1f}s",
         highlight=False,
     )
+
+
+async def _search_single_site(
+    wired: WiredServices,
+    site_id: str,
+    query: str,
+    language_filter: Language | None,
+) -> "Iterator[SearchResult]":
+    """Yield search results from a single site's parser.
+
+    Async generator. Used by :func:`_search_run_async` when
+    ``--site`` is passed, so the CLI does not fan out to sites the
+    user scoped out.
+    """
+    parser = wired.registry.get_parser(site_id, wired.session)
+    async for result in parser.search(query):
+        if (
+            language_filter is not None
+            and result.language is not None
+            and result.language != language_filter
+        ):
+            continue
+        yield result
 
 
 def _format_search_line(result: SearchResult) -> str:
@@ -885,25 +949,22 @@ def library_stats(
 async def _library_stats_async(
     wired: WiredServices, *, json_output: bool
 ) -> None:
-    from sqlalchemy import text as _text
+    """Async body of ``nexusdl library stats``.
 
-    async with wired.database.session() as sess:
-        manga_count = (
-            await sess.execute(_text("SELECT COUNT(*) FROM mangas"))
-        ).scalar_one()
-        chapter_count = (
-            await sess.execute(_text("SELECT COUNT(*) FROM chapters"))
-        ).scalar_one()
-        page_count = (
-            await sess.execute(
-                _text("SELECT COALESCE(SUM(page_count), 0) FROM chapters")
-            )
-        ).scalar_one()
+    The counts come from :meth:`LibraryDatabase.stats` — the public
+    aggregate method — rather than from inline SQL. A raw
+    ``SELECT COUNT(*)`` in the CLI couples the command to the schema
+    (a future migration that renames a table would break this command
+    without touching anything that looks like a query), and a query
+    against the database layer's public API belongs in the database
+    layer anyway.
+    """
+    stats = await wired.database.stats()
 
     payload = {
-        "manga_count": int(manga_count),
-        "chapter_count": int(chapter_count),
-        "page_count": int(page_count),
+        "manga_count": stats.manga_count,
+        "chapter_count": stats.chapter_count,
+        "page_count": stats.page_count,
     }
     if json_output:
         _echo_json(payload)
@@ -959,6 +1020,16 @@ async def _library_delete_async(
             f"[red]Manga not found:[/red] {manga_id!r}"
         )
         raise typer.Exit(_EXIT_ERROR)
+
+    # An unconfirmed destructive delete is exactly the kind of thing a
+    # postmortem asks about six months later. Log it explicitly on
+    # stderr so a script's trace shows what was actually removed.
+    if yes and delete_files:
+        _err_console.print(
+            f"[yellow]--yes with --delete-files: removing "
+            f"{manga.title!r} ({manga.id}) and its files without "
+            f"confirmation.[/yellow]"
+        )
 
     if not yes:
         suffix = " (and its archive files)" if delete_files else ""
@@ -1106,6 +1177,8 @@ def sites_list(
             include_disabled=include_disabled,
         )
         if json_output:
+            from dataclasses import asdict
+
             _echo_json(
                 [
                     {
@@ -1113,10 +1186,7 @@ def sites_list(
                         "name": s.name,
                         "language": s.language.value,
                         "adult": s.adult,
-                        "capabilities": {
-                            k: getattr(s.capabilities, k)
-                            for k in s.capabilities.__slots__
-                        },
+                        "capabilities": asdict(s.capabilities),
                     }
                     for s in sites
                 ]
@@ -1162,6 +1232,8 @@ def sites_show(
             raise typer.Exit(_EXIT_ERROR)
 
         if json_output:
+            from dataclasses import asdict
+
             _echo_json(
                 {
                     "id": site.id,
@@ -1170,10 +1242,7 @@ def sites_show(
                     "parser_class": site.parser_class,
                     "language": site.language.value,
                     "adult": site.adult,
-                    "capabilities": {
-                        k: getattr(site.capabilities, k)
-                        for k in site.capabilities.__slots__
-                    },
+                    "capabilities": asdict(site.capabilities),
                     "cookies_required": list(site.cookies_required),
                     "max_concurrent_downloads": site.max_concurrent_downloads,
                     "rate_limit": site.rate_limit,
@@ -1622,19 +1691,21 @@ def _masked_settings(settings: Any) -> dict[str, Any]:
 
     Uses :meth:`pydantic.BaseModel.model_dump` to get the full settings
     tree (every section and every field), then redacts the three root
-    secrets and the two proxy URL fields. The redaction markers differ
-    deliberately:
+    secrets and the two proxy URL fields.
 
-    * **Root secrets** → ``"***"`` — the length is withheld because a
-      JSON file may be committed, and a root secret's length narrows a
-      brute-force.
-    * **Proxy URLs** → ``"***"`` — same rationale, applied to every URL
-      in ``proxy.url`` / ``proxy.urls``. ``None`` stays ``None``.
+    **Two layers of defence, on purpose.** ``model_dump(mode="json")``
+    already produces a masked string for every :class:`~pydantic.SecretStr`
+    field — Pydantic returns ``"**********"`` for the value, not the
+    plaintext. That means a secret field that a future contributor
+    forgets to add to :data:`_ROOT_SECRET_FIELDS` still cannot leak
+    through this function — the plaintext never reaches the dict.
 
-    The generic dump approach (rather than a hand-enumerated dict of
-    sections) means a future config section is automatically included
-    without a code change here, and the function cannot drift out of
-    sync with the config schema.
+    The explicit redaction in this function is the **second** layer:
+    it produces a uniform ``"***"`` marker for every secret, regardless
+    of Pydantic's own masking format. A caller reading the JSON output
+    sees one consistent placeholder, not two (``"**********"`` for
+    some fields, ``"***"`` for others). The uniformity is worth the
+    duplication.
 
     Args:
         settings: A :class:`~nexusdl.core.config.Settings` instance.

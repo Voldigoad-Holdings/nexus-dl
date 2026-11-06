@@ -99,7 +99,6 @@ from .schemas.responses import ErrorCode, error_response
 from .security import (
     TokenError,
     TokenExpiredError,
-    TokenInvalidError if False else TokenError,  # keep mypy quiet — see below
     TokenPayload,
     TokenRevokedError,
     TokenTypeMismatchError,
@@ -474,7 +473,11 @@ async def get_optional_payload(
     """Return the token payload, or ``None`` when authentication is absent.
 
     Same reuse-then-verify logic as :func:`get_current_payload`, but
-    **never raises** on authentication failure — it returns ``None``.
+    **never raises on authentication failure** (401) — it returns
+    ``None``. Non-auth errors (500 from a misconfigured auth service, an
+    internal error from ``verify_access``) propagate unchanged, so a
+    broken deployment is not silently masked as "anonymous user".
+
     Use this for endpoints that serve both authenticated and anonymous
     clients (public search, manga detail, health status via API, …).
 
@@ -488,8 +491,13 @@ async def get_optional_payload(
             credentials=credentials,
             services=services,
         )
-    except HTTPException:
-        return None
+    except HTTPException as exc:
+        # Only swallow authentication failures (401). A 500 means the
+        # auth service itself is broken — that is a bug we want to
+        # surface, not mask as "no user".
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            return None
+        raise
 
 
 #: "Authenticated user, or None if anonymous" type.
@@ -518,7 +526,10 @@ def require_role(
 
     Raises:
         HTTPException: 403 with ``reason`` set to ``INSUFFICIENT_ROLE``
-            and the required role documented in ``details``.
+            and the required role documented in ``details``. Per RFC 6750
+            §3.1, the response also carries
+            ``WWW-Authenticate: Bearer error="insufficient_scope"`` so
+            standard API clients can recognize the failure mode.
     """
     async def _checker(payload: CurrentUser) -> TokenPayload:
         if not role_at_least(payload.role, required):
@@ -533,6 +544,10 @@ def require_role(
                         "actual_role": payload.role.value,
                     },
                 ).model_dump(),
+                headers={
+                    "WWW-Authenticate": 'Bearer error="insufficient_scope"',
+                    "X-Auth-Reason": "INSUFFICIENT_ROLE",
+                },
             )
         return payload
 
@@ -613,16 +628,18 @@ def _unauthorized(
 
 
 def _oauth_error(reason: str) -> str:
-    """Map our internal reason to an RFC 6750 ``error`` value.
+    """Map our internal reason to an RFC 6750 ``error`` value for 401s.
 
     The ``WWW-Authenticate`` header is what browsers and API clients
     read to understand the failure. Values per RFC 6750:
 
     * ``invalid_request`` — the request lacked a required token.
     * ``invalid_token``   — the token was malformed, expired, or revoked.
-    * ``insufficient_scope`` — the token lacks the required permissions
-      (used here only by :func:`require_role`, which builds its own
-      header — this function is for the 401 paths).
+
+    ``insufficient_scope`` is intentionally **not** produced here: it is
+    a 403-specific error and is emitted by :func:`require_role` directly
+    (see its 403 response, which sets its own ``WWW-Authenticate``
+    header). This function covers 401 paths only.
     """
     return (
         "invalid_request" if reason == "MISSING_TOKEN" else "invalid_token"

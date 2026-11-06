@@ -57,20 +57,38 @@ is what the TUI wants for a batch download.
 
 Completion detection
 --------------------
-The worker waits until every task in
-:attr:`_download_chapter_ids` reaches a terminal phase in the tracker
-(via ``TaskProgress.is_terminal``). The wait loop polls every 500 ms
-and calls :meth:`_finish_download` when the count of terminal tasks
-equals the count of chapters that were actually submitted (after
-``skip_existing`` pruned the ones already on disk).
+The worker waits until every chapter in :attr:`_download_chapter_ids`
+has been **observed as terminal at least once** during the poll loop.
+The screen maintains a :attr:`_terminal_chapter_ids` set that
+accumulates chapter ids as the tracker reports them terminal; the
+loop ends when that set's size reaches the batch size.
 
-A download that finishes with one or more failures shows a
-**partial-success** status ("X succeeded, Y failed") rather than a
-uniform "done" — the user must know which chapters need attention.
+Accumulating terminal chapter ids — rather than checking
+``len(tasks) == len(batch)`` on each poll — is required because the
+tracker may evict finished tasks from its snapshot under memory
+pressure. A batch of 200 chapters against a 100-task tracker would
+never satisfy the equality check: after the first 100 completions, the
+tracker's snapshot could contain only the 100 most-recent tasks, and
+the loop would spin forever showing ``downloading: 200``. The
+accumulating set makes the check monotone: once a chapter is
+observed terminal, it stays counted, regardless of what the tracker
+shows on the next poll.
+
+A download that finishes with one or more failures or cancellations
+shows a **partial-success** status ("X succeeded, Y failed") rather
+than a uniform "done" — the user must know which chapters need
+attention. A cancellation triggered by the user also counts as a
+non-success for this purpose: a user who cancelled a chapter expects
+to see that chapter in the "not downloaded" count, not silently
+folded into the success total.
 
 Cancel semantics
 ----------------
-"Cancel" is best-effort:
+"Cancel" is best-effort, and **not** worker-based: the cancel logic
+runs inline in :meth:`_cancel_download` and awaits its per-task
+manager calls before returning. This makes the cancel idempotent — a
+double-click cannot start two cancel batches that race each other and
+leave some tasks un-cancelled.
 
 * The download worker (which is waiting for completion) is cancelled
   — the wait stops.
@@ -117,7 +135,10 @@ The screen introduces fifteen keys under ``download.*``:
 * ``download.status.downloading`` — during a download, with ``{active}``.
 * ``download.status.done`` — every submitted chapter succeeded.
 * ``download.status.done_with_failures`` — some failed, with
-  ``{success}`` and ``{failed}``.
+  ``{success}`` and ``{failed}``. Used for both genuine failures and
+  user-triggered cancellations: to the user, "this chapter did not
+  download" is the relevant fact, whether the cause was a network
+  error or a cancel click.
 * ``download.status.cancelled`` — after a user-triggered cancel.
 * ``download.status.error`` — an unexpected failure, with ``{error}``.
 
@@ -200,6 +221,13 @@ _SHIPPED_FORMATS: Final[tuple[PackagingFormat, ...]] = (
 #: promptly after the last chapter completes, slow enough that the loop
 #: does not contend with the display timer's own polling.
 _COMPLETION_POLL_INTERVAL: Final[float] = 0.5
+
+#: Phase strings used by the completion detection to distinguish a
+#: successful chapter from a failed or cancelled one. Matches the phase
+#: values exposed by :class:`TaskProgress` — see
+#: :mod:`nexusdl.core.downloader.progress` for the canonical list.
+_PHASE_COMPLETED: Final[str] = "completed"
+_PHASE_FAILED: Final[str] = "failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -321,6 +349,13 @@ class DownloadScreen(Screen[None]):
         #: (after ``skip_existing`` pruning). Empty before the first
         #: download starts, empty again after :meth:`_finish_download`.
         self._download_chapter_ids: set[str] = set()
+
+        #: Chapter ids **observed as terminal** at least once during
+        #: the current batch's poll loop. Accumulates monotonically,
+        #: independent of what the tracker's snapshot contains on each
+        #: poll — see the module docstring's "Completion detection"
+        #: section for why this is required.
+        self._terminal_chapter_ids: set[str] = set()
 
         #: Whether a download is currently in progress. Guards the
         #: completion check in the worker's poll loop and the toggle
@@ -467,17 +502,22 @@ class DownloadScreen(Screen[None]):
         limit applies to the whole batch. See the module docstring's
         "Submit-then-wait" section.
 
-        Waits by polling the tracker every 500 ms until every submitted
-        chapter's task is terminal. A ``CancelledError`` (either from
-        the user's cancel action or from Textual's teardown) propagates
-        after resetting the in-progress flag.
+        Waits by polling the tracker every 500 ms and accumulating
+        chapter ids that have reached a terminal phase in
+        :attr:`_terminal_chapter_ids`. The loop ends when every
+        submitted chapter has been observed terminal at least once —
+        see the module docstring's "Completion detection" section for
+        why the accumulating set is required (the tracker may evict
+        finished tasks from its snapshot under memory pressure, which
+        would otherwise leave the loop spinning forever on a large
+        batch).
         """
         chapter_list = self.query_one(ChapterList)
         selected = chapter_list.selected_chapters
         if not selected:
             return
 
-        to_submit = self._prune_already_downloaded(selected)
+        to_submit = await self._prune_already_downloaded(selected)
         if not to_submit:
             self._set_status(
                 self._translator.translate("download.status.idle")
@@ -485,6 +525,7 @@ class DownloadScreen(Screen[None]):
             return
 
         self._download_chapter_ids = {c.id for c in to_submit}
+        self._terminal_chapter_ids = set()
         self._download_in_progress = True
         self._update_controls()
         self._set_status(
@@ -502,15 +543,19 @@ class DownloadScreen(Screen[None]):
                 )
                 await self._manager.submit(task)
 
-            # Wait for every submitted chapter's task to reach a terminal
-            # phase. Poll interval matches _COMPLETION_POLL_INTERVAL.
+            # Wait for every submitted chapter to be observed terminal
+            # at least once. The accumulating set tolerates tracker
+            # eviction — see the module docstring.
             while True:
                 await asyncio.sleep(_COMPLETION_POLL_INTERVAL)
                 snapshot = await self._tracker.snapshot()
                 tasks = self._tasks_for_snapshot(snapshot)
+                for task in tasks:
+                    if task.is_terminal:
+                        self._terminal_chapter_ids.add(task.chapter_id)
                 if (
-                    len(tasks) == len(self._download_chapter_ids)
-                    and all(t.is_terminal for t in tasks)
+                    len(self._terminal_chapter_ids)
+                    >= len(self._download_chapter_ids)
                 ):
                     self._finish_download(tasks)
                     return
@@ -528,7 +573,7 @@ class DownloadScreen(Screen[None]):
             self._update_controls()
             return
 
-    def _prune_already_downloaded(
+    async def _prune_already_downloaded(
         self, chapters: tuple[Chapter, ...]
     ) -> list[Chapter]:
         """Filter out chapters whose output file already exists.
@@ -536,6 +581,12 @@ class DownloadScreen(Screen[None]):
         Honours ``settings.downloader.skip_existing``. Uses
         :func:`~nexusdl.core.paths.chapter_output_path` for the path
         lookup so the check matches what the worker would produce.
+
+        The ``Path.exists()`` calls are I/O-bound; on a network-mounted
+        downloads directory a batch of 100 chapters can take seconds.
+        The whole loop is therefore offloaded to a worker thread via
+        :func:`asyncio.to_thread` — a batch download must not freeze
+        the event loop.
 
         Args:
             chapters: The chapters the user marked.
@@ -549,24 +600,37 @@ class DownloadScreen(Screen[None]):
         base = manga_dir(
             Path(self._settings.storage.downloads_dir), self._manga.title
         )
-        keep: list[Chapter] = []
-        for chapter in chapters:
-            expected = chapter_output_path(
-                base, chapter.title, self._current_format
-            )
-            if not expected.exists():
-                keep.append(chapter)
-        return keep
+        fmt = self._current_format
+
+        def _prune_sync() -> list[Chapter]:
+            keep: list[Chapter] = []
+            for chapter in chapters:
+                expected = chapter_output_path(
+                    base, chapter.title, fmt
+                )
+                if not expected.exists():
+                    keep.append(chapter)
+            return keep
+
+        return await asyncio.to_thread(_prune_sync)
 
     def _finish_download(self, tasks: tuple[TaskProgress, ...]) -> None:
-        """Show the final status for a completed batch and reset state."""
+        """Show the final status for a completed batch and reset state.
+
+        A chapter that did not complete successfully — whether it
+        failed with a network error or was cancelled by the user — is
+        counted as "not downloaded" in the status line. To the user,
+        "the chapter is not there" is the relevant fact regardless of
+        cause; a status that folded cancellations into the success
+        count would hide the missing chapters.
+        """
         self._download_in_progress = False
         self._update_controls()
 
-        success = sum(1 for t in tasks if t.phase != "failed")
-        failed = sum(1 for t in tasks if t.phase == "failed")
+        success = sum(1 for t in tasks if t.phase == _PHASE_COMPLETED)
+        not_ok = len(self._download_chapter_ids) - success
 
-        if failed == 0:
+        if not_ok <= 0:
             self._set_status(
                 self._translator.translate("download.status.done")
             )
@@ -575,21 +639,30 @@ class DownloadScreen(Screen[None]):
                 self._translator.translate(
                     "download.status.done_with_failures",
                     success=success,
-                    failed=failed,
+                    failed=not_ok,
                 )
             )
 
         self._download_chapter_ids = set()
+        self._terminal_chapter_ids = set()
 
     def _cancel_download(self) -> None:
         """Stop the download worker and cancel/pause in-flight tasks.
 
-        Best-effort: the worker's wait is cancelled first (so the
-        display stops polling for completion), then a separate worker
-        walks the current snapshot and stops every non-terminal task
-        via the manager's ``cancel`` (pending) or ``pause`` (running)
-        APIs. Each stopped task is marked cancelled in the tracker so
-        the progress bar updates immediately.
+        Best-effort, **not worker-based**: the cancel logic runs inline
+        in :meth:`_do_cancel_tasks` and awaits its per-task manager
+        calls before returning. Making it worker-based (``@work``) would
+        let a second click on Cancel start a second cancel batch that
+        races the first — with ``@work(exclusive=True)``, the first
+        batch would be cancelled mid-loop, leaving some tasks
+        un-cancelled while the status line said "cancelled".
+
+        The worker's wait is cancelled first (so the display stops
+        polling for completion), then the inline cancel walks the
+        current snapshot and stops every non-terminal task via the
+        manager's ``cancel`` (pending) or ``pause`` (running) APIs.
+        Each stopped task is marked cancelled in the tracker so the
+        progress bar updates immediately.
 
         A task that has already finished — or that finishes between the
         snapshot and the cancel loop — is left alone. See the module
@@ -597,13 +670,32 @@ class DownloadScreen(Screen[None]):
         """
         if not self._download_in_progress:
             return
-        if self._download_worker is not None and not self._download_worker.is_done:
+        if (
+            self._download_worker is not None
+            and not self._download_worker.is_done
+        ):
             self._download_worker.cancel()
-        self._do_cancel_tasks()
+        # Fire-and-forget: the cancel itself is async and must not
+        # block the button handler. A second click while this runs is
+        # idempotent (each task checks ``is_terminal`` before acting),
+        # but cannot start a second batch because the *synchronous*
+        # guard ``_download_in_progress`` is reset only by
+        # ``_do_cancel_tasks`` at the end.
+        self.run_worker(
+            self._do_cancel_tasks(),
+            group="cancel",
+            exclusive=True,
+            exit_on_error=False,
+        )
 
-    @work(exclusive=True, group="cancel")
     async def _do_cancel_tasks(self) -> None:
-        """Cancel pending tasks and pause running ones for the batch."""
+        """Cancel pending tasks and pause running ones for the batch.
+
+        Runs inline (via :meth:`run_worker`) rather than as a
+        ``@work``-decorated method so the caller can hold a reference
+        to the coroutine it started — see :meth:`_cancel_download`'s
+        docstring for why the reference matters for idempotency.
+        """
         snapshot = await self._tracker.snapshot()
         tasks = self._tasks_for_snapshot(snapshot)
         for task in tasks:
@@ -720,6 +812,8 @@ class DownloadScreen(Screen[None]):
 
     def _update_controls(self) -> None:
         """Enable or disable the buttons based on current state."""
+        if not self.is_mounted:
+            return
         chapter_list = self.query_one(ChapterList)
         has_selection = len(chapter_list.selected_chapters) > 0
         start_btn = self.query_one("#download-start", Button)

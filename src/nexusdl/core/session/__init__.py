@@ -126,8 +126,10 @@ case with no benefit.
 
 Lazy loading
 ------------
-All forty-five exports are resolved through PEP 562's ``__getattr__``
-mechanism. Importing ``nexusdl.core.session`` **does not import any
+All forty-five module-level exports are resolved through PEP 562's
+``__getattr__`` mechanism, plus the two introspection helpers
+(:func:`list_symbols`, :func:`get_symbol`) that are defined locally in
+this module. Importing ``nexusdl.core.session`` **does not import any
 submodule**.
 
 This matters more here than anywhere else in the project, because the
@@ -218,17 +220,17 @@ Dependency graph (no cycles)::
     core.exceptions
          ▲
          │
-    ┌────┴──────────────────────────────────────────────────────────┐
-    │                                                                │
-    user_agents   rate_limiter   proxy_manager   playwright_pool    │
-    flaresolverr  cookie_manager circuit_breaker cache              │
-         ▲             ▲             ▲             ▲                  │
-         │             │             │             │                  │
-         └─────────────┴──────┬──────┴─────────────┴──────────────────┘
-                              │
-                        http_session
-                              │
-                        (composition root)
+    ┌────┴─────────────────────────────────────────────────────────────┐
+    │                                                                  │
+    user_agents   rate_limiter   proxy_manager   playwright_pool       │
+    flaresolverr  cookie_manager circuit_breaker cache                 │
+         ▲             ▲             ▲             ▲                    │
+         │             │             │             │                    │
+         └─────────────┴─────────────┼─────────────┴────────────────────┤
+                                     │
+                               http_session
+                                     │
+                             (composition root)
 
 ``http_session`` depends on ``user_agents``, ``rate_limiter``, and
 ``proxy_manager`` directly (imports for construction of defaults and for
@@ -322,7 +324,7 @@ __all__ = [
 # Maps exported name -> (submodule basename, attribute name in that submodule).
 # Every listed symbol is defined at module level in the given submodule.
 # Adding a new top-level export is a one-line change here plus a matching
-# TYPE_CHECKING re-export below.
+# TYPE_CHECKING re-export below plus a matching __all__ entry.
 
 _LAZY: dict[str, tuple[str, str]] = {
     # --- http_session (very heavy: httpx[http2] + hishel + everything) -- #
@@ -383,6 +385,12 @@ _LAZY: dict[str, tuple[str, str]] = {
     "DEFAULT_DEFAULT_TTL": ("cache", "DEFAULT_DEFAULT_TTL"),
     "DEFAULT_EVICTION_TARGET_RATIO": ("cache", "DEFAULT_EVICTION_TARGET_RATIO"),
 }
+
+#: Names defined *locally* in this module, never routed through
+#: :data:`_LAZY`. They are the two introspection helpers. Kept in a
+#: separate constant rather than inlined so :func:`list_symbols` and
+#: the ``__all__`` consistency check both derive from one place.
+_LOCAL: frozenset[str] = frozenset({"list_symbols", "get_symbol"})
 
 
 # ===========================================================================
@@ -468,7 +476,7 @@ def __getattr__(name: str) -> Any:
 
     Called by Python's import machinery whenever an attribute is accessed
     on this package that is not already bound in ``globals()``. Only the
-    names in :data:`__all__` are handled; anything else raises
+    names in :data:`_LAZY` are handled; anything else raises
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
@@ -555,9 +563,9 @@ def __dir__() -> list[str]:
     Python's default :func:`dir` implementation collects a module's
     ``__dict__`` and, when the module defines ``__getattr__``, calls it
     with each candidate name to decide what to display. Because none of
-    the forty-five exports are present in ``__dict__`` at import time, an
-    unmodified :func:`dir` would not list them - the package would
-    appear empty in a REPL.
+    the forty-five lazy exports are present in ``__dict__`` at import
+    time, an unmodified :func:`dir` would not list them - the package
+    would appear empty in a REPL.
 
     The returned list is :data:`__all__` plus the standard module
     dunders a user typically expects to see.
@@ -572,16 +580,25 @@ def __dir__() -> list[str]:
 # ===========================================================================
 
 def list_symbols() -> list[str]:
-    """Return the sorted list of top-level lazy exports.
+    """Return the sorted list of every top-level export (lazy + local).
 
+    The list is the union of:
+
+    * the forty-five **lazy** exports registered in :data:`_LAZY`, and
+    * the two **local** helpers (:func:`list_symbols` itself and
+      :func:`get_symbol`), which are defined in this module's body.
+
+    This matches :data:`__all__` exactly - the invariant is checked in
+    :mod:`tests.unit.core.session.test_session_init` (both directions).
     Useful for parametrized tests (``@pytest.mark.parametrize("name",
     list_symbols())``), session-status dashboards that enumerate what the
     subsystem exposes, and tooling that needs to know the public surface
     without importing every submodule.
+
+    Returns:
+        A sorted list of strings, one per public export.
     """
-    # Only the forty-five public exports, not the introspection helpers
-    # themselves - otherwise ``list_symbols`` would include itself.
-    return sorted(_LAZY.keys())
+    return sorted(set(_LAZY) | _LOCAL)
 
 
 def get_symbol(name: str) -> Any:
@@ -593,14 +610,58 @@ def get_symbol(name: str) -> Any:
     collaborator class from a config string, diagnostic tools that
     enumerate the session surface).
 
+    For the two **local** helpers (:func:`list_symbols`,
+    :func:`get_symbol`), this is exactly a plain attribute access - they
+    are already bound in the module namespace.
+
+    For a **lazy** export, this routes through :func:`__getattr__` so
+    the cache is populated with the same value a plain attribute access
+    would return. This avoids the subtle issue with
+    ``__import__(__name__, fromlist=[name])``, which imports a
+    **submodule** with the same name as the attribute when one exists
+    (e.g. if ``__all__`` ever includes a name matching a submodule
+    basename, the ``fromlist`` mechanism would return the submodule
+    instead of the attribute).
+
+    Args:
+        name: The export name to resolve.
+
+    Returns:
+        The symbol, exactly as ``getattr(nexusdl.core.session, name)``
+        would return it.
+
     Raises:
         KeyError: If ``name`` is not a public session export.
     """
-    if name not in _LAZY:
-        available = ", ".join(sorted(_LAZY.keys()))
+    if name not in _LAZY and name not in _LOCAL:
+        available = ", ".join(list_symbols())
         raise KeyError(
             f"Unknown session symbol {name!r}. Available: {available}. "
             f"Every other symbol lives in its specific submodule - import "
             f"from 'nexusdl.core.session.<submodule>' directly."
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    # Local helpers are already bound; lazy ones go through __getattr__
+    # so the cache stays consistent with plain attribute access.
+    if name in _LOCAL:
+        return globals()[name]
+    return __getattr__(name)
+
+
+# ===========================================================================
+# Sanity: __all__ must exactly match the union of lazy + local exports
+# ===========================================================================
+# This assertion runs at import time and would fail on any future edit
+# that adds an entry to _LAZY without adding it to __all__ (or vice
+# versa), or that adds a local helper without registering it in _LOCAL.
+# The cost is a single set comparison at import; the benefit is that an
+# inconsistent public surface is caught the moment the package loads,
+# not on the first `from nexusdl.core.session import *` in a caller.
+
+if frozenset(__all__) != (frozenset(_LAZY) | _LOCAL):
+    _missing_from_all = (frozenset(_LAZY) | _LOCAL) - frozenset(__all__)
+    _missing_from_exports = frozenset(__all__) - (frozenset(_LAZY) | _LOCAL)
+    raise RuntimeError(
+        "nexusdl.core.session.__all__ does not match the union of "
+        f"_LAZY and _LOCAL. Missing from __all__: {sorted(_missing_from_all)}. "
+        f"Listed but not exported: {sorted(_missing_from_exports)}."
+    )

@@ -56,8 +56,9 @@ Different FlareSolverr releases have slightly different shapes — a
 parser here:
 
 * reads fields via :func:`Mapping.get` with sensible defaults,
-* converts a base64-encoded ``response`` to text if it is flagged as
-  such by the ``Content-Type`` in ``solution.headers``,
+* converts a base64-encoded ``response`` to text if the
+  ``Content-Type`` in ``solution.headers`` indicates a text format
+  (HTML, XML, JSON),
 * returns a :class:`FlareSolverrResult` whose optional fields are
   ``None`` rather than raising,
 * never inspects anything it did not opt into.
@@ -83,6 +84,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -143,6 +145,26 @@ _COMMAND_SESSIONS_LIST: Final[str] = "sessions.list"
 
 #: Body ``status`` value that indicates success.
 _STATUS_OK: Final[str] = "ok"
+
+#: Content-Type prefixes that identify a body as text (and thus as a
+#: candidate for base64 decoding in FlareSolverr's ``response`` field).
+_TEXTUAL_CONTENT_TYPE_PREFIXES: Final[tuple[str, ...]] = (
+    "text/",
+    "application/xhtml",
+    "application/xml",
+    "application/json",
+)
+
+#: HTML prefixes accepted by :func:`_looks_like_html`. A genuine
+#: Cloudflare-cleared page is virtually always one of these; the check
+#: is a heuristic to distinguish "FlareSolverr returned HTML" from
+#: "FlareSolverr returned a base64 blob or a JSON fragment".
+_HTML_PREFIXES: Final[tuple[str, ...]] = (
+    "<!doctype",
+    "<html",
+    "<!--",
+    "<?xml",
+)
 
 _log = logger.bind(component="session.flaresolverr")
 
@@ -269,7 +291,14 @@ class FlareSolverrClient:
             range, or ``timeout_ms`` is not an ``int``.
     """
 
-    __slots__ = ("_client", "_closed", "_enabled", "_endpoint", "_timeout_ms")
+    __slots__ = (
+        "_client",
+        "_client_lock",
+        "_closed",
+        "_enabled",
+        "_endpoint",
+        "_timeout_ms",
+    )
 
     def __init__(
         self,
@@ -295,6 +324,10 @@ class FlareSolverrClient:
         self._timeout_ms: int = timeout_ms
         self._enabled: bool = enabled
         self._client: httpx.AsyncClient | None = None
+        # Serialises client creation so two concurrent first-solves
+        # cannot each build an ``AsyncClient``. See ``_ensure_client``
+        # docstring.
+        self._client_lock = asyncio.Lock()
         self._closed: bool = False
 
     # ------------------------------------------------------------------ #
@@ -425,9 +458,12 @@ class FlareSolverrClient:
         successful :meth:`solve` is itself the best health check).
 
         A disabled client returns ``False`` without contacting the
-        server. A closed client raises :class:`SessionError` — after
-        close, the caller must not be using the client at all, so a
-        silent ``False`` would hide a programming error.
+        server, and **logs at DEBUG** so an operator inspecting logs
+        can distinguish "disabled by configuration" from "unreachable"
+        (both yield ``False``, but only the latter is a problem).
+        A closed client raises :class:`SessionError` — after close,
+        the caller must not be using the client at all, so a silent
+        ``False`` would hide a programming error.
 
         Returns:
             ``True`` iff the server responded with a successful payload,
@@ -435,6 +471,9 @@ class FlareSolverrClient:
             except for the "client is closed" case.
         """
         if not self._enabled:
+            _log.debug(
+                "FlareSolverr health check skipped: client is disabled"
+            )
             return False
         if self._closed:
             raise SessionError(
@@ -513,12 +552,37 @@ class FlareSolverrClient:
         return response
 
     async def _ensure_client(self) -> httpx.AsyncClient:
-        """Return the underlying client, creating it lazily on first use."""
-        if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=None,  # per-request timeout is set explicitly
-            )
-        return self._client
+        """Return the underlying client, creating it lazily on first use.
+
+        Creation is serialised by ``_client_lock`` so concurrent
+        first-solves cannot each build an ``AsyncClient`` — the loser
+        of such a race would leak its connection pool. After the first
+        successful creation the lock is uncontended and the dict
+        lookup is atomic; the fast path avoids acquiring the lock at
+        all in steady state.
+
+        Raises:
+            SessionError: If the client has been closed between the
+                caller's check and the acquisition of the lock (a
+                ``close()`` racing a ``solve()`` — the caller should
+                retry with a fresh client).
+        """
+        # Fast path — no lock needed once the client exists.
+        client = self._client
+        if client is not None:
+            return client
+
+        async with self._client_lock:
+            if self._closed:
+                raise SessionError(
+                    "FlareSolverrClient is closed; create a new instance "
+                    "to continue solving challenges"
+                )
+            if self._client is None:
+                self._client = httpx.AsyncClient(
+                    timeout=None,  # per-request timeout is set explicitly
+                )
+            return self._client
 
     # ------------------------------------------------------------------ #
     # Internals — payload parsing                                        #
@@ -542,9 +606,15 @@ class FlareSolverrClient:
         try:
             payload = response.json()
         except (ValueError, json.JSONDecodeError) as exc:
+            # A proxy that intercepts ``/v1`` (or a FlareSolverr that
+            # serves an HTML error page instead of the JSON API) lands
+            # here. Echo a short prefix of the body so the operator
+            # can identify what actually responded.
+            body_preview = response.text[:120].replace("\n", " ")
             raise SessionError(
                 f"FlareSolverr returned invalid JSON for {url!r}: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc} "
+                f"(body starts with: {body_preview!r})"
             ) from exc
 
         if not isinstance(payload, Mapping):
@@ -599,8 +669,10 @@ class FlareSolverrClient:
         user_agent_raw = solution.get("userAgent")
         user_agent = user_agent_raw if isinstance(user_agent_raw, str) else None
 
-        html_raw = solution.get("response")
-        html = _extract_html(html_raw, solution.get("headers"))
+        html = _extract_html(
+            solution.get("response"),
+            solution.get("headers"),
+        )
 
         cookies = _extract_cookies(solution.get("cookies"))
 
@@ -688,15 +760,90 @@ def _extract_cookies(raw: Any) -> Mapping[str, str]:
     return MappingProxyType(result)
 
 
+def _is_textual_content_type(headers: Any) -> bool:
+    """Return ``True`` iff *headers* describes a textual content type.
+
+    FlareSolverr echoes the solved response's headers in
+    ``solution.headers``. When the body is base64-encoded (binary
+    responses), the ``Content-Type`` names the decoded format. We use
+    this to decide whether a base64 blob is a candidate for decoding
+    into HTML.
+
+    Args:
+        headers: The ``solution.headers`` value, expected to be either a
+            mapping or a list of ``{"name": ..., "value": ...}`` dicts
+            (FlareSolverr returns the latter on some versions).
+
+    Returns:
+        ``True`` iff the Content-Type header is present and starts with
+        a textual prefix from :data:`_TEXTUAL_CONTENT_TYPE_PREFIXES`.
+    """
+    content_type = _find_header(headers, "content-type")
+    if not content_type:
+        return False
+    lowered = content_type.lower().lstrip()
+    return any(lowered.startswith(prefix) for prefix in _TEXTUAL_CONTENT_TYPE_PREFIXES)
+
+
+def _find_header(headers: Any, name: str) -> str | None:
+    """Return the header value for *name*, or ``None``.
+
+    Handles both FlareSolverr header shapes: a plain mapping
+    ``{"Name": "Value"}`` and the list-of-dicts form
+    ``[{"name": "Name", "value": "Value"}, ...]``. Matching is
+    case-insensitive.
+    """
+    if isinstance(headers, Mapping):
+        for key, value in headers.items():
+            if isinstance(key, str) and key.lower() == name.lower():
+                return value if isinstance(value, str) else None
+        return None
+    if isinstance(headers, list):
+        for entry in headers:
+            if not isinstance(entry, Mapping):
+                continue
+            entry_name = entry.get("name")
+            entry_value = entry.get("value")
+            if (
+                isinstance(entry_name, str)
+                and entry_name.lower() == name.lower()
+                and isinstance(entry_value, str)
+            ):
+                return entry_value
+        return None
+    return None
+
+
+def _looks_like_html(text: str) -> bool:
+    """Return ``True`` iff *text* plausibly starts with an HTML prologue.
+
+    Used to sanity-check a body whose ``Content-Type`` was reported as
+    textual: a base64 blob (or a JSON fragment) served under
+    ``text/html`` should not be handed to the caller as HTML.
+
+    Accepts a leading UTF-8 BOM and any leading whitespace before
+    matching one of :data:`_HTML_PREFIXES`. Comments (``<!--``) are
+    accepted because some servers prepend one before the DOCTYPE.
+    """
+    stripped = text.lstrip("\ufeff \t\r\n").lower()
+    return stripped.startswith(_HTML_PREFIXES)
+
+
 def _extract_html(raw: Any, headers: Any) -> str | None:
     """Extract the resolved HTML from a solution payload.
 
-    FlareSolverr returns the body in ``solution.response``. For text
-    responses (HTML, JSON, XML) it is a string; for binary responses it
-    is base64-encoded and its ``Content-Type`` is echoed in
-    ``solution.headers``. This function only returns HTML — the only
-    body type the pipeline uses. Non-HTML bodies become ``None`` rather
-    than being returned as base64 garbage.
+    FlareSolverr returns the body in ``solution.response``:
+
+    * For **textual** responses (HTML, XML, JSON), ``response`` is
+      already a decoded string.
+    * For **binary** responses, ``response`` is a base64-encoded blob
+      and the decoded format is named by ``Content-Type`` in
+      ``solution.headers``.
+
+    This function returns the HTML body in the textual case, decodes
+    the base64 blob in the binary case when the ``Content-Type`` names
+    a textual format, and returns ``None`` in every other case
+    (non-HTML responses, undecodable blobs, unparseable payloads).
 
     Args:
         raw: The ``solution.response`` value.
@@ -707,12 +854,43 @@ def _extract_html(raw: Any, headers: Any) -> str | None:
         The HTML string, or ``None`` if the response was not HTML.
     """
     if isinstance(raw, str):
-        # Fast path: FlareSolverr already gave us a string. Confirm it
-        # looks like HTML by a cheap prefix check (case-insensitive
-        # ``<!doctype`` or ``<html``) — otherwise the caller would be
-        # handed a base64 blob pretending to be HTML.
-        head = raw.lstrip()[:16].lower()
-        if head.startswith("<!doctype") or head.startswith("<html"):
+        # Textual payload. Confirm it plausibly looks like HTML (or XML)
+        # before handing it to the caller — FlareSolverr occasionally
+        # returns a JSON error body here when the target redirects the
+        # solver to an API endpoint.
+        if _looks_like_html(raw):
             return raw
         return None
+
+    if not isinstance(raw, (bytes, bytearray)):
+        # FlareSolverr may return a base64-encoded *string* for binary
+        # responses (not bytes). Try that path.
+        if not isinstance(raw, str):
+            return None
+
+    # Binary / base64-encoded string. Only decode when the reported
+    # Content-Type is textual — decoding an image as HTML would waste
+    # memory and produce garbage for the caller.
+    if not _is_textual_content_type(headers):
+        return None
+
+    if isinstance(raw, (bytes, bytearray)):
+        # FlareSolverr returned raw bytes (rare, some proxy setups).
+        try:
+            decoded = bytes(raw).decode("utf-8", errors="replace")
+        except (ValueError, TypeError):
+            return None
+    else:
+        # Base64-encoded string (the common binary case).
+        try:
+            decoded_bytes = base64.b64decode(raw, validate=False)
+        except (binascii.Error, ValueError):
+            return None
+        try:
+            decoded = decoded_bytes.decode("utf-8", errors="replace")
+        except (ValueError, TypeError):
+            return None
+
+    if _looks_like_html(decoded):
+        return decoded
     return None

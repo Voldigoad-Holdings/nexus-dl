@@ -23,7 +23,7 @@ cannot:
   ``plugins_dir`` (documented in :mod:`nexusdl.core.config`).
   :func:`resolve_paths` computes the entire set from a single base
   directory, so an operator who wants everything under
-  ``/mnt/nexusdl`` calls one function and gets eleven paths that agree
+  ``/mnt/nexusdl`` calls one function and gets ten paths that agree
   with each other.
 
 Public surface
@@ -173,18 +173,6 @@ _ENV_FILENAME: Final[str] = ".env"
 #: "Documented duplication" section. A change here without a matching
 #: change in those modules (or vice versa) would fail the cross-check
 #: test that guards the three copies.
-#:
-#: The ``CBT`` extension is ``".tar"`` — the extension the tar archive
-#: produced by a ``CbtPackager`` would carry. The mapping is present
-#: regardless of whether the ``CbtPackager`` module ships in the
-#: current release: an operator who requests ``PackagingFormat.CBT``
-#: gets the correct path today, and a caller that checks
-#: ``chapter_output_path(..., PackagingFormat.CBT).exists()`` gets an
-#: answer consistent with whatever the worker writes. If the
-#: packager's on-disk naming convention ever changes (``.cbt`` instead
-#: of ``.tar``), the change must be applied to **all three** copies of
-#: this mapping in a single commit — the cross-check test will flag a
-#: partial update.
 _FORMAT_EXTENSIONS: Final[dict[PackagingFormat, str]] = {
     PackagingFormat.FOLDER: "",
     PackagingFormat.ZIP: ".zip",
@@ -314,8 +302,29 @@ def resolve_paths(base_dir: Path | None = None) -> dict[str, Path]:
     note).
 
     When *base_dir* is ``None``, the paths match
-    :class:`~nexusdl.core.config.PathsSection`'s defaults exactly. When
-    it is provided, every path is derived from it::
+    :class:`~nexusdl.core.config.PathsSection`'s defaults exactly — the
+    same values a fresh ``Settings().paths`` and
+    ``Settings().storage.downloads_dir`` would carry::
+
+        resolve_paths() == {
+            "user_data_dir":   platformdirs.user_data_path(APP_SLUG),
+            "user_config_dir": platformdirs.user_config_path(APP_SLUG),
+            "user_cache_dir":  platformdirs.user_cache_path(APP_SLUG),
+            "user_log_dir":    platformdirs.user_log_path(APP_SLUG),
+            "downloads_dir":   user_data_dir / "downloads",
+            "cookies_file":    user_data_dir / "cookies.enc",
+            "database_file":   user_data_dir / "library.db",
+            "cache_dir":       user_cache_dir,
+            "logs_dir":        user_log_dir,
+            "plugins_dir":     user_data_dir / "plugins",
+        }
+
+    When *base_dir* is provided, every path is derived from it — but
+    **the derivation is not the same shape as the platformdirs
+    default**. ``platformdirs`` uses four distinct root directories
+    (``share/`` for data, ``config/`` for config, ``cache/`` for cache,
+    ``state/log/`` for logs); a single ``base_dir`` override must
+    distinguish them explicitly, so each type gets a named subdirectory::
 
         resolve_paths(Path("/mnt/nexusdl")) == {
             "user_data_dir":   Path("/mnt/nexusdl/data"),
@@ -330,6 +339,22 @@ def resolve_paths(base_dir: Path | None = None) -> dict[str, Path]:
             "plugins_dir":     Path("/mnt/nexusdl/data/plugins"),
         }
 
+    .. note::
+
+       The ``/data`` suffix on ``user_data_dir`` in relocated mode is
+       **deliberate** and asymmetric with the platformdirs default
+       (which has no ``data`` suffix). A caller that wants to override
+       ``Settings.paths`` to match a relocated ``resolve_paths(...)``
+       must read the relocated value — ``user_data_dir`` is
+       ``base_dir / "data"``, not ``base_dir``. Reconstructing the
+       paths by hand as ``Settings(paths={"user_data_dir": "/mnt/x"})``
+       would produce a *different* layout from ``resolve_paths(Path("/mnt/x"))``
+       — every derived path under it would be one level shallower
+       than what ``resolve_paths`` computed. When relocating, always
+       use one of the two: the relocated ``resolve_paths(...)`` dict
+       (feeding a custom ``PathsSection``), **or** the ``Settings``
+       override — never mix the two.
+
     The dict has the same keys as :class:`~nexusdl.core.config.PathsSection`'s
     fields, plus ``downloads_dir`` (which lives on
     :class:`~nexusdl.core.config.StorageSection` in the config object).
@@ -339,7 +364,7 @@ def resolve_paths(base_dir: Path | None = None) -> dict[str, Path]:
     Args:
         base_dir: Optional root directory under which to relocate every
             path. ``None`` uses the platformdirs-computed defaults,
-            which are the same as a fresh :class:`Settings().paths`.
+            which are the same as a fresh ``Settings().paths``.
 
     Returns:
         A new mapping from path name to :class:`pathlib.Path`. The
@@ -354,6 +379,8 @@ def resolve_paths(base_dir: Path | None = None) -> dict[str, Path]:
         log = user_log_dir()
     else:
         # Relocated — every path derives from the single base.
+        # The per-type subdirectory suffixes are what make the four
+        # logically distinct roots distinguishable under one base.
         data = base_dir / "data"
         config = base_dir / "config"
         cache = base_dir / "cache"
@@ -384,10 +411,10 @@ def format_extension(format_: PackagingFormat) -> str:
     Matches :meth:`nexusdl.core.downloader.worker.DownloadWorker._compute_output_path`
     exactly — see the module docstring's "Documented duplication"
     section. ``FOLDER`` produces an empty extension (the target is a
-    directory, not a file); ``CBT`` produces ``".tar"``, the extension
-    a tar archive carries. The CBT mapping is present regardless of
-    whether the ``CbtPackager`` module ships in this release — see the
-    :data:`_FORMAT_EXTENSIONS` constant's docstring.
+    directory, not a file); ``CBT`` produces ``".tar"`` even though no
+    ``CbtPackager`` ships in this release, so a caller that computes a
+    path for a future CBT packager already produces the correct
+    extension.
 
     Args:
         format_: The packaging format.
@@ -404,9 +431,17 @@ def format_extension(format_: PackagingFormat) -> str:
             a matching extension.
     """
     if format_ not in _FORMAT_EXTENSIONS:
+        # Use ``.name`` rather than the enum member's repr — the
+        # resulting message is readable regardless of whether
+        # ``PackagingFormat`` is a ``StrEnum``, ``IntEnum``, or a
+        # plain ``Enum``. Sorting by ``.name`` is safe for every enum
+        # variety; sorting the members themselves would raise
+        # ``TypeError`` on a plain ``Enum`` and turn this
+        # ``ValueError`` into a much less obvious bug.
+        known = sorted(member.name for member in PackagingFormat)
         raise ValueError(
             f"unknown PackagingFormat {format_!r}; "
-            f"known values: {sorted(_FORMAT_EXTENSIONS)}"
+            f"known values: {known}"
         )
     return _FORMAT_EXTENSIONS[format_]
 
@@ -492,6 +527,19 @@ def ensure_all_directories(settings: Settings) -> None:
     consolidates the two sections into one would remove the two-source
     lookup below, but the helper's behaviour would be identical.
 
+    .. note::
+
+       ``settings.paths.cache_dir`` is currently identical to
+       ``settings.paths.user_cache_dir``, and ``settings.paths.logs_dir``
+       is identical to ``settings.paths.user_log_dir`` —
+       :class:`~nexusdl.core.config.PathsSection` deliberately keeps
+       both names (the former for the sub-``http`` cache root the
+       composition root needs, the latter as a future-proof alias).
+       ``ensure_directory`` is idempotent, so iterating both names
+       creates each directory once in practice. If a future config
+       refactor eliminates one of each pair, this helper does not need
+       to change — it already tolerates the redundancy.
+
     Idempotent — a second call is a no-op. Intended for the composition
     root's startup sequence, right after :class:`Settings` is loaded::
 
@@ -575,21 +623,33 @@ def find_env_file(start_dir: Path | None = None) -> Path | None:
     """Walk up from *start_dir* looking for a ``.env`` file.
 
     :class:`~nexusdl.core.config.Settings` resolves ``.env`` relative to
-    the **current working directory**. A user who runs ``nexusdl`` from
-    a project subdirectory (``~/projects/my-manga-list/scripts/``) does
+    the **current working directory** by default (the ``env_file`` key
+    in its ``SettingsConfigDict``). A user who runs ``nexusdl`` from a
+    project subdirectory (``~/projects/my-manga-list/scripts/``) does
     not get their parent ``.env``, because it is not on the path
-    pydantic-settings checks. This helper reproduces the ``.env`` lookup
-    a caller would otherwise have to write by hand — the same pattern
-    ``git`` uses for its ``.git`` directory — so a bootstrap command
-    (``nexusdl admin init``) can find the file if it exists.
+    pydantic-settings checks. This helper reproduces the ``.env``
+    lookup a caller would otherwise have to write by hand — the same
+    pattern ``git`` uses for its ``.git`` directory — so a bootstrap
+    command (``nexusdl admin init``) can find the file if it exists.
 
-    **The caller is responsible for actually using the result.**
-    ``Settings`` does not accept an explicit ``.env`` path after
-    construction — a caller that finds a ``.env`` in a parent directory
-    either changes the working directory or sets the three secrets via
-    environment variables directly. This helper exists so that a
-    bootstrap command can print ``"using .env from /home/user/.env"``
-    and a diagnostic command can show what would be found.
+    **How to use the result.** ``Settings`` accepts an explicit
+    ``_env_file`` argument at *construction* time, which overrides the
+    ``env_file`` key in ``model_config``::
+
+        found = find_env_file()
+        settings = Settings(_env_file=found) if found else Settings()
+
+    That is the recommended integration for a CLI that has walked up
+    the directory tree: pass the discovered path to the constructor
+    rather than change the process working directory. (``Settings``
+    does not accept an ``_env_file`` override *after* construction —
+    the config is frozen — so the decision must be made before the
+    first ``Settings()`` call.)
+
+    This helper exists so that a bootstrap command can print
+    ``"using .env from /home/user/.env"`` and a diagnostic command can
+    show what would be found; it is also the natural building block
+    for the ``_env_file=found`` pattern above.
 
     Args:
         start_dir: The directory to start walking up from. Defaults to

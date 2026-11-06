@@ -27,15 +27,28 @@ filter preset constructs the widget with the right kwargs; a caller
 that wants a filter control installs its own controls and calls
 :meth:`SiteSelector.set_language` / :meth:`SiteSelector.toggle_adult`.
 
-Assumption on the registry
---------------------------
-The widget assumes :meth:`~nexusdl.core.registry.site_registry.SiteRegistry.initialize`
+Registry errors
+---------------
+The widget assumes
+:meth:`~nexusdl.core.registry.site_registry.SiteRegistry.initialize`
 has already been awaited — that is what the composition root does at
-startup, before any screen is pushed. :meth:`SiteRegistry.list_sites`
-raises :class:`~nexusdl.core.exceptions.ConfigError` if the registry is
-not initialized; the widget does **not** catch that exception, because
-a screen appearing before the registry is ready is a composition-root
-bug that deserves a loud failure, not a hidden empty list.
+startup, before any screen is pushed.
+:meth:`SiteRegistry.list_sites` raises
+:class:`~nexusdl.core.exceptions.ConfigError` if the registry is not
+initialized; the widget **re-raises** that exception, because a screen
+appearing before the registry is ready is a composition-root bug that
+deserves a loud failure, not a hidden empty list.
+
+Any **other** exception raised by ``list_sites`` (a ``RuntimeError``
+from a partially-initialized registry, an ``AttributeError`` from a
+malformed site in the registry's internal state) is caught and
+rendered as an error placeholder in the widget itself. The reasoning
+is the same as
+:class:`~nexusdl.interfaces.cli.screens.settings.SettingsScreen`'s
+defensive section rendering: a broken registry should not blank the
+whole screen, and it should not crash the app — a user who sees
+"Error: …" in the selector can report it and continue using the rest
+of the TUI.
 
 Message handler name
 --------------------
@@ -62,6 +75,16 @@ but still free-text) and could legitimately contain ``[`` or ``]`` — a
 markup-based label would interpret those as Textual markup tags and
 render garbage, or worse, hide part of the name. Using ``.append()``
 treats every character literally.
+
+Single registry query per refresh
+---------------------------------
+:meth:`SiteSelector._refresh` queries the registry **once** for the
+filtered list and reuses the result for the status line and the empty
+state. The empty-state message needs the *unfiltered* total (to
+distinguish "no sites configured" from "all sites filtered out"), and
+earlier versions issued a second ``list_sites()`` call for that count.
+The total is now fetched once and passed to the message builder —
+one round-trip per refresh, not two.
 
 Reactive state
 --------------
@@ -105,12 +128,14 @@ from textual.message import Message
 from textual.widgets import Label, OptionList, Static
 from textual.widgets.option_list import Option
 
+from nexusdl.core.exceptions import ConfigError
 from nexusdl.core.i18n import Translator, get_default_translator
+from nexusdl.core.models.enums import Language
 from nexusdl.core.models.site import SiteConfig
 from nexusdl.core.registry.site_registry import SiteRegistry
 
 if TYPE_CHECKING:
-    from nexusdl.core.models.enums import Language
+    pass
 
 
 __all__ = ["SiteSelector"]
@@ -127,14 +152,15 @@ _ID_STATUS: Final[str] = "site-selector-status"
 _ID_LIST: Final[str] = "site-selector-list"
 _ID_EMPTY: Final[str] = "site-selector-empty"
 _CLASS_HIDDEN: Final[str] = "hidden"
+_CLASS_ERROR: Final[str] = "error"
 
 
 class SiteSelector(Vertical):
     """A Textual widget for selecting a source site from the registry.
 
-    See the module docstring for the design contract, the empty-state
-    behaviour, and the handler name a parent screen must implement to
-    react to a selection.
+    See the module docstring for the design contract, the registry
+    error policy, the empty-state behaviour, and the handler name a
+    parent screen must implement to react to a selection.
 
     The widget is keyboard-first: ``↑`` / ``↓`` navigate the list,
     ``Enter`` selects, ``Ctrl+R`` refreshes the list from the registry,
@@ -197,6 +223,9 @@ class SiteSelector(Vertical):
         content-align: center middle;
         color: $text-muted;
         text-align: center;
+    }}
+    #{_ID_EMPTY}.{_CLASS_ERROR} {{
+        color: $error;
     }}
     .{_CLASS_HIDDEN} {{
         display: none;
@@ -406,8 +435,17 @@ class SiteSelector(Vertical):
         user would select right now" without waiting for them to press
         Enter — a preview panel that shows details for the highlighted
         site, for example. Returns ``None`` when the option list is
-        empty or the highlighted option no longer maps to a live site.
+        empty, when the widget has not yet been mounted, or when the
+        highlighted option no longer maps to a live site.
+
+        The ``is_mounted`` guard protects against a caller that reads
+        the property from its own ``on_mount`` handler before this
+        widget's children have been mounted — ``query_one`` would raise
+        ``NoMatches`` in that case, and returning ``None`` is the
+        correct "not yet available" answer.
         """
+        if not self.is_mounted:
+            return None
         list_widget = self.query_one(f"#{_ID_LIST}", OptionList)
         index = list_widget.highlighted
         if index is None:
@@ -430,12 +468,43 @@ class SiteSelector(Vertical):
         current filters excluded every site), the placeholder is shown
         with a message that distinguishes the two cases so the user
         knows whether to clear a filter or to populate the registry.
+
+        **Error policy:**
+
+        * :class:`~nexusdl.core.exceptions.ConfigError` is re-raised —
+          a registry that is not initialized is a composition-root bug
+          and must fail loudly (see the module docstring).
+        * Any other exception is caught and rendered as an error
+          placeholder. A broken registry (a ``RuntimeError`` from a
+          partially-initialized state, an ``AttributeError`` from a
+          malformed site) should not blank the screen or crash the
+          app; the user sees the error message and can report it.
         """
         list_widget = self.query_one(f"#{_ID_LIST}", OptionList)
         empty_widget = self.query_one(f"#{_ID_EMPTY}", Static)
         status_widget = self.query_one(f"#{_ID_STATUS}", Label)
 
-        sites = self._fetch_sites()
+        try:
+            sites = self._fetch_sites()
+            total_unfiltered = self._count_all_sites()
+        except ConfigError:
+            # Composition-root bug — re-raise, do not swallow.
+            raise
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self._sites_by_id = {}
+            list_widget.clear_options()
+            list_widget.add_class(_CLASS_HIDDEN)
+            empty_widget.update(
+                f"{type(exc).__name__}: {exc}"
+            )
+            empty_widget.add_class(_CLASS_ERROR)
+            empty_widget.remove_class(_CLASS_HIDDEN)
+            status_widget.update(Text("", style="dim"))
+            return
+
+        # Clear any error styling left over from a previous failed
+        # refresh — the widget is recovering.
+        empty_widget.remove_class(_CLASS_ERROR)
 
         # Rebuild the option-to-site map before populating the list so
         # that a fast user pressing Enter during the update sees a
@@ -445,7 +514,9 @@ class SiteSelector(Vertical):
         if not sites:
             list_widget.clear_options()
             list_widget.add_class(_CLASS_HIDDEN)
-            empty_widget.update(self._empty_message())
+            empty_widget.update(
+                self._empty_message(total_unfiltered)
+            )
             empty_widget.remove_class(_CLASS_HIDDEN)
         else:
             list_widget.clear_options()
@@ -478,6 +549,20 @@ class SiteSelector(Vertical):
         )
         return sorted(sites, key=lambda s: s.name.casefold())
 
+    def _count_all_sites(self) -> int:
+        """Return the total number of sites in the registry, unfiltered.
+
+        Used by :meth:`_empty_message` to distinguish "no sites
+        configured" from "all sites filtered out". Queried once per
+        refresh and reused — see the module docstring's "Single
+        registry query per refresh" section.
+        """
+        return len(
+            self._registry.list_sites(
+                include_adult=True, include_disabled=True
+            )
+        )
+
     def _site_label(self, site: SiteConfig) -> Text:
         """Build the rich-text label shown for one site.
 
@@ -493,6 +578,10 @@ class SiteSelector(Vertical):
           declare JS rendering — the user knows the site will be slow
           to search.
 
+        A site whose ``name`` is empty (a registry invariant violation,
+        but one the widget tolerates rather than crashes on) falls back
+        to its ``id`` so the option list never renders a blank row.
+
         Args:
             site: The site to render.
 
@@ -502,12 +591,16 @@ class SiteSelector(Vertical):
         """
         text = Text()
         is_disabled = self._registry.is_disabled(site.id)
+        # A site without a name is a registry bug; fall back to the
+        # id so the option is not a blank row. The fallback is
+        # rendering-only — the widget never mutates the config.
+        display_name = site.name or site.id
 
         if is_disabled:
             text.append("⊘ ", style="dim red")
-            text.append(site.name, style="dim strike")
+            text.append(display_name, style="dim strike")
         else:
-            text.append(site.name, style="bold")
+            text.append(display_name, style="bold")
 
         text.append(f"  ({site.language.value})", style="dim")
 
@@ -547,19 +640,20 @@ class SiteSelector(Vertical):
 
         return status
 
-    def _empty_message(self) -> str:
+    def _empty_message(self, total_unfiltered: int) -> str:
         """Build the empty-state message.
 
         Distinguishes "no sites are configured at all" from "the
         current filter excluded every site" — the fix is different in
         each case, and conflating them would leave the user guessing
         which button to press.
+
+        Args:
+            total_unfiltered: The total number of sites in the
+                registry, unfiltered. Computed once by
+                :meth:`_refresh` via :meth:`_count_all_sites` and
+                passed in to avoid a second registry query.
         """
-        total = len(
-            self._registry.list_sites(
-                include_adult=True, include_disabled=True
-            )
-        )
-        if total == 0:
+        if total_unfiltered == 0:
             return self._translator.translate("site.selector.empty.registry")
         return self._translator.translate("site.selector.empty.filtered")

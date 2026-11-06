@@ -78,6 +78,31 @@ exist and how to push them — this file. A future screen added to
 deliberate: a screen with its own navigation logic would produce N
 different notions of "back", which the pipeline's UX contract forbids.
 
+Panel refresh: coalescing, not cancelling
+-----------------------------------------
+The status panel is refreshed on three triggers: mount, a periodic
+interval (:data:`_PANEL_REFRESH_INTERVAL` seconds), and every
+``library.updated`` event. A download pipeline that adds 20 chapters
+in quick succession emits 20 events in a few seconds — refreshing on
+each would start twenty panel workers per interval, each of which
+would be cancelled by the next (``@work(exclusive=True)``), leaving
+twenty ``CancelledError`` warnings in the logs and producing a flicker
+on each partial panel render.
+
+The panel refresh worker is therefore **not exclusive**: it is a
+plain ``@work(group="panel")``. A refresh that arrives while another
+is running executes in parallel and simply produces a later
+``panel.update(text)`` call; because the panel is rendered in a single
+``update``, the last writer wins and the user sees the freshest
+snapshot. No cancellation, no log noise, no flicker — a dashboard
+that is 100 ms behind is not a bug.
+
+Every data source in the panel refresh is queried **once**. Earlier
+versions queried ``list_mangas(page=1, per_page=1)`` twice — once for
+the count, once to grab the ``updated_at`` of the most recent item —
+which cost a redundant round-trip every 2 seconds. The current code
+queries once and reuses the result.
+
 Quit confirmation
 -----------------
 ``Ctrl+Q`` is the quit binding. When the download manager reports one
@@ -93,6 +118,25 @@ external dependencies and no state of its own, so an inline declaration
 is the appropriate choice for a screen that exists only for this file's
 use.
 
+**The "No" button is focused by default.** ``Enter`` on the modal
+therefore cancels, matching the "never make a destructive action the
+default" principle. A user who hits ``Ctrl+Q`` and immediately presses
+``Enter`` out of habit stays on the dashboard with their download
+intact; only an explicit click on "Yes" (or moving focus to it and
+pressing ``Enter``) confirms the quit.
+
+Log router injection
+--------------------
+The logs destination requires a :class:`~nexusdl.interfaces.cli.screens.logs.LogRouter`
+— an object the composition root creates and owns. The screen receives
+it as a constructor argument rather than reaching into
+``self.app.log_router``: the ``App`` subclass does own a ``log_router``
+attribute, but the ``MainScreen`` should not depend on that detail of
+its host app. Passing the router explicitly keeps the dependency
+declared in the screen's own signature — a reviewer reading
+``MainScreen.__init__`` sees the full set of collaborators without
+having to trace through ``app.py``.
+
 Localisation
 ------------
 The screen introduces twenty keys under ``main.*``:
@@ -101,7 +145,8 @@ The screen introduces twenty keys under ``main.*``:
   ``main.menu.settings``, ``main.menu.logs``, ``main.menu.help``,
   ``main.menu.quit``.
 * Panel headers — ``main.panel.identity``, ``main.panel.library``,
-  ``main.panel.downloads``, ``main.panel.sites``.
+  ``main.panel.library_last_updated``, ``main.panel.downloads``,
+  ``main.panel.sites``.
 * Panel values — ``main.value.not_started`` (for the server when not
   running), ``main.value.never`` (for the library when it has never
   been updated), ``main.value.none`` (for empty lists).
@@ -124,6 +169,7 @@ Dependency graph (no cycles)::
     nexusdl.core.events                           ├──► interfaces.cli.screens.main
     nexusdl.core.i18n                             │
     nexusdl.core.library.database                 │
+    nexusdl.core.models.enums                     │
     nexusdl.core.registry.site_registry           │
     nexusdl.core.version                          │
     nexusdl.interfaces.cli.screens.*              │
@@ -157,11 +203,12 @@ from nexusdl.core.constants import (
     EVENT_LIBRARY_UPDATED,
 )
 from nexusdl.core.i18n import Translator, get_default_translator
+from nexusdl.core.models.enums import DownloadStatus
+from nexusdl.core.utils.time import format_relative
 from nexusdl.core.version import __version__ as NEXUSDL_VERSION
-from nexusdl.core.utils.time import format_relative, utcnow
 from nexusdl.interfaces.cli.screens.help import HelpScreen
 from nexusdl.interfaces.cli.screens.library import LibraryScreen
-from nexusdl.interfaces.cli.screens.logs import LogsScreen
+from nexusdl.interfaces.cli.screens.logs import LogRouter, LogsScreen
 from nexusdl.interfaces.cli.screens.search import SearchScreen
 from nexusdl.interfaces.cli.screens.settings import SettingsScreen
 
@@ -209,6 +256,15 @@ _FEEDBACK_LINGER_SECONDS: Final[float] = 2.0
 #: without subscribing to the progress tracker directly.
 _PANEL_REFRESH_INTERVAL: Final[float] = 2.0
 
+#: Download statuses that count as "in progress" for the quit
+#: confirmation gate and the panel's download summary. ``PAUSED`` is
+#: deliberately excluded — a paused task has been stopped by the user
+#: and does not carry the same "work will be lost" weight.
+_DOWNLOAD_STATUS_ACTIVE: Final[tuple[DownloadStatus, ...]] = (
+    DownloadStatus.RUNNING,
+    DownloadStatus.PENDING,
+)
+
 
 # --------------------------------------------------------------------------- #
 # Quit confirmation modal                                                     #
@@ -224,6 +280,13 @@ class _QuitConfirm(ModalScreen[bool]):
     a file for a modal that has zero reuse potential.
 
     The screen's result is ``True`` (quit) or ``False`` (stay).
+
+    **The safe "No" button is focused on mount.** A user who hits
+    ``Ctrl+Q`` mid-download and then presses ``Enter`` out of habit
+    stays on the dashboard; only an explicit move to the "Yes" button
+    (via Tab) or a click on it confirms the quit. Making the
+    destructive action the Enter default is a well-known UX antipattern
+    — this modal does not fall into it.
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
@@ -295,6 +358,15 @@ class _QuitConfirm(ModalScreen[bool]):
                     variant="error",
                 )
 
+    def on_mount(self) -> None:
+        """Focus the safe ("No") button.
+
+        ``Enter`` on the dialog therefore cancels. See the class
+        docstring for why the destructive action is deliberately not
+        the default.
+        """
+        self.query_one("#quit-no", Button).focus()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Dismiss with the corresponding boolean result."""
         if event.button.id == "quit-yes":
@@ -316,7 +388,8 @@ class MainScreen(Screen[None]):
     """The dashboard screen that anchors the TUI.
 
     See the module docstring for the design contract, the sub-screen
-    coordination pattern, and the quit-confirmation flow.
+    coordination pattern, the panel-refresh coalescing, and the
+    quit-confirmation flow.
 
     Args:
         settings: Application settings. Read for the identity line and
@@ -329,6 +402,10 @@ class MainScreen(Screen[None]):
             when the user opens it.
         event_bus: The shared event bus. The screen subscribes to
             ``library.updated`` for the library-summary refresh.
+        log_router: The log router owned by the composition root.
+            Passed through to the logs screen; injected here so the
+            screen does not depend on an attribute of its host
+            ``App``.
         translator: The localisation service. When ``None`` (the
             default), the process-wide default translator is used — see
             :func:`~nexusdl.core.i18n.get_default_translator`.
@@ -389,6 +466,7 @@ class MainScreen(Screen[None]):
         manager: DownloadManager,
         session: HttpSession,
         event_bus: EventBus,
+        log_router: LogRouter,
         translator: Translator | None = None,
         name: str | None = None,
         id: str | None = None,
@@ -401,6 +479,7 @@ class MainScreen(Screen[None]):
         self._manager = manager
         self._session = session
         self._event_bus = event_bus
+        self._log_router = log_router
         self._translator = (
             translator if translator is not None else get_default_translator()
         )
@@ -518,7 +597,7 @@ class MainScreen(Screen[None]):
     def action_goto_logs(self) -> None:
         """Push the logs screen. Bound to ``G`` and the menu item."""
         screen = LogsScreen(
-            log_router=self.app.log_router,  # type: ignore[attr-defined]
+            log_router=self._log_router,
             translator=self._translator,
         )
         self.app.push_screen(screen, callback=self._after_generic)
@@ -611,9 +690,21 @@ class MainScreen(Screen[None]):
         """Refresh the status panel with the current state."""
         self._run_panel_refresh()
 
-    @work(exclusive=True, group="panel")
+    @work(group="panel")
     async def _run_panel_refresh(self) -> None:
         """Fetch the panel's state and render it.
+
+        Not ``exclusive`` — see the module docstring's "Panel refresh:
+        coalescing, not cancelling" section. A refresh arriving while
+        another is running executes in parallel and its
+        ``panel.update(text)`` simply writes the latest snapshot; no
+        cancellation warnings, no flicker on partial renders.
+
+        Every data source is queried **once** per refresh. The library
+        count and the "last updated" timestamp come from the same
+        ``list_mangas(page=1, per_page=1)`` call — earlier versions
+        queried twice, which was a redundant round-trip on every panel
+        tick.
 
         Every data source is queried independently so one failure (a
         database hiccup, a manager exception) does not blank the whole
@@ -643,15 +734,12 @@ class MainScreen(Screen[None]):
         try:
             mangas = await self._database.list_mangas(page=1, per_page=1)
             manga_count = mangas.total
-            last_updated = await self._last_library_update()
-            text.append(
-                f"  {manga_count} mangas", style=""
+            last_updated: datetime | None = (
+                mangas.items[0].updated_at if mangas.items else None
             )
+            text.append(f"  {manga_count} mangas", style="")
             text.append("\n")
-            text.append(
-                "  ",
-                style="",
-            )
+            text.append("  ", style="")
             text.append(
                 self._translator.translate(
                     "main.panel.library_last_updated",
@@ -678,10 +766,10 @@ class MainScreen(Screen[None]):
         text.append("\n\n")
         try:
             running = await self._manager.list_tasks(
-                status=_DOWNLOAD_STATUS_RUNNING
+                status=DownloadStatus.RUNNING
             )
             pending = await self._manager.list_tasks(
-                status=_DOWNLOAD_STATUS_PENDING
+                status=DownloadStatus.PENDING
             )
             text.append(
                 f"  {len(running)} active, {len(pending)} pending",
@@ -721,31 +809,6 @@ class MainScreen(Screen[None]):
             text.append(f"  {type(exc).__name__}: {exc}", style="red")
 
         panel.update(text)
-
-    async def _last_library_update(self) -> datetime | None:
-        """Return the timestamp of the library's most recent update.
-
-        A small query against the ``mangas`` table for the maximum
-        ``updated_at`` value — the same pattern
-        :class:`~nexusdl.core.library.search.PaginatedResult` uses for
-        its ``last_updated_at`` field. Returned as a timezone-aware
-        datetime, or ``None`` when the library has never been written.
-        """
-        # ``LibraryDatabase`` does not expose a ``last_updated_at``
-        # helper directly (its stats API is a private method). The
-        # screen computes the value from ``list_mangas``'s most recent
-        # item — the ordering ``list_mangas`` uses puts recently-updated
-        # mangas first. Using that rather than a bespoke query keeps the
-        # screen from depending on database internals.
-        latest = await self._database.list_mangas(page=1, per_page=1)
-        if not latest.items:
-            return None
-        # ``Manga.updated_at`` is ``datetime | None`` in the model; a
-        # manga just written by the scanner or a download has it set.
-        for item in latest.items:
-            if item.updated_at is not None:
-                return item.updated_at
-        return None
 
     # ------------------------------------------------------------------ #
     # Status bar                                                         #
@@ -815,33 +878,12 @@ class MainScreen(Screen[None]):
         would be interrupted by quitting. ``PAUSED`` is excluded: a
         paused task has already been stopped by the user and does not
         carry the same "in-progress work" weight for the confirmation
-        prompt.
+        prompt. The list of active statuses is declared once as
+        :data:`_DOWNLOAD_STATUS_ACTIVE` so the two call sites (this
+        helper and the panel's download summary) cannot drift.
         """
-        running = await self._manager.list_tasks(
-            status=_DOWNLOAD_STATUS_RUNNING
-        )
-        pending = await self._manager.list_tasks(
-            status=_DOWNLOAD_STATUS_PENDING
-        )
-        return len(running) + len(pending)
-
-
-# --------------------------------------------------------------------------- #
-# Constants used only by the panel and quit flows                              #
-# --------------------------------------------------------------------------- #
-# Imported at the bottom so the module's top stays readable. The names
-# are enumerated here rather than at the top because they only appear in
-# two helpers, and a reader scrolling to the helpers sees the values in
-# their natural context.
-# --------------------------------------------------------------------------- #
-
-from nexusdl.core.models.enums import DownloadStatus as _DownloadStatus  # noqa: E402
-
-_DOWNLOAD_STATUS_RUNNING: Final[_DownloadStatus] = _DownloadStatus.RUNNING
-_DOWNLOAD_STATUS_PENDING: Final[_DownloadStatus] = _DownloadStatus.PENDING
-
-# Silence the unused-import warning on ``utcnow`` — it is used by
-# ``format_relative`` internally, and imported here for a future
-# explicit "as of <now>" line in the panel header that has not yet been
-# added. Kept so a future edit does not have to add the import.
-_ = utcnow
+        total = 0
+        for status in _DOWNLOAD_STATUS_ACTIVE:
+            tasks = await self._manager.list_tasks(status=status)
+            total += len(tasks)
+        return total

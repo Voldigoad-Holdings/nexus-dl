@@ -30,7 +30,11 @@ Design notes:
       ``True``/``False`` ("is this secret set?") rather than the raw value.
       The view only sends a value back to the host if the user explicitly
       changed it. A no-touch apply is therefore a no-op for secrets — no
-      leak, no accidental overwrite.
+      leak, no accidental overwrite. The secret binding clears its
+      placeholder on focus so typing after clicking on the field replaces
+      the masked value rather than concatenating with it, and a
+      ``_user_edited`` flag distinguishes "user cleared the secret" from
+      "user deleted the placeholder but did nothing else".
     * **Local validation runs before** :attr:`on_apply` so the host receives
       only structurally valid data (int/float parsed, paths optionally
       checked, per-field ``validator`` passed). Business validation stays
@@ -41,8 +45,24 @@ Design notes:
       target section with a brief field flash. No widget duplication.
     * **Sections are lazy-built then stacked-and-hidden** — opening a long
       section does not slow down the others.
-    * **Theme follows CTk appearance mode** via a 1 s poll (ttk/ttk-adjacent
-      widgets do not re-theme themselves).
+    * **Theme follows CTk appearance mode** via a 1 s poll (ttk-adjacent
+      widgets do not re-theme themselves). A theme change rebuilds the
+      currently displayed section from the same underlying values, and
+      **preserves unsaved edits**: the pending values of every dirty
+      binding are captured before the rebuild and re-applied after.
+      Without this, a system theme switch would silently discard the
+      user's in-progress changes — the dirty indicator would flip to
+      "No unsaved changes" even though the user had typed into several
+      fields.
+    * **Construction order is significant.** :meth:`SettingsView._build`
+      creates the widget skeleton; :meth:`SettingsView._build_nav`
+      creates the nav buttons (which requires the nav frame to exist);
+      :meth:`SettingsView._apply_theme` re-applies the theme to the
+      skeleton and the nav buttons (it calls
+      :meth:`SettingsView._refresh_nav_selection`, which touches
+      ``_nav_buttons``); and :meth:`SettingsView._show_section` renders
+      the current section on top of that. Any future code added to
+      ``__init__`` must respect this order.
     * Callbacks are isolated — a misbehaving host never breaks Tk.
     * Cleans up after itself on ``<Destroy>``.
 """
@@ -667,6 +687,14 @@ class _SecretBinding(_BaseBinding):
         self._state: _SecretState = _SecretState.UNTOUCHED
         self._pending: str = ""
         self._visible = False
+        #: Set to ``True`` the first time the user modifies the field.
+        #: Used to distinguish "user cleared the field" (state CLEARED)
+        #: from "user deleted the placeholder but did nothing else"
+        #: (state UNTOUCHED). Without this flag, focusing the field and
+        #: pressing Backspace once would mark the secret as deleted —
+        #: the apply would then clear a valid secret the user never
+        #: intended to touch.
+        self._user_edited: bool = False
 
         row = ctk.CTkFrame(container, fg_color="transparent")
         row.pack(fill="x")
@@ -677,6 +705,10 @@ class _SecretBinding(_BaseBinding):
         if self._original:
             self._entry.insert(0, labels.secret_set_placeholder)
         self._entry.bind("<KeyRelease>", self._on_entry_changed)
+        # Clear the placeholder on focus so the user starts from a blank
+        # field. Without this, typing after clicking on the placeholder
+        # would produce ``"••••••••mynewsecret"`` as the new value.
+        self._entry.bind("<FocusIn>", self._on_entry_focus)
 
         self._toggle = ctk.CTkButton(
             row,
@@ -700,15 +732,27 @@ class _SecretBinding(_BaseBinding):
 
     # ----- interactions -----------------------------------------------------
 
+    def _on_entry_focus(self, _event=None) -> None:
+        """Clear the placeholder on focus so the user starts from blank.
+
+        Without this, the placeholder (``"••••••••"``) would become part
+        of the new value as soon as the user typed anything — a click on
+        the field followed by a single keystroke would produce
+        ``"••••••••<typed>"`` as the new secret.
+        """
+        if self._original and self._entry.get() == self._labels.secret_set_placeholder:
+            try:
+                self._entry.delete(0, "end")
+            except Exception:
+                pass
+
     def _on_entry_changed(self, _event=None) -> None:
         current = self._entry.get()
         if not current:
-            self._state = (
-                _SecretState.UNTOUCHED
-                if not self._original
-                else _SecretState.CLEARED
-            )
-            if self._original:
+            # Field is empty. Whether this means "user cleared the
+            # secret" or "user deleted the placeholder and did nothing
+            # else" depends on whether they ever typed anything.
+            if self._user_edited:
                 self._state = _SecretState.CLEARED
             else:
                 self._state = _SecretState.UNTOUCHED
@@ -716,6 +760,7 @@ class _SecretBinding(_BaseBinding):
         else:
             self._state = _SecretState.SET
             self._pending = current
+            self._user_edited = True
         self._on_change()
 
     def _on_clear(self) -> None:
@@ -725,6 +770,7 @@ class _SecretBinding(_BaseBinding):
             pass
         self._state = _SecretState.CLEARED
         self._pending = ""
+        self._user_edited = True
         self._on_change()
 
     def _toggle_visibility(self) -> None:
@@ -758,6 +804,7 @@ class _SecretBinding(_BaseBinding):
 
     def _apply_value(self, value: Any) -> None:
         # Reset to default semantics: default for a secret is "clear".
+        self._user_edited = False
         if value is None and self._original:
             self._state = _SecretState.CLEARED
         else:
@@ -885,13 +932,21 @@ class SettingsView(ctk.CTkFrame):
         self._destroyed: bool = False
         self._last_theme_mode: str = self._current_mode()
 
+        # Order matters. ``_build`` creates the skeleton; ``_build_nav``
+        # creates the nav buttons (which requires the nav frame to
+        # exist); ``_apply_theme`` re-applies the theme to the skeleton
+        # and the nav buttons (it calls ``_refresh_nav_selection``,
+        # which touches ``_nav_buttons``); ``_show_section`` renders the
+        # current section on top of that. Reordering these calls breaks
+        # the widget with an ``AttributeError`` on ``_nav_buttons`` at
+        # construction time.
         self._build()
-        self._apply_theme()
         self._build_nav()
+        self._apply_theme()
         self._show_section(self._current_section_id)
         self._refresh_dirty()
 
-        self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_theme_check()
 
     # ------------------------------------------------------------------
@@ -1082,7 +1137,11 @@ class SettingsView(ctk.CTkFrame):
 
     def _refresh_nav_selection(self) -> None:
         theme = self._theme()
-        for section_id, button in self._nav_buttons.items():
+        # ``_nav_buttons`` may not exist yet if a future refactor calls
+        # this from ``_build`` — a defensive guard against that ordering
+        # mistake, rather than an AttributeError at construction time.
+        nav_buttons = getattr(self, "_nav_buttons", {})
+        for section_id, button in nav_buttons.items():
             active = section_id == self._current_section_id and not self._search_text
             try:
                 button.configure(
@@ -1627,6 +1686,21 @@ class SettingsView(ctk.CTkFrame):
     def _apply_theme(self) -> None:
         if self._destroyed:
             return
+
+        # Capture pending values before destroying the bindings — a
+        # theme switch must not lose the user's unsaved edits.
+        pending: dict[str, Any] = {}
+        for key, binding in self._bindings.items():
+            try:
+                if binding.is_dirty():
+                    pending[key] = binding.get_pending_value()
+            except Exception:
+                _log.exception(
+                    "Failed to capture pending value for {!r} during "
+                    "theme change",
+                    key,
+                )
+
         theme = self._theme()
         try:
             self.configure(fg_color=theme["bg"])
@@ -1637,12 +1711,28 @@ class SettingsView(ctk.CTkFrame):
         except Exception:
             pass
         self._refresh_nav_selection()
-        # Rebuild surfaces that were already built for the old theme.
+
+        # Rebuild surfaces.
         self._bindings.clear()
         for child in self._form_host.winfo_children():
             child.destroy()
         self._built_sections.clear()
         self._show_section(self._current_section_id)
+
+        # Re-apply the pending values on top of the freshly rebuilt
+        # bindings so the dirty state survives the theme change.
+        for key, value in pending.items():
+            binding = self._bindings.get(key)
+            if binding is not None:
+                try:
+                    binding.set_value(value)
+                except Exception:
+                    _log.exception(
+                        "Failed to restore pending value for {!r} after "
+                        "theme change",
+                        key,
+                    )
+
         self._refresh_dirty()
         self._refresh_restart_banner()
 
@@ -1655,11 +1745,15 @@ class SettingsView(ctk.CTkFrame):
         self._theme_after_id = None
         if self._destroyed:
             return
-        current = self._current_mode()
-        if current != self._last_theme_mode:
-            self._last_theme_mode = current
-            self._apply_theme()
-        self._schedule_theme_check()
+        try:
+            current = self._current_mode()
+            if current != self._last_theme_mode:
+                self._last_theme_mode = current
+                self._apply_theme()
+        finally:
+            # Always reschedule — a single failure in ``_apply_theme``
+            # must not stop the polling loop for the widget's lifetime.
+            self._schedule_theme_check()
 
     # ------------------------------------------------------------------
     # Teardown
@@ -1667,6 +1761,8 @@ class SettingsView(ctk.CTkFrame):
 
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._destroyed:
             return
         self._destroyed = True
         for attr in ("_search_after_id", "_theme_after_id", "_toast_after_id"):

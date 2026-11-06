@@ -109,6 +109,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import inspect
 import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -187,9 +188,14 @@ class AuthConfig:
             rejections. Default ``True`` — helps native clients decide
             between "log in again" and "wait and retry".
         on_auth_success: Called on every successful verification. Isolated.
+            Sync callables and async callables are both supported — the
+            middleware awaits a returned awaitable.
         on_auth_failure: Called on every failed verification in enforce
-            mode (populate-mode failures are silent by default to avoid
-            log spam from unauthenticated public traffic).
+            mode. In populate mode, **expected** failures (token expired,
+            invalid, …) are silent; **unexpected** exceptions raised by
+            ``verify_access`` are logged regardless of mode, so a broken
+            auth service is not invisible. Isolated (sync/async both
+            supported).
     """
 
     public_paths: frozenset[str] = field(
@@ -395,7 +401,7 @@ class AuthMiddleware:
 
         # --- Success: populate state and dispatch.
         self._populate(scope, payload, source=source)
-        self._emit_success(payload, path, method, source)
+        await self._emit_success(payload, path, method, source)
         await self.app(scope, receive, send)
 
     # ------------------------------------------------------------------
@@ -490,7 +496,7 @@ class AuthMiddleware:
         path = scope.get("path", "/")
         method = scope.get("method", "GET").upper()
 
-        self._emit_failure(reason, path, method, token_prefix)
+        await self._emit_failure(reason, path, method, token_prefix)
 
         _log.info(
             "auth rejected: path={} method={} reason={} token_prefix={}",
@@ -537,7 +543,7 @@ class AuthMiddleware:
     # Observability
     # ------------------------------------------------------------------
 
-    def _emit_success(
+    async def _emit_success(
         self,
         payload: TokenPayload,
         path: str,
@@ -555,11 +561,16 @@ class AuthMiddleware:
             token_source=source,
         )
         try:
-            cb(event)
+            result = cb(event)
+            # Support async callbacks (metrics exporters, tracing hooks,
+            # alerting webhooks). A sync callable returns a non-awaitable
+            # and falls through unchanged.
+            if inspect.isawaitable(result):
+                await result
         except Exception:
             _log.exception("on_auth_success callback raised")
 
-    def _emit_failure(
+    async def _emit_failure(
         self,
         reason: str,
         path: str,
@@ -576,7 +587,9 @@ class AuthMiddleware:
             token_prefix=token_prefix,
         )
         try:
-            cb(event)
+            result = cb(event)
+            if inspect.isawaitable(result):
+                await result
         except Exception:
             _log.exception("on_auth_failure callback raised")
 

@@ -58,7 +58,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal
+
+from loguru import logger as _logger
 
 # NB: customtkinter is intentionally NOT imported here. See module docstring.
 
@@ -89,6 +92,8 @@ __all__ = [
     "NEXUS_HIGH_CONTRAST",
 ]
 
+
+_log = _logger.bind(component="gui.theme")
 
 ThemeMode = Literal["light", "dark"]
 
@@ -246,8 +251,20 @@ class Colors:
         return source.get(key, default)
 
     def pair(self, key: str) -> tuple[str, str]:
-        """Return ``(light, dark)`` for CTk widgets that want auto-theme pairs."""
-        return (self._light[key], self._dark[key])
+        """Return ``(light, dark)`` for CTk widgets that want auto-theme pairs.
+
+        Raises:
+            KeyError: If ``key`` is missing from either mode. This indicates
+                a malformed theme (tokens must be symmetric across modes).
+        """
+        try:
+            return (self._light[key], self._dark[key])
+        except KeyError as exc:
+            missing_mode = "light" if key not in self._light else "dark"
+            raise KeyError(
+                f"Color token {key!r} missing from {missing_mode} mode; "
+                "themes must be symmetric across modes"
+            ) from exc
 
     def to_dict(self) -> dict[str, dict[str, str]]:
         return {"light": dict(self._light), "dark": dict(self._dark)}
@@ -309,7 +326,6 @@ _ALIASES: dict[str, str] = {
     "error_fg": "danger",
     "status_error": "danger",
     "danger_bg": "danger",
-    "danger_hover": "danger_hover",
     # Warning / feedback
     "status_warning": "warning",
     "banner_bg": "warning_soft",
@@ -616,9 +632,16 @@ def get_mode() -> ThemeMode:
     """
     try:
         import customtkinter as ctk  # noqa: PLC0415 — lazy on purpose
-        return "light" if str(ctk.get_appearance_mode()).lower() == "light" else "dark"
     except Exception:
+        # CTk unavailable (headless): fallback is expected, debug only.
+        _log.debug("customtkinter unavailable; defaulting to dark mode")
         return "dark"
+    try:
+        ctk_mode = str(ctk.get_appearance_mode()).lower()
+    except Exception:
+        _log.debug("ctk.get_appearance_mode() raised; defaulting to dark mode")
+        return "dark"
+    return "light" if ctk_mode == "light" else "dark"
 
 
 def apply_appearance_mode(mode: ThemeMode) -> None:
@@ -630,11 +653,12 @@ def apply_appearance_mode(mode: ThemeMode) -> None:
     try:
         import customtkinter as ctk  # noqa: PLC0415
     except Exception:
+        _log.debug("customtkinter unavailable; appearance mode not applied")
         return
     try:
         ctk.set_appearance_mode("Light" if mode == "light" else "Dark")
     except Exception:
-        pass
+        _log.exception("ctk.set_appearance_mode({!r}) raised", mode)
 
 
 # ===========================================================================
@@ -664,6 +688,10 @@ def get_color_pair(name: str) -> tuple[str, str]:
     Example::
 
         ctk.CTkFrame(fg_color=get_color_pair("surface"))
+
+    Raises:
+        KeyError: If ``name`` is missing from either mode. Themes must be
+            symmetric across modes.
     """
     return get_theme().colors.pair(name)
 

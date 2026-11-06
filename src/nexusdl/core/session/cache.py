@@ -69,6 +69,19 @@ The storage key is ``sha256(json.dumps(key_parts, sort_keys=True))``
 short of a SHA-256 break, which is not a realistic concern for this
 threat model.
 
+Sensitive ``Vary`` headers
+--------------------------
+A response with ``Vary: Cookie`` or ``Vary: Authorization`` is **not
+cached**. The ``vary_values`` (which include the full ``Cookie`` or
+``Authorization`` header value) are serialised into the ``.meta.json``
+in plaintext, and a session token appearing on disk — even inside the
+user's cache directory — is a security defect the cache is not
+authorised to introduce. The cache is for anonymous, shareable
+responses; a session-bound response is neither.
+
+Other ``Vary`` headers (``Accept-Language``, ``Accept-Encoding``,
+``User-Agent``, …) are safe and cached normally.
+
 Eviction
 --------
 When the sum of all entry sizes exceeds ``max_size_bytes``, entries are
@@ -81,6 +94,14 @@ frequently-read entry stays cached even if it is old.
 
 ``eviction_target_ratio`` must be in ``(0, 1]``. ``1.0`` disables the
 hysteresis (evict exactly to the limit).
+
+The eviction loop deletes entry **files** one at a time (unavoidable
+I/O) but only persists the index **once** at the end of the batch.
+Without this batching, a 100-entry eviction would do 100 sequential
+``fsync`` calls under the lock, stalling every other cache operation
+for up to a second. A batch is capped at 100 entries (see
+``_EVICT_BATCH_LIMIT``) so a pathological case never holds the lock
+for more than a hundred deletions.
 
 Expiry
 ------
@@ -147,7 +168,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final
 
-import aiofiles
 import httpx
 from loguru import logger
 
@@ -205,6 +225,19 @@ _CACHEABLE_CONTENT_PREFIXES: Final[tuple[str, ...]] = (
 #: HTTP methods the cache stores. Only ``GET`` is idempotent and cacheable
 #: per RFC 7234 for a client cache without explicit directives.
 _CACHEABLE_METHODS: Final[frozenset[str]] = frozenset({"GET"})
+
+#: ``Vary`` header names that make a response **uncacheable**. A response
+#: that varies on ``Cookie`` or ``Authorization`` depends on session
+#: state; caching it would write the credential value into the
+#: plaintext ``.meta.json`` in the user's cache directory. See the
+#: module docstring's "Sensitive Vary headers" section.
+_SENSITIVE_VARY_HEADERS: Final[frozenset[str]] = frozenset(
+    {"cookie", "authorization", "proxy-authorization"}
+)
+
+#: Maximum number of entries evicted in a single batch. Caps the time
+#: :meth:`HttpCache._evict_if_needed_unlocked` holds the index lock.
+_EVICT_BATCH_LIMIT: Final[int] = 100
 
 #: File names inside the cache directory.
 _META_SUFFIX: Final[str] = ".meta.json"
@@ -331,7 +364,9 @@ class CacheEntry:
             Used for revalidation (``If-Modified-Since``).
         vary_values: The subset of request headers named by the
             response's ``Vary`` directive, captured at write time. Part
-            of the cache key — see the module docstring.
+            of the cache key — see the module docstring. Never contains
+            a credential header: responses whose ``Vary`` names a
+            sensitive header are not cached.
     """
 
     url: str
@@ -436,7 +471,8 @@ class HttpCache:
     that never touches the cache pays nothing for its existence.
 
     See the module docstring for the storage format, the freshness
-    rules, the eviction policy, and the multi-process warning.
+    rules, the eviction policy, the sensitive-Vary policy, and the
+    multi-process warning.
 
     Example:
         >>> cache = HttpCache(
@@ -658,9 +694,10 @@ class HttpCache:
 
         Returns ``True`` when the entry was written, ``False`` when the
         response was not cacheable (non-200, ``no-store``, oversized
-        body, non-cacheable content type, or a method other than GET).
-        ``False`` is **not** an error — a response that cannot be cached
-        is still served to the caller.
+        body, non-cacheable content type, a method other than GET, or a
+        response whose ``Vary`` names a sensitive header — see the
+        module docstring). ``False`` is **not** an error — a response
+        that cannot be cached is still served to the caller.
 
         Args:
             url: The request URL, verbatim.
@@ -709,6 +746,30 @@ class HttpCache:
         )
 
         vary_headers = _parse_vary(response.headers.get("vary", ""))
+        # Wildcard Vary means "cannot be keyed by a bounded set of
+        # vary values" — RFC 7234 §4.1 says such responses are not
+        # cacheable by a shared cache. We treat them as not cacheable
+        # at all (a private cache could key on every request header,
+        # but the cache directory stores vary_values in plaintext).
+        if "*" in vary_headers:
+            _log.debug(
+                "Not caching {}: response carries Vary: * (wildcard)",
+                url,
+            )
+            return False
+        # Sensitive Vary headers (Cookie, Authorization) are not cached.
+        # See the module docstring's "Sensitive Vary headers" section.
+        sensitive = _SENSITIVE_VARY_HEADERS.intersection(vary_headers)
+        if sensitive:
+            _log.debug(
+                "Not caching {}: response varies on sensitive header(s) "
+                "{}; caching would leak credentials into the plaintext "
+                "metadata file",
+                url,
+                sorted(sensitive),
+            )
+            return False
+
         vary_values: dict[str, str] = {}
         if vary_headers:
             if request_headers is None:
@@ -1184,8 +1245,26 @@ class HttpCache:
         key: str,
         *,
         touch_stats: bool = True,
+        persist_index: bool = True,
     ) -> bool:
-        """Delete an entry's files and index record. Holds the lock."""
+        """Delete an entry's files and index record. Holds the lock.
+
+        Args:
+            site_id: The site id.
+            key: The storage key.
+            touch_stats: Whether to count the deletion in
+                :attr:`_evictions` (eviction callers count it
+                themselves).
+            persist_index: When ``False``, the index is updated in
+                memory but not written to disk — the caller is
+                responsible for a single final
+                :meth:`_save_index_unlocked` call. Used by
+                :meth:`_evict_if_needed_unlocked` to batch the index
+                persistence after many deletions.
+
+        Returns:
+            ``True`` iff an index record existed and was removed.
+        """
         compound_key = self._compound_key(site_id, key)
         meta = self._index.pop(compound_key, None)
         if meta is None and touch_stats:
@@ -1206,7 +1285,8 @@ class HttpCache:
                     type(exc).__name__,
                     exc,
                 )
-        await self._save_index_unlocked()
+        if persist_index:
+            await self._save_index_unlocked()
         return meta is not None
 
     def _touch_unlocked(
@@ -1232,18 +1312,20 @@ class HttpCache:
         """Evict LRU entries until the cache size is under the target.
 
         Caller must hold :attr:`_index_lock`. Iterates LRU entries and
-        deletes them one at a time. Each deletion calls
-        :meth:`_delete_entry_unlocked`, which rewrites the index — for a
-        large eviction batch this means N index writes. That is
-        acceptable in practice: eviction is rare (it fires once the
-        cache crosses its ceiling, typically after thousands of writes)
-        and the operation is bounded by ``_evict_batch_limit``.
+        deletes them one at a time. The entry **files** are deleted as
+        we go (unavoidable I/O), but the index is **persisted only
+        once** at the end of the batch — see the module docstring's
+        "Eviction" section. This is the difference between a 100-entry
+        eviction taking a few hundred milliseconds (100 unlinks + 100
+        index writes) and a few milliseconds (100 unlinks + 1 index
+        write).
 
-        The ``_evict_batch_limit`` (default 100) caps the batch size to
-        keep a pathological case (e.g. one massive entry that would
-        trigger thousands of evictions to compensate) from doing
-        thousands of index writes. A batch limit hit does not leave the
-        cache oversized — the next ``put`` will evict more.
+        The batch is capped at :data:`_EVICT_BATCH_LIMIT` entries so a
+        pathological case (one massive entry that would trigger
+        thousands of evictions to compensate) never holds the lock for
+        more than a hundred unlinks. A batch limit hit does not leave
+        the cache oversized permanently — the next ``put`` will evict
+        more.
         """
         if self._total_size <= self._max_size_bytes:
             return
@@ -1257,7 +1339,7 @@ class HttpCache:
         for compound_key, meta in ordered:
             if self._total_size <= self._target_size_bytes:
                 break
-            if evicted >= 100:
+            if evicted >= _EVICT_BATCH_LIMIT:
                 # Defer the rest to the next put — the batch limit keeps
                 # a pathological case from running thousands of
                 # sequential disk writes under one lock.
@@ -1266,11 +1348,21 @@ class HttpCache:
             key = meta.get("key")
             if not isinstance(key, str):
                 continue
+            # ``touch_stats=False`` because the caller counts the
+            # eviction itself; ``persist_index=False`` because we do a
+            # single index write after the loop.
             await self._delete_entry_unlocked(
-                site_id, key, touch_stats=False
+                site_id,
+                key,
+                touch_stats=False,
+                persist_index=False,
             )
             self._evictions += 1
             evicted += 1
+
+        # Single index write for the whole batch.
+        if evicted > 0:
+            await self._save_index_unlocked()
 
         _log.debug(
             "Cache eviction: removed {} entrie(s); size now {} / {}",
@@ -1386,7 +1478,9 @@ def _select_cacheable_headers(
       info).
     * ``vary`` — declared for clarity.
     * Every header named by the ``Vary`` directive — those are part of
-      the cache key by definition.
+      the cache key by definition, **except** the sensitive headers
+      listed in :data:`_SENSITIVE_VARY_HEADERS`, which are never
+      serialised to disk.
     """
     whitelist = {
         "content-type",
@@ -1401,9 +1495,10 @@ def _select_cacheable_headers(
     }
     result: dict[str, str] = {}
     for name, value in headers.items():
-        if name.lower() in whitelist:
+        lower = name.lower()
+        if lower in whitelist:
             result[name] = value
-        elif name.lower() in vary_headers:
+        elif lower in vary_headers and lower not in _SENSITIVE_VARY_HEADERS:
             result[name] = value
     return MappingProxyType(result)
 

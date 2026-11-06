@@ -21,6 +21,36 @@ Why alias the ``Labels`` classes:
       ``<Component>Labels``. New components should follow the same
       convention: define ``Labels`` locally, expose ``<Component>Labels``
       here.
+
+Public surface
+--------------
+:data:`__all__` lists seventeen symbols:
+
+* **Fifteen lazy component exports** — the four widgets and their
+  associated data classes, resolved from their submodules on first
+  access by :func:`__getattr__`.
+* **Two introspection helpers** — :func:`list_components` and
+  :func:`get_component`, defined locally in this module. They never
+  route through the lazy loader (they are the loader's own accessors),
+  and :func:`list_components` reports the *component* surface (fifteen
+  names) plus the two helpers, matching :data:`__all__` exactly.
+
+Adding a new component
+----------------------
+Three steps, one file each:
+
+1. Add an entry to :data:`_COMPONENTS` (the lazy registry) and a
+   matching entry to :data:`__all__`.
+2. Add the matching import to the ``TYPE_CHECKING`` block so mypy and
+   IDEs resolve the symbol.
+3. If the component defines its own ``Labels`` dataclass, expose it as
+   ``<Component>Labels`` in both :data:`_COMPONENTS` and :data:`__all__`.
+
+An inconsistent addition — a name in ``__all__`` but not in
+``_COMPONENTS``, or vice versa — fails the module-level sanity check at
+the bottom of this file, so ``import nexusdl.interfaces.gui.components``
+raises :class:`RuntimeError` immediately rather than the first
+``from ... import *`` in a downstream caller.
 """
 from __future__ import annotations
 
@@ -28,10 +58,17 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 # --- Package version (soft read from nexusdl.version) -----------------------
-
+#
+# A missing ``nexusdl.version`` module is a broken installation, not a
+# runtime error the GUI can recover from — but we do not want to crash
+# the whole package import on a partially-installed environment. The
+# fallback exists so a caller that only wants to inspect the package
+# (e.g. ``list_components()`` in a build script) still works. Any other
+# import failure (a SyntaxError in ``nexusdl/version.py``, a circular
+# import) is a genuine bug and must propagate.
 try:
     from nexusdl.version import __version__ as __version__
-except Exception:  # pragma: no cover - defensive fallback
+except ImportError:  # pragma: no cover - broken installation
     __version__ = "3.0.0"
 
 
@@ -91,6 +128,12 @@ _COMPONENTS: dict[str, tuple[str, str]] = {
     "default_columns": ("chapter_table", "default_columns"),
 }
 
+#: Names defined *locally* in this module, never routed through
+#: :data:`_COMPONENTS`. They are the two introspection helpers. Kept in
+#: a separate constant rather than inlined so :func:`list_components`
+#: and the ``__all__`` consistency check both derive from one place.
+_LOCAL: frozenset[str] = frozenset({"list_components", "get_component"})
+
 
 # --- Static re-exports for type checkers and IDEs ---------------------------
 #
@@ -123,13 +166,14 @@ if TYPE_CHECKING:
 # --- Lazy loader ------------------------------------------------------------
 
 def __getattr__(name: str) -> Any:
-    """Resolve a public name on first access (:pep:`562`).
+    """Resolve a public component name on first access (:pep:`562`).
 
     Raises:
         AttributeError: If ``name`` is not a known public component.
         ImportError: If the component's module cannot be imported because
-            an optional dependency is missing (e.g. ``customtkinter`` on a
-            Web-only install). The message points at the ``[gui]`` extra.
+            an optional dependency is missing (e.g. ``customtkinter`` on
+            a Web-only install). The message points at the ``[gui]``
+            extra.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -137,7 +181,7 @@ def __getattr__(name: str) -> Any:
 
     entry = _COMPONENTS.get(name)
     if entry is None:
-        available = ", ".join(sorted(_COMPONENTS))
+        available = ", ".join(sorted(list(_COMPONENTS) + list(_LOCAL)))
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}. "
             f"Available components: {available}"
@@ -164,19 +208,34 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Expose the full public API to ``dir()``, IDEs and tab-completion."""
-    return sorted(list(globals().keys()) + list(__all__))
+    """Expose the full public API to ``dir()``, IDEs and tab-completion.
+
+    The result is deduplicated: a name that has already been resolved
+    (and therefore appears in ``globals()``) must not also appear via
+    :data:`__all__`. Python's ``dir()`` contract allows duplicates in
+    theory, but every IDE and every tab-completion engine assumes a set.
+    """
+    return sorted(set(globals().keys()) | set(__all__))
 
 
 # --- Introspection helpers --------------------------------------------------
 
 def list_components() -> list[str]:
-    """Return the sorted list of public component names.
+    """Return the sorted list of every public component export.
 
-    Useful for plugin discovery, dynamic GUI builders, parametrized tests,
-    or a future "component gallery" debug screen.
+    The list is the union of:
+
+    * the fifteen **lazy** component exports registered in
+      :data:`_COMPONENTS`, and
+    * the two **local** helpers (:func:`list_components` itself and
+      :func:`get_component`), which are defined in this module's body.
+
+    This matches :data:`__all__` exactly — the invariant is checked by
+    the module-level assertion at the bottom of this file. Useful for
+    plugin discovery, dynamic GUI builders, parametrized tests, or a
+    future "component gallery" debug screen.
     """
-    return sorted(_COMPONENTS.keys())
+    return sorted(set(_COMPONENTS) | _LOCAL)
 
 
 def get_component(name: str) -> Any:
@@ -186,12 +245,47 @@ def get_component(name: str) -> Any:
     message when the name is unknown — convenient for dynamic lookups
     (plugins, config-driven UIs).
 
+    For the two **local** helpers (:func:`list_components`,
+    :func:`get_component`), this is exactly a plain attribute access —
+    they are already bound in the module namespace.
+
+    For a **lazy** export, this routes through :func:`__getattr__` so
+    the cache is populated with the same value a plain attribute access
+    would return. This avoids the subtle issue with
+    ``__import__(__name__, fromlist=[name])``, which would import a
+    **submodule** with the same name as the attribute when one exists
+    (e.g. ``fromlist=["progress_widget"]`` would return the submodule
+    instead of the ``ProgressWidget`` class).
+
     Raises:
-        KeyError: If ``name`` is not a registered component.
+        KeyError: If ``name`` is not a public component export.
     """
-    if name not in _COMPONENTS:
-        available = ", ".join(sorted(_COMPONENTS))
+    if name not in _COMPONENTS and name not in _LOCAL:
+        available = ", ".join(list_components())
         raise KeyError(
             f"Unknown component {name!r}. Available components: {available}"
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    if name in _LOCAL:
+        return globals()[name]
+    return __getattr__(name)
+
+
+# --- Sanity: __all__ must exactly match the union of lazy + local exports ---
+#
+# This assertion runs at import time and would fail on any future edit
+# that adds an entry to _COMPONENTS without adding it to __all__ (or
+# vice versa), or that adds a local helper without registering it in
+# _LOCAL. The cost is a single set comparison at import; the benefit is
+# that an inconsistent public surface is caught the moment the package
+# loads, not on the first `from nexusdl.interfaces.gui.components import *`
+# in a caller.
+
+if frozenset(__all__) != (frozenset(_COMPONENTS) | _LOCAL):
+    _missing_from_all = (frozenset(_COMPONENTS) | _LOCAL) - frozenset(__all__)
+    _missing_from_exports = frozenset(__all__) - (frozenset(_COMPONENTS) | _LOCAL)
+    raise RuntimeError(
+        "nexusdl.interfaces.gui.components.__all__ does not match the "
+        f"union of _COMPONENTS and _LOCAL. Missing from __all__: "
+        f"{sorted(_missing_from_all)}. Listed but not exported: "
+        f"{sorted(_missing_from_exports)}."
+    )

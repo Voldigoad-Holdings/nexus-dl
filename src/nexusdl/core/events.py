@@ -202,10 +202,17 @@ class Event:
     :class:`TypeError`. This protects a handler that is currently
     reading the event from being surprised by an earlier handler
     mutating it. The protection is **shallow** — nested mutable values
-    (a ``dict`` at the top level, a list of dicts) are not copied and
-    not frozen. The pipeline's events carry flat payloads so this
-    limitation is not exercised, but a plugin that emits nested data
-    should treat the payload as read-only by convention.
+    (a ``dict`` nested inside the payload, a list of dicts) are not
+    copied and not frozen. The pipeline's events carry flat payloads so
+    this limitation is not exercised, but a plugin that emits nested
+    data should treat the payload as read-only by convention.
+
+    **Independence from the caller.** The payload is always **copied**
+    (via ``dict(self.payload)``) before being wrapped, **including**
+    when the caller passes a :class:`~types.MappingProxyType` whose
+    underlying dict they still hold a reference to. This guarantees
+    that a subsequent mutation of the caller's dict cannot reach the
+    event's payload, which is the point of freezing.
 
     Attributes:
         type: The event type, e.g. ``"download.progress"``. The twelve
@@ -271,15 +278,15 @@ class Event:
                 f"Event.payload must be a mapping, got "
                 f"{type(self.payload).__name__}"
             )
-        # Wrap in a MappingProxyType if not already wrapped so the
-        # payload is genuinely immutable at the top level. The `dict()`
-        # copy makes the wrapper independent of the caller's original
-        # dict — a caller that later mutates the dict it passed in does
-        # not affect this event's payload.
-        if not isinstance(self.payload, MappingProxyType):
-            object.__setattr__(
-                self, "payload", MappingProxyType(dict(self.payload))
-            )
+        # Always copy the payload before wrapping it. This guarantees
+        # that a caller who still holds a reference to the dict (or to
+        # the backing dict of a MappingProxyType) cannot mutate the
+        # event's payload afterwards. The copy is cheap — payloads
+        # contain a handful of keys — and unconditional, so the
+        # immutability contract does not depend on the input type.
+        object.__setattr__(
+            self, "payload", MappingProxyType(dict(self.payload))
+        )
 
         if not isinstance(self.id, UUID):
             raise TypeError(

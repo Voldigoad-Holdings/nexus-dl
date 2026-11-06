@@ -25,6 +25,14 @@ The screen is dismissable from any state with ``Escape`` or ``q`` — the
 same binding every other screen in this package uses, so the gesture is
 consistent across the TUI.
 
+A persistent hint line at the bottom of the screen (``help.hint``)
+surfaces the "press Esc or q to close" affordance **without** requiring
+the user to look at the Global category. The information is redundant
+with the ``help.binding.back`` row inside Global — deliberately so:
+a first-time user who opens Help to learn a different binding must not
+have to navigate to a specific category to learn how to leave the
+screen.
+
 Binding catalog
 ---------------
 The screen renders a **static catalog**, defined at module scope in
@@ -58,9 +66,19 @@ screen that pushes the help screen does not need a handler.
 Localisation
 ------------
 The screen introduces **24 translation keys** under ``help.*``. The
-category titles and the description of every binding are localised; the
-key names themselves (``Esc``, ``Ctrl+Q``, ``↑``, …) are not — they
-are symbols, not prose, and every locale uses the same ones.
+category titles, the description of every binding, the screen title,
+and the persistent hint are all localised; the key names themselves
+(``Esc``, ``Ctrl+Q``, ``↑``, …) are not — they are symbols, not
+prose, and every locale uses the same ones. The split is:
+
+* **6 category titles** — ``help.category.{global,navigation,search,download,settings,logs}``.
+* **16 binding descriptions** — ``help.binding.*``. Several bindings
+  share a key (``help.binding.back`` is used by four categories): the
+  key count is 24, not 26, because sharing is how the catalog avoids
+  drift between two categories that legitimately use the same
+  gesture.
+* **2 structural keys** — ``help.title`` (the screen header) and
+  ``help.hint`` (the persistent bottom line).
 
 A missing key renders the key verbatim, matching the contract every
 other widget and screen in this package follows. See
@@ -81,7 +99,7 @@ changed, only because the catalog was left out of date.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Final
+from typing import ClassVar, Final
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -92,9 +110,6 @@ from textual.widgets import Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from nexusdl.core.i18n import Translator, get_default_translator
-
-if TYPE_CHECKING:
-    pass
 
 
 __all__ = ["BindingCategory", "BindingInfo", "HelpScreen"]
@@ -135,7 +150,10 @@ class BindingInfo:
     Attributes:
         keys: The key notation, exactly as the user must type it
             (``"Esc / q"``, ``"Ctrl+Q"``, ``"↑ / ↓"``). Not localised —
-            symbols are locale-independent.
+            symbols are locale-independent. Must be a non-empty
+            :class:`str`; a tuple of keys would render as
+            ``"('Esc', 'q')"`` (an implementation artefact, not user
+            copy), so the field is validated at construction time.
         description_key: The translation key for the action
             description. Rendered via
             :meth:`~nexusdl.core.i18n.Translator.translate`.
@@ -143,6 +161,32 @@ class BindingInfo:
 
     keys: str
     description_key: str
+
+    def __post_init__(self) -> None:
+        """Validate the field types.
+
+        Raises:
+            TypeError: If ``keys`` or ``description_key`` is not a
+                :class:`str`. A tuple of keys, or a ``None``
+                description, would break the renderer at best or
+                produce misleading user copy at worst; failing at
+                construction time keeps the catalog's shape honest.
+            ValueError: If ``keys`` is empty — an empty key column
+                row conveys no information.
+        """
+        if not isinstance(self.keys, str):
+            raise TypeError(
+                f"BindingInfo.keys must be a str, got "
+                f"{type(self.keys).__name__}; a tuple of keys renders "
+                f"as an implementation artefact, not user copy"
+            )
+        if not self.keys:
+            raise ValueError("BindingInfo.keys must be non-empty")
+        if not isinstance(self.description_key, str):
+            raise TypeError(
+                f"BindingInfo.description_key must be a str, got "
+                f"{type(self.description_key).__name__}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +275,15 @@ _CATALOG: Final[tuple[BindingCategory, ...]] = (
         ),
     ),
 )
+
+
+#: Lookup table for :func:`_category_by_id`. Built once at module load
+#: so the handler's lookup is O(1) instead of O(n) — n is six today, so
+#: the difference is immeasurable, but the dict makes the intent ("this
+#: is a lookup, not a scan") obvious and would scale if the catalog grew.
+_CATALOG_BY_ID: Final[dict[str, BindingCategory]] = {
+    category.id: category for category in _CATALOG
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -361,7 +414,7 @@ class HelpScreen(Screen[None]):
         """
         if event.option.id is None:
             return
-        category = _category_by_id(event.option.id)
+        category = _CATALOG_BY_ID.get(event.option.id)
         if category is not None:
             self._render_into_content(category)
 
@@ -377,7 +430,7 @@ class HelpScreen(Screen[None]):
         """
         if event.option.id is None:
             return
-        category = _category_by_id(event.option.id)
+        category = _CATALOG_BY_ID.get(event.option.id)
         if category is not None:
             self._render_into_content(category)
 
@@ -428,21 +481,3 @@ class HelpScreen(Screen[None]):
             text.append("\n")
 
         return text
-
-
-# --------------------------------------------------------------------------- #
-# Module-level helpers                                                        #
-# --------------------------------------------------------------------------- #
-
-
-def _category_by_id(category_id: str) -> BindingCategory | None:
-    """Return the catalog category with *category_id*, or ``None``.
-
-    A ``None`` return would be a bug — the option list only contains
-    ids drawn from :data:`_CATALOG` — but the handler is defensive
-    rather than raising into Textual's dispatch machinery.
-    """
-    for category in _CATALOG:
-        if category.id == category_id:
-            return category
-    return None

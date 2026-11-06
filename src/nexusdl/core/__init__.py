@@ -40,43 +40,51 @@ actually needs.
 
 Curated top-level exports
 -------------------------
-This file re-exports **fifteen symbols** - the small set that any
-consumer of the framework needs to bootstrap an application. Every
-other symbol lives in its specific submodule and is imported from
-there. The choice is deliberate:
+This file re-exports **seventeen symbols**: **fifteen lazy exports**
+resolved on first access from their submodules, plus **two
+introspection helpers** (:func:`list_symbols` and :func:`get_symbol`)
+defined locally in this module. Every other symbol lives in its
+specific submodule and is imported from there. The choice is
+deliberate:
 
 * **Import cost.** ``import nexusdl.core`` is now **side-effect-free**
   (see "Lazy loading" below). A sub-package that needs only
   ``NexusDLError`` pays for ``exceptions.py`` (pure stdlib ``typing``)
   and nothing else - not pydantic, not cryptography, not yaml, not
-  httpx. Only the fifteen exports, resolved on first access, cost
+  httpx. Only the fifteen lazy exports, resolved on first access, cost
   anything, and only for the modules they actually use.
 
 * **Clarity.** A caller reading ``from nexusdl.core.models import Manga``
   knows exactly where ``Manga`` lives. ``from nexusdl.core import Manga``
   would be forty percent shorter and twice as opaque.
 
-* **Stability.** The fifteen exports are the **highest-stability tier**
+* **Stability.** The seventeen exports are the **highest-stability tier**
   of the framework - a signature change to any of them is a
   project-wide breaking change. Re-exporting everything would
   inadvertently promote every domain model and utility to that tier,
   which they do not deserve.
 
-The fifteen exports
--------------------
-::
+The seventeen exports
+---------------------
+Fifteen **lazy** exports (defined in submodules, resolved by
+``__getattr__`` on first access)::
 
     NexusDLError          base exception every consumer catches
     Settings              the configuration entry point
     bootstrap_env_file    first-run .env creation
     Event, EventBus       the coordination mechanism
-    logger                the bound loguru logger (see caveat below)
+    logger                the loguru logger object (see caveat below)
     configure_logging     logger setup (explicit arguments)
     configure_logging_from_settings   logger setup (from Settings)
     get_logger            per-module bound logger helper
     Translator            the localisation service
     get_default_translator, configure_default_translator   process-wide default
     APP_NAME, APP_SLUG, DATA_PACKAGE                       identity constants
+
+Two **local** helpers (defined in this module, never lazy)::
+
+    list_symbols          enumerate the lazy exports (for tools and tests)
+    get_symbol            resolve a lazy export by name (for tools)
 
 Everything else - :class:`~nexusdl.core.models.manga.Manga`,
 :class:`~nexusdl.core.session.http_session.HttpSession`,
@@ -88,7 +96,7 @@ section "What is not re-exported" below spells out the rule.
 
 Lazy loading
 ------------
-All fifteen exports are resolved through PEP 562's ``__getattr__``
+All fifteen lazy exports are resolved through PEP 562's ``__getattr__``
 mechanism. Importing ``nexusdl.core`` **does not import any submodule**.
 This matters because:
 
@@ -118,6 +126,10 @@ This matters because:
   jsonschema, or playwright. A script that does ``from nexusdl.core
   import NexusDLError`` pays for ``exceptions.py`` (~1 ms) and nothing
   else.
+
+The two local helpers (``list_symbols``, ``get_symbol``) are defined in
+this module's body and are available immediately - they do not route
+through ``__getattr__``.
 
 See "A note on the ``logger`` attribute and the ``logger`` submodule"
 below for the one caveat this lazy loading introduces - and why it is
@@ -196,7 +208,7 @@ surface use the top-level import, which this file re-exports::
 
     from nexusdl.core import Settings, get_logger
 
-The fifteen exports above are the only symbols guaranteed to be
+The seventeen exports above are the only symbols guaranteed to be
 importable from ``nexusdl.core`` directly. Everything else - even the
 public surface of every sub-package - lives behind a submodule hop.
 
@@ -208,7 +220,7 @@ Two distinct objects share the name ``logger``:
   ``configure_logging``, ``configure_logging_from_settings``,
   ``get_logger``, and the bound loguru logger object.
 * ``nexusdl.core.logger`` - the **loguru logger** object, exposed by
-  this package as one of the fifteen exports.
+  this package as one of the fifteen lazy exports.
 
 Before any explicit ``import nexusdl.core.logger``, ``from nexusdl.core
 import logger`` returns the **loguru logger** (resolved by this
@@ -234,11 +246,21 @@ To avoid the ambiguity entirely:
   ``import nexusdl.core.logger`` in the same process, or retrieve the
   module from ``sys.modules["nexusdl.core.logger"]`` explicitly.
 
+:func:`get_symbol` (one of the two local helpers) routes through
+:func:`__getattr__` so its result matches the current state of the
+package attribute - but if ``import nexusdl.core.logger`` has already
+executed in the process, ``get_symbol("logger")`` returns the
+**submodule**, not the loguru logger. The deterministic escape hatch
+for tooling that needs the loguru logger regardless of prior imports
+is::
+
+    from nexusdl.core.logger import logger as _loguru_logger
+
 Stability
 ---------
 Three tiers of import stability across the whole framework:
 
-* **Tier 1 - the fifteen exports of this file.** Renaming any of them
+* **Tier 1 - the seventeen exports of this file.** Renaming any of them
   is a **project-wide** breaking change that requires a migration.
   These are the only symbols NexusDL commits to keeping stable across
   minor releases. The signatures may grow (a new keyword argument with
@@ -324,8 +346,8 @@ submodule. ``from nexusdl.core import Settings`` and
 object** - there is no proxy, no wrapper, no second definition. The
 top-level path is a convenience, not a fork. A future change that
 moved ``Settings`` between submodules would keep the top-level alias
-working as long as the symbol remains one of the fifteen exports; a
-change that removed it from the fifteen would be a breaking change
+working as long as the symbol remains one of the fifteen lazy exports;
+a change that removed it from the fifteen would be a breaking change
 regardless of submodule location.
 
 Dependency graph (no cycles)::
@@ -357,9 +379,9 @@ dependencies at first use**, not imports performed by this file. This
 file imports **nothing** at module load - the six leaf-side modules
 (``config``, ``constants``, ``events``, ``exceptions``, ``i18n``,
 ``logger``) are loaded lazily, when a caller accesses one of the
-fifteen exports. This makes ``import nexusdl.core`` effectively free,
-and makes ``from nexusdl.core.exceptions import NexusDLError`` cost
-only ``exceptions.py`` rather than the entire ``config.py``
+fifteen lazy exports. This makes ``import nexusdl.core`` effectively
+free, and makes ``from nexusdl.core.exceptions import NexusDLError``
+cost only ``exceptions.py`` rather than the entire ``config.py``
 dependency graph. See "Lazy loading" above for the rationale and the
 one caveat.
 """
@@ -408,8 +430,8 @@ __all__ = [
 #
 # Maps exported name -> (submodule basename, attribute name in that submodule).
 # Every listed symbol is defined at module level in the given submodule.
-# Adding a new top-level export is a one-line change here plus a matching
-# TYPE_CHECKING re-export below.
+# Adding a new top-level lazy export is a one-line change here plus a
+# matching TYPE_CHECKING re-export below plus a matching __all__ entry.
 #
 # The ``logger`` entry is deliberately (``"logger"``, ``"logger"``) - we
 # want the *loguru logger object* exported by the ``logger`` submodule,
@@ -440,6 +462,12 @@ _LAZY: dict[str, tuple[str, str]] = {
     "APP_SLUG": ("constants", "APP_SLUG"),
     "DATA_PACKAGE": ("constants", "DATA_PACKAGE"),
 }
+
+#: Names defined *locally* in this module, never routed through
+#: :data:`_LAZY`. They are the two introspection helpers. Kept in a
+#: separate constant rather than inlined so :func:`list_symbols` and
+#: the ``__all__`` consistency check both derive from one place.
+_LOCAL: frozenset[str] = frozenset({"list_symbols", "get_symbol"})
 
 
 # ===========================================================================
@@ -477,7 +505,7 @@ def __getattr__(name: str) -> Any:
 
     Called by Python's import machinery whenever an attribute is accessed
     on this package that is not already bound in ``globals()``. Only the
-    names in :data:`__all__` are handled; anything else raises
+    names in :data:`_LAZY` are handled; anything else raises
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
@@ -565,8 +593,8 @@ def __dir__() -> list[str]:
     Python's default :func:`dir` implementation collects a module's
     ``__dict__`` and, when the module defines ``__getattr__``, calls it
     with each candidate name to decide what to display. Because none of
-    the fifteen exports are present in ``__dict__`` at import time, an
-    unmodified :func:`dir` would not list them - the package would
+    the fifteen lazy exports are present in ``__dict__`` at import time,
+    an unmodified :func:`dir` would not list them - the package would
     appear empty in a REPL.
 
     The returned list is :data:`__all__` plus the standard module dunders
@@ -582,16 +610,25 @@ def __dir__() -> list[str]:
 # ===========================================================================
 
 def list_symbols() -> list[str]:
-    """Return the sorted list of top-level lazy exports.
+    """Return the sorted list of every top-level export (lazy + local).
 
-    Useful for parametrized tests (``@pytest.mark.parametrize("name",
+    The list is the union of:
+
+    * the fifteen **lazy** exports registered in :data:`_LAZY`, and
+    * the two **local** helpers (:func:`list_symbols` itself and
+      :func:`get_symbol`), which are defined in this module's body.
+
+    This matches :data:`__all__` exactly - the invariant is checked in
+    :mod:`tests.unit.core.test_core_init` (both directions). Useful for
+    parametrized tests (``@pytest.mark.parametrize("name",
     list_symbols())``), schema registries, and tooling that needs to
     enumerate the core's Tier-1 surface without importing every
     submodule.
+
+    Returns:
+        A sorted list of strings, one per public export.
     """
-    # Only the fifteen Tier-1 exports, not the introspection helpers -
-    # otherwise ``list_symbols`` would include itself.
-    return sorted(_LAZY.keys())
+    return sorted(set(_LAZY) | _LOCAL)
 
 
 def get_symbol(name: str) -> Any:
@@ -602,14 +639,58 @@ def get_symbol(name: str) -> Any:
     (plugin introspection tools, parametrized tests, composition-root
     builders that want to resolve a symbol from a config string).
 
+    For the two **local** helpers (:func:`list_symbols`,
+    :func:`get_symbol`), this is exactly a plain attribute access - they
+    are already bound in the module namespace.
+
+    For a **lazy** export, this routes through :func:`__getattr__` so
+    the cache is populated with the same value a plain attribute access
+    would return. This matters for the ``logger`` symbol: an
+    implementation that used ``__import__(__name__, fromlist=[name])``
+    would force the ``nexusdl.core.logger`` submodule to load and rebind
+    ``nexusdl.core.logger`` to the module object, silently returning
+    the **module** instead of the loguru logger. Routing through
+    :func:`__getattr__` avoids that.
+
+    Args:
+        name: The export name to resolve.
+
+    Returns:
+        The symbol, exactly as ``getattr(nexusdl.core, name)`` would
+        return it.
+
     Raises:
         KeyError: If ``name`` is not a public core export.
     """
-    if name not in _LAZY:
-        available = ", ".join(sorted(_LAZY.keys()))
+    if name not in _LAZY and name not in _LOCAL:
+        available = ", ".join(list_symbols())
         raise KeyError(
             f"Unknown core symbol {name!r}. Available: {available}. "
             f"Every other symbol lives in its specific submodule - "
             f"import from 'nexusdl.core.<submodule>' directly."
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    # Local helpers are already bound; lazy ones go through __getattr__
+    # so the cache stays consistent with plain attribute access.
+    if name in _LOCAL:
+        return globals()[name]
+    return __getattr__(name)
+
+
+# ===========================================================================
+# Sanity: __all__ must exactly match the union of lazy + local exports
+# ===========================================================================
+# This assertion runs at import time and would fail on any future edit
+# that adds an entry to _LAZY without adding it to __all__ (or vice
+# versa), or that adds a local helper without registering it in _LOCAL.
+# The cost is a single set comparison at import; the benefit is that an
+# inconsistent public surface is caught the moment the package loads,
+# not on the first `from nexusdl.core import *` in a caller.
+
+if frozenset(__all__) != (frozenset(_LAZY) | _LOCAL):
+    _missing_from_all = (frozenset(_LAZY) | _LOCAL) - frozenset(__all__)
+    _missing_from_exports = frozenset(__all__) - (frozenset(_LAZY) | _LOCAL)
+    raise RuntimeError(
+        "nexusdl.core.__all__ does not match the union of _LAZY and "
+        f"_LOCAL. Missing from __all__: {sorted(_missing_from_all)}. "
+        f"Listed but not exported: {sorted(_missing_from_exports)}."
+    )

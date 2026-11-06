@@ -40,42 +40,51 @@ calls are explicitly discouraged in this codebase.
 The canonical runtime order
 ===========================
 
-    Logging   →   CORS   →   RateLimit   →   Auth   →   app
+:data:`MIDDLEWARE_ORDER` defines, and :func:`build_middleware_stack`
+returns, this order:
+
+    Logging   →   CORS   →   Auth   →   RateLimit   →   app
 
 Justification, outermost to innermost:
 
 * **Logging** wraps everything so it captures 401s, 429s, preflights,
-  and unexpected 500s with the same structure.
-* **CORS** must sit inside logging (so preflights are logged) but
-  outside rate-limit and auth (so preflights never consume a rate-limit
-  token and never require authentication — browsers don't send
-  credentials on preflights).
-* **RateLimit** must sit inside auth (so it can bucket by ``user``
-  instead of falling back to IP) — but that requires auth to have run
-  first, which means auth must be **outside** rate-limit. Contradiction?
-  No: auth is inside rate-limit in the *call stack* sense, but rate-limit
-  reads ``scope["state"]["user_id"]`` which auth populates. In the
-  correct ordering above, auth runs *inside* rate-limit's dispatch — so
-  rate-limit executes **before** auth and would see no user.
-  Correction below.
+  and unexpected 500s with the same structure — including the
+  ``X-Request-ID`` header it generates.
+* **CORS** sits inside logging (so preflights are logged) but outside
+  auth and rate-limit (so preflights never consume a rate-limit token
+  and never require authentication — browsers don't send credentials on
+  preflights). CORS short-circuits preflights before they ever reach
+  auth.
+* **Auth** runs before rate-limit so that it can populate
+  ``scope["state"]["user_id"]`` **before** rate-limit reads it.
+* **RateLimit** reads ``scope["state"]["user_id"]`` at its entry point.
+  If auth ran after it, the state would be empty and every request
+  would be bucketed by IP — silently defeating the per-user quota.
 
-Wait — the actual mechanism matters. Rate-limit and auth both run
-inside the ASGI dispatch chain. Rate-limit reads
-``scope["state"]["user_id"]`` at *its* entry point. If auth runs
-*after* rate-limit, the state is empty when rate-limit reads it.
+Why the "intuitive" reading is wrong
+------------------------------------
 
-The correct runtime order therefore is:
+A natural-looking order is::
 
-    Logging   →   CORS   →   Auth   →   RateLimit   →   app
+    Logging → CORS → RateLimit → Auth → app   (WRONG)
 
-This means **auth runs before rate-limit**, populating the state that
-rate-limit consumes. Logging still wraps everything (it sees the
-final status after both), and CORS still sits outside both (it
-short-circuits preflights).
+The reasoning goes "rate-limit should reject expensive requests before
+they reach auth, to save CPU". This is a trap:
 
-**This is the order :func:`build_middleware_stack` returns**, and it
-differs from an intuitive "rate-limit first" reading. Trust the
-helper, not the intuition.
+* Rate-limit reads ``scope["state"]["user_id"]`` **at its own entry
+  point**, not after auth runs. In the order above, auth runs *after*
+  rate-limit's dispatch has already executed → the state is still empty
+  when rate-limit reads it → **every request is bucketed by IP** →
+  the ``600/min per-user`` quota is silently converted into a
+  ``600/min per-IP`` quota → a single user behind a shared NAT exhausts
+  the budget for everyone else.
+
+* Auth's failure cost is tiny (a single JWT verify, cached by
+  ``AuthMiddleware``), so there is no meaningful CPU saved by moving
+  rate-limit ahead of it.
+
+**Trust the helper, not the intuition.** :func:`build_middleware_stack`
+returns the correct order; do not re-order the returned list.
 
 Loading strategy
 ================
@@ -162,8 +171,12 @@ __all__ = [
 # This is the order in which the middlewares must appear in the list
 # returned by ``build_middleware_stack`` (and therefore in
 # ``FastAPI(middleware=[...])``). See the module docstring for the
-# rationale — especially why auth comes BEFORE rate_limit despite the
-# intuitive reading.
+# rationale — especially why **auth comes before rate_limit** despite
+# the intuitive "rate-limit first" reading.
+#
+# Do not reorder this tuple. Do not splice additional middlewares into
+# it without updating the module docstring, the ``_MODULE_FOR_KEY`` and
+# ``_CLASS_FOR_KEY`` maps below, and the ``_LAZY`` registry.
 
 MIDDLEWARE_ORDER: tuple[str, ...] = (
     "logging",
@@ -186,7 +199,7 @@ MIDDLEWARE_ORDER: tuple[str, ...] = (
 #   3. add the symbols to the ``__all__`` list above and to the
 #      TYPE_CHECKING block,
 #   4. add the middleware key to ``MIDDLEWARE_ORDER`` (in the right
-#      runtime position) and to ``_MODULE_FOR_KEY``.
+#      runtime position) and to ``_MODULE_FOR_KEY`` / ``_CLASS_FOR_KEY``.
 
 _LAZY: dict[str, tuple[str, str]] = {
     # ----- logging -----
@@ -224,8 +237,7 @@ _LAZY: dict[str, tuple[str, str]] = {
 
 
 #: Map a middleware key (from :data:`MIDDLEWARE_ORDER`) to its submodule
-#: and the concrete middleware class name. Used by
-#: :func:`build_middleware_stack` to resolve configs into instances.
+#: basename. Used by :func:`_resolve_class` and :func:`build_middleware_stack`.
 _MODULE_FOR_KEY: dict[str, str] = {
     "logging": "logging",
     "cors": "cors",
@@ -233,6 +245,7 @@ _MODULE_FOR_KEY: dict[str, str] = {
     "rate_limit": "rate_limit",
 }
 
+#: Map a middleware key to its concrete class name.
 _CLASS_FOR_KEY: dict[str, str] = {
     "logging": "LoggingMiddleware",
     "cors": "CORSMiddleware",
@@ -299,6 +312,9 @@ def __getattr__(name: str) -> Any:
             ``[web]`` extra.
     """
     # Dunder / special attributes must never route through lazy loading.
+    # Python will not normally call ``__getattr__`` for them (they are
+    # always present on the module), but this guard is cheap and
+    # protective.
     if name.startswith("__"):
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}"
@@ -445,19 +461,27 @@ def default_middleware_stack(
         include_rate_limit: Include the rate-limit middleware.
             Default ``True``.
         include_cors: Include the CORS middleware. Default ``True``.
-            When included without an explicit ``cors_config``, the
-            CORS config is chosen by ``cors_config`` fallback: if not
-            provided, a ``disabled_cors()`` config is used — deployers
-            **should** pass their real origin here.
+            **When included without an explicit ``cors_config``, this
+            function uses ``disabled_cors()``**, which makes the CORS
+            middleware a no-op — no CORS headers are ever added, no
+            preflight is intercepted, no origin is checked. Pass a real
+            ``cors_config`` (e.g. ``single_origin_cors("https://app")``)
+            for CORS to have any effect. Set ``include_cors=False`` for
+            an explicit no-op (equivalent behaviour, clearer intent).
         include_logging: Include the logging middleware. Default ``True``.
         cors_config: Explicit :class:`CORSConfig`. When ``None`` and
-            ``include_cors=True``, ``disabled_cors()`` is used (safe
-            default; logs at warning if actually used to serve traffic).
-        slow_threshold_ms: Passed to :class:`LoggingConfig`.
-        trust_forwarded_for: Passed to :class:`LoggingConfig`'s...
-            actually it belongs to :class:`RateLimitConfig`. Applied to
-            the rate-limit config when included.
-        trusted_proxies: Same — applied to the rate-limit config.
+            ``include_cors=True``, ``disabled_cors()`` is used — see the
+            ``include_cors`` note above.
+        slow_threshold_ms: Passed to :class:`LoggingConfig`. Requests
+            slower than this are logged at WARNING.
+        trust_forwarded_for: Passed to :class:`RateLimitConfig`. When
+            ``True``, the rate-limit middleware honors
+            ``X-Forwarded-For`` for the client IP (subject to
+            ``trusted_proxies``). Ignored if ``include_rate_limit=False``.
+        trusted_proxies: Passed to :class:`RateLimitConfig`. Set of IPs
+            allowed to set ``X-Forwarded-For``. Empty +
+            ``trust_forwarded_for=True`` means "trust every forwarding
+            client" — acceptable only behind a single known proxy.
 
     Raises:
         ValueError: If ``include_auth=True`` and ``auth_service`` is
@@ -472,6 +496,11 @@ def default_middleware_stack(
 
     logging_config = None
     if include_logging:
+        # Accessing via ``__getattr__`` explicitly is REQUIRED:
+        # ``LoggingConfig`` is not bound in this module's globals until
+        # the lazy loader has run once, and Python's ``LOAD_GLOBAL``
+        # does **not** fall back to ``__getattr__`` (PEP 562 only
+        # triggers on ``module.attr`` access).
         logging_config = __getattr__("LoggingConfig")(
             slow_threshold_ms=slow_threshold_ms,
         )

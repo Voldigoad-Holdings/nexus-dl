@@ -22,9 +22,34 @@ Universal design notes:
       provided are shown.
     * Callbacks are isolated — a misbehaving parent never breaks Tk.
     * Cleans up after itself on ``<Destroy>`` (cancels pending ``after``).
+
+Event binding is idempotent
+---------------------------
+:meth:`MangaCard._bind_card_events` binds mouse handlers on the card and
+every descendant that is not an action button. The method is called from
+several places — once from ``__init__``, once per badge-frame rebuild —
+and a naive implementation that called ``widget.bind(..., add="+")``
+without tracking would attach **duplicate handlers**: a card rebuilt five
+times would fire ``_handle_click`` five times on a single user click,
+toggling the selection five times (returning it to its original state)
+and calling ``on_select`` with contradictory values.
+
+The card therefore tracks every widget it has bound in a
+:class:`weakref.WeakSet`. A widget that is destroyed (a rebuilt badge,
+a rebuilt checkmark) drops out of the set automatically, so the set
+never prevents a legitimate re-bind of a *new* widget at the same
+logical position. A widget that has already been bound is skipped on the
+next call — which is exactly what makes the "rebuild the badges, then
+re-bind the frame" sequence safe.
+
+Weak references (rather than the widget itself in a plain ``set``) are
+required because Tk widgets are destroyed explicitly and their
+references must not outlive the widget: a plain ``set`` would leak every
+widget the card ever created.
 """
 from __future__ import annotations
 
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -214,7 +239,6 @@ _DOWNLOAD_BTN_BG = ("#2980B9", "#1F6AA5")
 _DOWNLOAD_BTN_HOVER = ("#1F6AA5", "#1A5488")
 _VIEW_BTN_BG = ("gray85", "gray25")
 _VIEW_BTN_HOVER = ("gray75", "gray30")
-_DESTROY_BIND_TAG = "__manga_card__"
 
 
 # ---------------------------------------------------------------------------
@@ -330,12 +354,21 @@ class MangaCard(ctk.CTkFrame):
         self._leave_after_id: str | None = None
         self._destroyed = False
 
+        #: Every widget the card has already bound its mouse handlers on.
+        #: A ``WeakSet`` (not a plain ``set``) so that a destroyed widget
+        #: — a rebuilt badge, a rebuilt checkmark — drops out on its own,
+        #: and a new widget at the same logical position can be bound
+        #: again. The guard against double-binding is what makes
+        #: repeated rebuilds safe — see the module docstring's
+        #: "Event binding is idempotent" section.
+        self._bound_widgets: weakref.WeakSet = weakref.WeakSet()
+
         self._build()
         self._render()
         self._bind_card_events(self)
         self._refresh_hover()
 
-        self.bind("<Destroy>", self._on_destroy, add=f"+{_DESTROY_BIND_TAG}")
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
     # ------------------------------------------------------------------
     # Public API
@@ -615,7 +648,9 @@ class MangaCard(ctk.CTkFrame):
 
         if self._show_status:
             status = self._manga.status
-            color = _MANGA_STATUS_COLOR.get(status, _MANGA_STATUS_COLOR[MangaStatus.UNKNOWN])
+            color = _MANGA_STATUS_COLOR.get(
+                status, _MANGA_STATUS_COLOR[MangaStatus.UNKNOWN]
+            )
             icon = _MANGA_STATUS_ICON.get(status, "?")
             key = _STATUS_LABEL_KEY.get(status, "status_unknown")
             text = getattr(self._labels, key, "")
@@ -644,9 +679,14 @@ class MangaCard(ctk.CTkFrame):
         else:
             self._badges_frame.grid_remove()
 
-        # Newly created badges must get card bindings (except when they are
-        # buttons, which they aren't here).
-        self._bind_card_events(self._badges_frame)
+        # Bind mouse handlers on the *new* badges only. The
+        # ``_badges_frame`` itself has been bound in ``__init__`` and
+        # remains bound — binding it again on every rebuild would
+        # accumulate handlers (see the module docstring's "Event binding
+        # is idempotent" section). The ``WeakSet`` guard in
+        # ``_bind_card_events`` makes the call safe either way.
+        for badge in self._badges_frame.winfo_children():
+            self._bind_card_events(badge)
 
     def _make_badge(self, parent, text: str, bg_color) -> ctk.CTkLabel:
         return ctk.CTkLabel(
@@ -703,6 +743,9 @@ class MangaCard(ctk.CTkFrame):
             font=("", 12, "bold"),
         )
         self._check_overlay.place(relx=1.0, rely=0.0, x=-4, y=4, anchor="ne")
+        # The overlay is a fresh widget — bind mouse handlers on it so a
+        # click on the checkmark still activates the card.
+        self._bind_card_events(self._check_overlay)
 
     def _remove_check_overlay(self) -> None:
         if self._check_overlay is None:
@@ -802,7 +845,10 @@ class MangaCard(ctk.CTkFrame):
         try:
             cb(*args)
         except Exception:
-            _log.exception("MangaCard: callback {!r} raised", getattr(cb, "__name__", cb))
+            _log.exception(
+                "MangaCard: callback {!r} raised",
+                getattr(cb, "__name__", cb),
+            )
 
     # ------------------------------------------------------------------
     # Bindings
@@ -813,9 +859,21 @@ class MangaCard(ctk.CTkFrame):
 
         Action buttons (and their descendants) are skipped so they do not
         trigger card clicks.
+
+        **Idempotent.** A widget that has already been bound by this card
+        is skipped on subsequent calls — see the module docstring's
+        "Event binding is idempotent" section. Without the guard, a card
+        whose badges are rebuilt (via :meth:`set_manga`) would attach a
+        new handler on every rebuild, and a single user click on the
+        badge frame would fire ``_handle_click`` as many times as the
+        card had been rebuilt.
         """
         if self._destroyed:
             return
+        if widget in self._bound_widgets:
+            return
+        self._bound_widgets.add(widget)
+
         action_widgets = set(self._action_buttons.values())
 
         def _is_action(w) -> bool:
@@ -837,7 +895,7 @@ class MangaCard(ctk.CTkFrame):
             ("<Leave>", self._handle_leave),
         ):
             try:
-                widget.bind(sequence, handler, add=f"+{_DESTROY_BIND_TAG}")
+                widget.bind(sequence, handler, add="+")
             except Exception:
                 pass
         try:
@@ -854,6 +912,8 @@ class MangaCard(ctk.CTkFrame):
 
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._destroyed:
             return
         self._destroyed = True
         if self._leave_after_id is not None:

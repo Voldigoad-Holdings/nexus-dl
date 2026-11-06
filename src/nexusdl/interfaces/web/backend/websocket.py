@@ -103,6 +103,15 @@ DEFAULT_HEARTBEAT_TIMEOUT_S: float = 60.0
 DEFAULT_MAX_CONNECTIONS: int = 2000
 
 
+#: Total ordering of roles, from least to most privileged. Used to
+#: implement "minimum role" gating in :class:`BusBridgeConfig`.
+_ROLE_RANK: dict[UserRole, int] = {
+    UserRole.GUEST: 0,
+    UserRole.USER: 1,
+    UserRole.ADMIN: 2,
+}
+
+
 # ===========================================================================
 # Public enums
 # ===========================================================================
@@ -295,11 +304,16 @@ class WSMessage:
             ts = datetime.now(timezone.utc)
 
         data = raw.get("data", {})
+        # Defensive: preserve a caller-supplied id only if it is a
+        # non-empty value. ``str(None)`` would produce the literal
+        # ``"None"`` — avoid that trap.
+        raw_id = raw.get("id")
+        msg_id = str(raw_id) if raw_id else str(uuid.uuid4())
         return cls(
             type=str(raw.get("type", "")),
             data=dict(data) if isinstance(data, Mapping) else {},
             ts=ts,
-            id=str(raw.get("id", "")) or str(uuid.uuid4()),
+            id=msg_id,
         )
 
 
@@ -398,14 +412,39 @@ class Connection:
             maxsize=queue_size
         )
         self._send_task: asyncio.Task[None] | None = None
+        # Invoked after a *self-initiated* close (currently: slow-consumer
+        # overflow) so the manager can remove us from the registry without
+        # waiting for the next heartbeat scan. Idempotent on the manager
+        # side (``disconnect``).
+        self._reap_callback: Callable[[Connection], Awaitable[None]] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle (driven by the manager)
     # ------------------------------------------------------------------
 
-    async def accept(self) -> None:
-        """Accept the WebSocket and start the send loop + hello message."""
-        await self.websocket.accept()
+    def set_reap_callback(
+        self, cb: Callable[[Connection], Awaitable[None]]
+    ) -> None:
+        """Install the callback invoked after a self-initiated close."""
+        self._reap_callback = cb
+
+    async def accept(self, *, subprotocol: str | None = None) -> None:
+        """Accept the WebSocket and start the send loop + hello message.
+
+        ``subprotocol`` is forwarded to the underlying WebSocket. The
+        send loop and hello message are **always** started here — even if
+        the transport rejects the subprotocol kwarg (some ASGI servers
+        only accept the bare ``accept()``).
+        """
+        if subprotocol is not None:
+            try:
+                await self.websocket.accept(subprotocol=subprotocol)
+            except TypeError:
+                # Some implementations don't accept the kwarg.
+                await self.websocket.accept()
+        else:
+            await self.websocket.accept()
+
         self._send_task = asyncio.create_task(
             self._send_loop(), name=f"ws-send-{self.id[:8]}"
         )
@@ -427,7 +466,13 @@ class Connection:
         code: WSCloseCode = WSCloseCode.NORMAL,
         reason: str = "",
     ) -> None:
-        """Close the connection cleanly. Idempotent."""
+        """Close the connection cleanly. Idempotent.
+
+        Idempotence is guaranteed by the ``_close_initiated`` guard: the
+        first caller owns the close, subsequent callers return
+        immediately. This is important because the manager, the send
+        loop, and the endpoint can all race to close a connection.
+        """
         if self._close_initiated:
             return
         self._close_initiated = True
@@ -438,7 +483,14 @@ class Connection:
             try:
                 await self._send_task
             except asyncio.CancelledError:
-                pass
+                # Distinguish the send task's cancellation (expected —
+                # we just cancelled it above) from our own cancellation
+                # (the caller of ``close()`` was cancelled). Re-raise
+                # only in the latter case so asyncio cancellation
+                # semantics are preserved.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling() > 0:
+                    raise
             except Exception:
                 _log.exception("Send loop raised during close")
 
@@ -471,13 +523,26 @@ class Connection:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No event loop — mark closed and let the manager reap it.
+            # No event loop — mark closed and let the manager reap it on
+            # the next heartbeat scan.
             self.closed = True
             return
         loop.create_task(
-            self.close(WSCloseCode.SLOW_CONSUMER, "client too slow"),
+            self._overflow_close_task(),
             name=f"ws-overflow-{self.id[:8]}",
         )
+
+    async def _overflow_close_task(self) -> None:
+        """Close the connection and notify the manager for deregistration."""
+        try:
+            await self.close(WSCloseCode.SLOW_CONSUMER, "client too slow")
+        finally:
+            cb = self._reap_callback
+            if cb is not None:
+                try:
+                    await cb(self)
+                except Exception:
+                    _log.exception("Reap callback raised during overflow")
 
     # ------------------------------------------------------------------
     # Subscription
@@ -648,6 +713,7 @@ class ConnectionManager:
         async with self._lock:
             if len(self._connections) >= self._config.max_connections:
                 at_capacity = True
+                conn: Connection | None = None
             else:
                 at_capacity = False
                 conn = Connection(
@@ -656,6 +722,7 @@ class ConnectionManager:
                     queue_size=self._config.queue_size,
                     heartbeat_interval_s=self._config.heartbeat_interval_s,
                 )
+                conn.set_reap_callback(self.disconnect)
                 if subscriptions is not None:
                     conn.subscriptions = set(subscriptions)
                 self._connections[conn.id] = conn
@@ -663,7 +730,7 @@ class ConnectionManager:
                 if len(self._connections) > self._peak_connections:
                     self._peak_connections = len(self._connections)
 
-        if at_capacity:
+        if at_capacity or conn is None:
             try:
                 await websocket.close(
                     code=int(WSCloseCode.TRY_AGAIN_LATER),
@@ -676,15 +743,13 @@ class ConnectionManager:
             )
 
         # 2) Accept + start the send loop (outside the lock).
+        #
+        # CRITICAL: always call ``conn.accept(...)`` — never call
+        # ``websocket.accept(...)`` directly here — otherwise the send
+        # loop and hello message are never started, and the client can
+        # never receive anything.
         try:
-            if subprotocol is not None:
-                try:
-                    await websocket.accept(subprotocol=subprotocol)
-                except TypeError:
-                    # Some implementations don't accept the kwarg.
-                    await websocket.accept()
-            else:
-                await conn.accept()
+            await conn.accept(subprotocol=subprotocol)
         except Exception:
             _log.exception("Failed to accept WebSocket {}", conn.id[:8])
             async with self._lock:
@@ -700,8 +765,20 @@ class ConnectionManager:
         )
         return conn
 
-    async def disconnect(self, connection: Connection) -> None:
-        """Deregister and close ``connection``. Idempotent."""
+    async def disconnect(
+        self,
+        connection: Connection,
+        *,
+        code: WSCloseCode = WSCloseCode.NORMAL,
+        reason: str = "server disconnect",
+    ) -> None:
+        """Deregister and close ``connection``. Idempotent.
+
+        The ``code`` / ``reason`` parameters are only used when this call
+        is the one that actually closes the connection (i.e. the
+        connection was not already closed by the send loop, an overflow,
+        or a concurrent caller).
+        """
         async with self._lock:
             existed = self._connections.pop(connection.id, None) is not None
         if existed:
@@ -712,7 +789,7 @@ class ConnectionManager:
             )
         if not connection.closed:
             try:
-                await connection.close(WSCloseCode.NORMAL, "server disconnect")
+                await connection.close(code, reason)
             except Exception:
                 _log.exception("Connection.close raised during disconnect")
 
@@ -974,15 +1051,26 @@ class ConnectionManager:
             reaped = 0
             for conn in snapshot:
                 if conn.closed:
+                    # Self-closed by the send loop (transport error) or
+                    # by an overflow task that raced us. Reap from the
+                    # registry — otherwise the slot leaks and eventually
+                    # saturates ``max_connections``.
+                    reaped += 1
+                    asyncio.create_task(
+                        self.disconnect(conn),
+                        name=f"ws-reap-{conn.id[:8]}",
+                    )
                     continue
                 elapsed = (now - conn.last_pong_at).total_seconds()
                 if elapsed > timeout:
                     reaped += 1
-                    # Schedule the close; do not block the heartbeat scan.
+                    # Schedule the close + deregistration; do not block
+                    # the heartbeat scan.
                     asyncio.create_task(
-                        conn.close(
-                            WSCloseCode.HEARTBEAT_TIMEOUT,
-                            "heartbeat timeout",
+                        self.disconnect(
+                            conn,
+                            code=WSCloseCode.HEARTBEAT_TIMEOUT,
+                            reason="heartbeat timeout",
                         ),
                         name=f"ws-hb-{conn.id[:8]}",
                     )
@@ -1004,9 +1092,11 @@ class BusBridgeConfig:
     Attributes:
         event_map: Mapping of ``event_bus_type -> ws_message_type``. Adding
             a new event to broadcast is a single entry.
-        require_role: Optional per-``ws_type`` minimum role — only
-            connections with at least this role receive the message.
-            Used for admin-only streams.
+        require_role: Optional per-``ws_type`` **minimum** role — only
+            connections with **at least** this role receive the message.
+            Used for admin-only streams. The comparison uses
+            :data:`_ROLE_RANK`, so ``USER`` implies ``USER`` or ``ADMIN``
+            and ``ADMIN`` implies ``ADMIN`` only.
         transform: Optional per-``event_bus_type`` function mapping the
             raw payload to the WS ``data`` dict. When absent, the raw
             payload is used as-is (after being coerced to ``dict``).
@@ -1056,18 +1146,37 @@ class BusBridge:
     def stop(self) -> None:
         """Unsubscribe from all events. Idempotent."""
         for bus_type, (handler, handle) in self._handles:
-            try:
-                unsubscribe = getattr(self._bus, "unsubscribe", None)
-                if unsubscribe is not None:
-                    # Both interfaces are possible in the codebase:
-                    # ``unsubscribe(event_type, handler)`` or
-                    # ``unsubscribe(handle)``. Try handle first.
-                    try:
-                        unsubscribe(handle)
-                    except TypeError:
-                        unsubscribe(bus_type, handler)
-            except Exception:
-                _log.debug("BusBridge unsubscribe failed for {!r}", bus_type)
+            unsubscribe = getattr(self._bus, "unsubscribe", None)
+            if unsubscribe is None:
+                continue
+            # Try the handle form first, but only if the bus actually
+            # returned a handle (``subscribe`` returns ``None`` on the
+            # default EventBus, in which case ``unsubscribe(None)`` is
+            # meaningless). Whatever the outcome — success, wrong
+            # signature, or error — fall through to the two-argument
+            # form as a last resort.
+            unsubscribed = False
+            if handle is not None:
+                try:
+                    unsubscribe(handle)
+                    unsubscribed = True
+                except TypeError:
+                    # Wrong signature — fall through.
+                    pass
+                except Exception:
+                    _log.debug(
+                        "BusBridge unsubscribe(handle) failed for {!r}",
+                        bus_type,
+                    )
+            if not unsubscribed:
+                try:
+                    unsubscribe(bus_type, handler)
+                except Exception:
+                    _log.debug(
+                        "BusBridge unsubscribe(event_type, handler) "
+                        "failed for {!r}",
+                        bus_type,
+                    )
         self._handles.clear()
         _log.info("BusBridge stopped")
 
@@ -1097,9 +1206,19 @@ class BusBridge:
                 data = {"value": raw_payload}
 
             message = WSMessage(type=ws_type, data=data)
-            roles = [require_role] if require_role is not None else None
             try:
-                await self._manager.broadcast(message, roles=roles)
+                if require_role is None:
+                    await self._manager.broadcast(message)
+                else:
+                    min_rank = _ROLE_RANK.get(require_role, 0)
+                    # ``require_role`` is documented as a *minimum*, so
+                    # accept every role ranked at or above it. Using
+                    # ``broadcast(roles=...)`` would do exact matching and
+                    # silently drop e.g. ADMIN recipients for a
+                    # ``require_role=USER`` stream.
+                    def _role_ok(c: Connection) -> bool:
+                        return _ROLE_RANK.get(c.auth.role, 0) >= min_rank
+                    await self._manager.broadcast(message, predicate=_role_ok)
             except Exception:
                 _log.exception(
                     "BusBridge broadcast failed for {!r} -> {!r}",

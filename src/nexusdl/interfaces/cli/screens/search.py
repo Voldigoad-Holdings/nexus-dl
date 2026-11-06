@@ -31,6 +31,25 @@ Results are **mounted incrementally** — a card appears as soon as its
 :class:`SearchResult` is yielded — so a slow site does not block the
 faster ones. The status bar updates the count as results arrive.
 
+Cancellation and epoch invalidation
+-----------------------------------
+Textual's ``@work(exclusive=True)`` cancels the previous worker when a
+new one starts, but the cancellation is **asynchronous**: a worker may
+still be inside its ``async for`` loop when ``_start_search`` returns.
+Without a defence, a worker cancelled *just after* the new search has
+emptied ``_results_by_manga_id`` could still mount a card for the old
+query — a card that would never map back to a result (the map no
+longer contains its ``manga_id``) and whose click would be a silent
+no-op.
+
+The screen therefore maintains an **epoch** counter,
+:attr:`_search_epoch`, incremented on every :meth:`_start_search` and
+:meth:`_clear_all`. The worker captures the epoch at entry and checks
+it before mounting each card; a mismatch means "the search this worker
+was running has been superseded" and the worker returns cleanly. This
+is a purely synchronous check — no reliance on Textual's scheduling
+guarantees — and it eliminates the ghost-card window entirely.
+
 Adult-content filter
 --------------------
 The screen's initial value of the adult-content filter is
@@ -68,7 +87,7 @@ if they were real values.
 
 Localisation
 ------------
-The screen introduces ten translation keys under ``search.*``:
+The screen introduces eleven translation keys under ``search.*``:
 
 * ``search.input.placeholder`` — the query input's placeholder.
 * ``search.button.clear`` — the clear button's label.
@@ -80,6 +99,13 @@ The screen introduces ten translation keys under ``search.*``:
 * ``search.status.empty`` — the "no results" message.
 * ``search.status.error`` — the "search failed" message, with the
   exception text interpolated.
+* ``search.status.error_with_count`` — the "search failed after N
+  result(s)" message, with both the exception text and the partial
+  result count interpolated. Used when the error happens *after* at
+  least one result has already been mounted — a user who sees five
+  cards and a "Search failed" status line without a count has no way
+  to tell whether the five cards are part of a failed search or a
+  stale render.
 
 A missing key renders the key verbatim, matching the contract every
 other widget and screen in this package follows. See
@@ -97,6 +123,15 @@ The parent screen handles the activation message with::
 
 The long handler name is the correct outcome of Textual's nested-
 message convention.
+
+Duplicate results
+-----------------
+A site can yield the same ``manga_id`` twice across pagination. The
+screen skips the duplicate at mount time — the first occurrence wins,
+both for the displayed card and for the id → result map. Skipping
+keeps the displayed card count equal to ``len(_results_by_manga_id)``
+and therefore to the number in the status bar; mounting both would
+make the status bar undercount relative to what the user sees.
 
 Dependency graph (no cycles)::
 
@@ -163,8 +198,9 @@ class SearchScreen(Screen[None]):
     """A Textual screen for searching mangas across every enabled site.
 
     See the module docstring for the streaming search contract, the
-    adult-content filter behaviour, the display-stub policy, and the
-    handler name for the activation message.
+    epoch invalidation, the adult-content filter behaviour, the
+    display-stub policy, and the handler name for the activation
+    message.
 
     Args:
         registry: The loaded site registry. Its
@@ -270,6 +306,12 @@ class SearchScreen(Screen[None]):
         )
         self._include_adult: bool = settings.content.allow_adult
         self._query: str = ""
+        #: Monotonic epoch, incremented on every new search and every
+        #: clear. The worker captures the epoch at entry and stops
+        #: mounting results as soon as the epoch changes. See the
+        #: module docstring's "Cancellation and epoch invalidation"
+        #: section.
+        self._search_epoch: int = 0
         #: ``manga_id`` → the :class:`SearchResult` the display stub was
         #: built from. Populated as results stream in; cleared on every
         #: new search. Used by :meth:`on_manga_card_selected` to map an
@@ -342,9 +384,12 @@ class SearchScreen(Screen[None]):
         :class:`SearchResultSelected` with it.
 
         A card whose stub id no longer maps to a result is ignored —
-        possible only if the results were cleared between the card
-        being mounted and the user pressing Enter, which the current
-        UI flow does not produce, but which the widget can survive.
+        this can happen only if the results were cleared between the
+        card being mounted and the user pressing Enter. The epoch
+        invalidation prevents the *mounting* of ghost cards, but a
+        user who clicks on a card in the same tick as the clear can
+        still produce a one-frame mismatch; the guard keeps that
+        click a silent no-op rather than a wrong manga launch.
         """
         result = self._results_by_manga_id.get(event.manga.id)
         if result is None:
@@ -364,33 +409,45 @@ class SearchScreen(Screen[None]):
 
         Extracted so the initial submission (from ``on_input_submitted``)
         and the adult-filter re-run (from ``_toggle_adult``) share the
-        same sequence: reset state, update the status line, then hand
-        off to the worker. ``@work(exclusive=True)`` handles canceling
-        any previous search.
+        same sequence: bump the epoch, reset state, update the status
+        line, then hand off to the worker. The epoch bump invalidates
+        any still-in-flight worker from a previous query; the
+        ``@work(exclusive=True)`` decorator also cancels the previous
+        worker, but the epoch check inside the worker's loop is what
+        guarantees no ghost card is mounted during the cancellation
+        window.
         """
         self._query = query
+        self._search_epoch += 1
+        epoch = self._search_epoch
         self._clear_results()
         self._set_status(
             self._translator.translate(
                 "search.status.searching", query=query
             )
         )
-        self._run_search(query)
+        self._run_search(query, epoch)
 
     @work(exclusive=True, group="search")
-    async def _run_search(self, query: str) -> None:
+    async def _run_search(self, query: str, epoch: int) -> None:
         """Consume ``search_all`` and mount a card for every yielded result.
 
         Runs on the app's event loop. The ``@work(exclusive=True)``
         decorator cancels a previous worker in the same group before
         starting this one, so a rapid sequence of submissions cannot
-        produce two concurrent searches against the same session.
+        produce two concurrent searches against the same session. The
+        ``epoch`` parameter is the second line of defence: even if the
+        previous worker is not yet cancelled when this one starts, its
+        own ``epoch != self._search_epoch`` check stops it from
+        mounting anything further.
 
         A ``CancelledError`` propagates untouched — the worker is
         cancelled by Textual's ownership rules when a new search
         starts or the screen is popped, and the generator's own
         ``finally`` block cleans up the in-flight per-site tasks.
-        Any other exception is caught and shown in the status line.
+        Any other exception is caught and shown in the status line,
+        with the partial result count if at least one card was
+        already mounted before the failure.
         """
         results_container = self.query_one(f"#{_ID_RESULTS}", VerticalScroll)
 
@@ -400,15 +457,30 @@ class SearchScreen(Screen[None]):
                 session=self._session,
                 include_adult=self._include_adult,
             ):
+                if epoch != self._search_epoch:
+                    # This worker has been superseded — stop cleanly.
+                    # The generator's own ``finally`` will cancel and
+                    # await the per-site tasks it started.
+                    return
                 self._mount_result(result, results_container)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — surfaced via status line
-            self._set_status(
-                self._translator.translate(
-                    "search.status.error", error=str(exc)
+            count = len(self._results_by_manga_id)
+            if count > 0:
+                self._set_status(
+                    self._translator.translate(
+                        "search.status.error_with_count",
+                        error=str(exc),
+                        count=count,
+                    )
                 )
-            )
+            else:
+                self._set_status(
+                    self._translator.translate(
+                        "search.status.error", error=str(exc)
+                    )
+                )
             return
 
         count = len(self._results_by_manga_id)
@@ -429,13 +501,19 @@ class SearchScreen(Screen[None]):
     def _mount_result(
         self, result: SearchResult, container: VerticalScroll
     ) -> None:
-        """Convert *result* to a display stub, register it, mount its card."""
+        """Convert *result* to a display stub, register it, mount its card.
+
+        Duplicate ``manga_id`` values (a site returning the same manga
+        twice across pagination) are skipped — the first occurrence
+        wins, both for the card and for the id → result map. Skipping
+        keeps the displayed card count equal to
+        ``len(_results_by_manga_id)`` and therefore to the number in
+        the status bar; mounting both would make the status bar
+        undercount relative to what the user sees.
+        """
         manga = _manga_from_search_result(result)
-        # Guard against a duplicate id — a site returning the same
-        # manga twice across pagination is possible in principle.
-        # The card is still mounted (it renders correctly), but the
-        # map keeps the latest result; the count and message both
-        # remain consistent with what the user sees.
+        if manga.id in self._results_by_manga_id:
+            return
         self._results_by_manga_id[manga.id] = result
         container.mount(MangaCard(manga, translator=self._translator))
 
@@ -451,7 +529,16 @@ class SearchScreen(Screen[None]):
             self._start_search(self._query)
 
     def _clear_all(self) -> None:
-        """Clear the input, the results, the query, and the status."""
+        """Clear the input, the results, the query, and the status.
+
+        Bumps the epoch so any still-in-flight worker stops mounting
+        results immediately, rather than waiting for Textual's
+        cancellation to take effect. Without the bump, a worker that
+        had already fetched a batch of results could mount them
+        *after* the clear, producing ghost cards that would never map
+        back to a result.
+        """
+        self._search_epoch += 1
         self.query_one(f"#{_ID_INPUT}", Input).value = ""
         self._query = ""
         self._clear_results()

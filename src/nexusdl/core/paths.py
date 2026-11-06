@@ -173,6 +173,18 @@ _ENV_FILENAME: Final[str] = ".env"
 #: "Documented duplication" section. A change here without a matching
 #: change in those modules (or vice versa) would fail the cross-check
 #: test that guards the three copies.
+#:
+#: The ``CBT`` extension is ``".tar"`` — the extension the tar archive
+#: produced by a ``CbtPackager`` would carry. The mapping is present
+#: regardless of whether the ``CbtPackager`` module ships in the
+#: current release: an operator who requests ``PackagingFormat.CBT``
+#: gets the correct path today, and a caller that checks
+#: ``chapter_output_path(..., PackagingFormat.CBT).exists()`` gets an
+#: answer consistent with whatever the worker writes. If the
+#: packager's on-disk naming convention ever changes (``.cbt`` instead
+#: of ``.tar``), the change must be applied to **all three** copies of
+#: this mapping in a single commit — the cross-check test will flag a
+#: partial update.
 _FORMAT_EXTENSIONS: Final[dict[PackagingFormat, str]] = {
     PackagingFormat.FOLDER: "",
     PackagingFormat.ZIP: ".zip",
@@ -372,10 +384,10 @@ def format_extension(format_: PackagingFormat) -> str:
     Matches :meth:`nexusdl.core.downloader.worker.DownloadWorker._compute_output_path`
     exactly — see the module docstring's "Documented duplication"
     section. ``FOLDER`` produces an empty extension (the target is a
-    directory, not a file); ``CBT`` produces ``".tar"`` even though no
-    ``CbtPackager`` ships in this release, so a caller that computes a
-    path for a future CBT packager already produces the correct
-    extension.
+    directory, not a file); ``CBT`` produces ``".tar"``, the extension
+    a tar archive carries. The CBT mapping is present regardless of
+    whether the ``CbtPackager`` module ships in this release — see the
+    :data:`_FORMAT_EXTENSIONS` constant's docstring.
 
     Args:
         format_: The packaging format.

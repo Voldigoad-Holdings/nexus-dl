@@ -41,11 +41,12 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Coroutine, Iterable, Mapping
 from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import customtkinter as ctk
 from loguru import logger as _logger
@@ -418,8 +419,20 @@ class AsyncBridge:
         pending = [t for t in asyncio.all_tasks() if t is not current]
         for t in pending:
             t.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        if not pending:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            _log.warning(
+                "AsyncBridge: {} task(s) ignored cancellation during drain",
+                len(pending),
+            )
+        except Exception:
+            _log.debug("AsyncBridge: drain raised")
 
 
 # ===========================================================================
@@ -451,6 +464,8 @@ class NexusDLApp(ctk.CTk):
         self._bridge = AsyncBridge()
         self._closing = False
         self._sites_cache: list[SiteConfig] = []
+        self._shutdown_future: ConcurrentFuture | None = None
+        self._shutdown_deadline: float = 0.0
 
         # --- Window setup ---
         self.title(self._labels.window_title)
@@ -491,13 +506,16 @@ class NexusDLApp(ctk.CTk):
     def _apply_theme_from_settings(self) -> None:
         settings = self._services.settings
 
+        mode: Literal["light", "dark"] = "dark"
         try:
-            mode = str(settings.gui.appearance_mode).lower()
+            raw = str(settings.gui.appearance_mode).lower()
         except Exception:
+            raw = "dark"
+        if raw == "light":
+            mode = "light"
+        elif raw == "dark":
             mode = "dark"
-        if mode not in ("light", "dark"):
-            mode = "dark"
-        apply_appearance_mode(mode)  # type: ignore[arg-type]
+        apply_appearance_mode(mode)
 
         try:
             theme_id = str(settings.gui.theme_id)
@@ -782,6 +800,15 @@ class NexusDLApp(ctk.CTk):
             return
         self._request_cover(data.card.cover_url, VIEW_LIBRARY, data.manga_id)
 
+    def _trigger_library_reload(self) -> None:
+        """Tk-thread callback: ask the library view to re-fetch its page."""
+        view = self._safe_get_view(VIEW_LIBRARY)
+        if view is not None and hasattr(view, "trigger_load"):
+            try:
+                view.trigger_load()
+            except Exception:
+                _log.exception("LibraryView.trigger_load raised")
+
     # ------------------------------------------------------------------
     # Covers
     # ------------------------------------------------------------------
@@ -979,18 +1006,36 @@ class NexusDLApp(ctk.CTk):
             task_id = payload.get("task_id")
             if not task_id:
                 return
+
+            raw_status = payload.get("status", DownloadStatus.RUNNING.value)
+            try:
+                status = DownloadStatus(raw_status)
+            except ValueError:
+                _log.warning(
+                    "download.progress: unknown status {!r}, defaulting to RUNNING",
+                    raw_status,
+                )
+                status = DownloadStatus.RUNNING
+
+            try:
+                completed = int(payload.get("completed") or 0)
+            except (TypeError, ValueError):
+                completed = 0
+            try:
+                sub_completed = int(payload.get("page_index") or 0)
+            except (TypeError, ValueError):
+                sub_completed = 0
+
             changes: dict[str, Any] = {
-                "status": DownloadStatus(
-                    payload.get("status", DownloadStatus.RUNNING.value)
-                ),
-                "completed": int(payload.get("completed", 0)),
+                "status": status,
+                "completed": completed,
                 "total": payload.get("total"),
-                "bytes_completed": int(payload.get("bytes_completed", 0)),
+                "bytes_completed": int(payload.get("bytes_completed") or 0),
                 "bytes_total": payload.get("bytes_total"),
                 "speed": payload.get("speed_bps"),
                 "eta_seconds": payload.get("eta_seconds"),
                 "sub_label": payload.get("chapter_label", ""),
-                "sub_completed": int(payload.get("page_index", 0)),
+                "sub_completed": sub_completed,
                 "sub_total": payload.get("page_count"),
                 "error": payload.get("error"),
             }
@@ -1024,6 +1069,42 @@ class NexusDLApp(ctk.CTk):
                 },
             )
 
+        async def _on_paused(event: Any) -> None:
+            payload = getattr(event, "payload", {}) or {}
+            task_id = payload.get("task_id")
+            if not task_id:
+                return
+            self._bridge.post(
+                self._apply_download_update,
+                task_id,
+                {"status": DownloadStatus.PAUSED},
+            )
+
+        async def _on_resumed(event: Any) -> None:
+            payload = getattr(event, "payload", {}) or {}
+            task_id = payload.get("task_id")
+            if not task_id:
+                return
+            self._bridge.post(
+                self._apply_download_update,
+                task_id,
+                {"status": DownloadStatus.RUNNING},
+            )
+
+        async def _on_cancelled(event: Any) -> None:
+            payload = getattr(event, "payload", {}) or {}
+            task_id = payload.get("task_id")
+            if not task_id:
+                return
+            self._bridge.post(
+                self._apply_download_update,
+                task_id,
+                {
+                    "status": DownloadStatus.CANCELLED,
+                    "error": payload.get("error"),
+                },
+            )
+
         async def _on_queue_paused(event: Any) -> None:
             payload = getattr(event, "payload", {}) or {}
             paused = bool(payload.get("paused", True))
@@ -1038,18 +1119,17 @@ class NexusDLApp(ctk.CTk):
             self._bridge.post(self._apply_site_health, site_id, health)
 
         async def _on_library_updated(_event: Any) -> None:
-            # Optional: trigger a refresh of the library view if visible.
-            view = self._safe_get_view(VIEW_LIBRARY)
-            if view is not None and hasattr(view, "trigger_load"):
-                try:
-                    self._bridge.post(view.trigger_load)
-                except Exception:
-                    pass
+            # Must NOT touch Tk here — we're on the async loop thread.
+            # Marshal to the Tk thread through the bridge.
+            self._bridge.post(self._trigger_library_reload)
 
         _subscribe(bus, "download.started", _on_started)
         _subscribe(bus, "download.progress", _on_progress)
         _subscribe(bus, "download.completed", _on_completed)
         _subscribe(bus, "download.failed", _on_failed)
+        _subscribe(bus, "download.paused", _on_paused)
+        _subscribe(bus, "download.resumed", _on_resumed)
+        _subscribe(bus, "download.cancelled", _on_cancelled)
         _subscribe(bus, "queue.paused", _on_queue_paused)
         _subscribe(bus, "site.health.changed", _on_health_changed)
         _subscribe(bus, "library.updated", _on_library_updated)
@@ -1104,6 +1184,12 @@ class NexusDLApp(ctk.CTk):
             return
         self._closing = True
 
+        # Hide the window immediately for better UX while we tear down.
+        try:
+            self.withdraw()
+        except Exception:
+            pass
+
         # 1) Persist UI state (still on Tk thread, safe).
         try:
             state = self._services.state_store.get("app", {})
@@ -1115,14 +1201,45 @@ class NexusDLApp(ctk.CTk):
         except Exception:
             _log.exception("Failed to persist app state")
 
-        # 2) Graceful async shutdown.
+        # 2) Schedule graceful async shutdown (non-blocking), then poll.
         shutdown = getattr(self._services, "on_shutdown_async", None)
         if shutdown is not None and callable(shutdown):
             try:
-                fut = self._bridge.run(shutdown())  # type: ignore[arg-type]
-                fut.result(timeout=3.0)
+                self._shutdown_future = self._bridge.run(shutdown())  # type: ignore[arg-type]
             except Exception:
-                _log.exception("services.on_shutdown_async raised or timed out")
+                _log.exception("Failed to schedule on_shutdown_async")
+                self._shutdown_future = None
+        else:
+            self._shutdown_future = None
+
+        self._shutdown_deadline = time.monotonic() + 3.0
+        self._poll_shutdown()
+
+    def _poll_shutdown(self) -> None:
+        fut = self._shutdown_future
+        if fut is not None:
+            if fut.done():
+                try:
+                    fut.result()
+                except Exception:
+                    _log.exception("services.on_shutdown_async raised")
+                self._shutdown_future = None
+            elif time.monotonic() > self._shutdown_deadline:
+                _log.warning(
+                    "on_shutdown_async timed out after 3s; cancelling"
+                )
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+                self._shutdown_future = None
+
+        if self._shutdown_future is not None:
+            try:
+                self.after(50, self._poll_shutdown)
+                return
+            except Exception:
+                self._shutdown_future = None
 
         # 3) Stop the async bridge.
         try:

@@ -56,6 +56,17 @@ The pool additionally tracks active contexts in a dict so that
 this is defense-in-depth, not a normal path: the ``acquire()`` contract
 already prevents leaks.
 
+Lifecycle serialisation
+-----------------------
+:meth:`start` and :meth:`stop` are serialised by an internal
+``_lifecycle_lock``. Without it, a concurrent ``start()`` running while
+``stop()`` is midway through ``browser.close()`` could launch a fresh
+browser only to have ``stop()`` finish by closing **that** browser and
+nulling the reference, leaving the pool in an inconsistent state. The
+lifecycle lock makes ``start`` and ``stop`` mutually exclusive; the
+public state lock (``_lock``) still protects the state observations
+that ``stats()`` and :meth:`acquire` make.
+
 Startup checks (Chromium install)
 ---------------------------------
 :meth:`start` verifies two things before declaring the pool ready:
@@ -110,6 +121,18 @@ timeouts. It **does** bound two operations of its own:
   own ``launch()`` timeout (30 s); a browser that cannot launch in that
   window is genuinely broken.
 
+Diagnostic accuracy
+-------------------
+The counters exposed by :meth:`stats` and the ``active_contexts`` count
+embedded in timeout error messages are read under the state lock.
+A slightly stale ``active_contexts`` (one acquire racing another) is
+acceptable — it is diagnostic information, not a correctness guarantee
+— but it is **never** corrupted. The two counters
+(``total_acquires``, ``total_timeouts``) are incremented inside the
+state lock for the same reason: a counter read from :meth:`stats`
+while an acquire is completing must be either the pre- or post-value,
+not a half-updated one.
+
 Dependency graph (no cycles)::
 
     core.exceptions      ─┐
@@ -130,7 +153,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 from loguru import logger
 
@@ -265,9 +288,8 @@ class PlaywrightPool:
             Cloudflare deployments fingerprint it) or when the site
             expects a specific mobile UA.
         viewport: ``(width, height)`` in pixels for the browser context.
-            Defaults to :data:`_DEFAULT_VIEWPORT`. Reduced
-            desktop-vs-mobile misrouting and keeps memory per context
-            predictable.
+            Defaults to ``(1920, 1080)``. Reduced desktop-vs-mobile
+            misrouting and keeps memory per context predictable.
         browser_args: Extra Chromium command-line arguments. When empty
             (the default), :data:`_DEFAULT_BROWSER_ARGS` is used.
             Providing an explicit tuple **replaces** the defaults, so a
@@ -284,6 +306,7 @@ class PlaywrightPool:
         "_browser",
         "_browser_args",
         "_headless",
+        "_lifecycle_lock",
         "_lock",
         "_max_contexts",
         "_playwright",
@@ -337,14 +360,26 @@ class PlaywrightPool:
         #: Tracks every context currently handed out to a caller, keyed by
         #: ``id(context)``. Only used by :meth:`stop` to force-close
         #: contexts a caller forgot to release — the normal path is
-        #: :meth:`acquire`'s ``finally``.
+        #: :meth:`acquire`'s ``finally``. Every read of this dict from a
+        #: public method must be under :attr:`_lock`; the only exception
+        #: is :meth:`acquire`'s own finally block, which mutates it and
+        #: has already been holding the lock.
         self._active_contexts: dict[int, BrowserContext] = {}
 
         self._semaphore = asyncio.Semaphore(max_contexts)
         self._lock = asyncio.Lock()
+        # Serialises ``start`` and ``stop`` so a concurrent start cannot
+        # race a still-in-progress stop and overwrite the browser
+        # reference the stop is about to null. Held for the full
+        # duration of each lifecycle operation (which may include
+        # ``await`` on Playwright I/O); the state lock protects only
+        # short observations.
+        self._lifecycle_lock = asyncio.Lock()
         self._started: bool = False
 
-        # Cumulative counters, exposed by ``stats()``.
+        # Cumulative counters, exposed by ``stats()``. Incremented under
+        # ``_lock`` (see :meth:`stats` docstring and module docstring's
+        # "Diagnostic accuracy" section).
         self._total_contexts_created: int = 0
         self._total_acquires: int = 0
         self._total_timeouts: int = 0
@@ -360,6 +395,12 @@ class PlaywrightPool:
         integration, and launches a headless Chromium. Subsequent calls
         return immediately without launching anything.
 
+        Serialised against :meth:`stop` by an internal lifecycle lock:
+        a ``start()`` concurrent with a ``stop()`` will run **after**
+        the stop completes, not interleaved with it. This is what makes
+        ``await pool.stop(); await pool.start()`` safe even when an
+        ``acquire()`` is still unwinding in another task.
+
         Raises:
             NexusDLPlaywrightError: If Playwright is not installed, if
                 Chromium is not installed (the message names the
@@ -368,9 +409,10 @@ class PlaywrightPool:
                 state — no leaked Playwright instance, no half-launched
                 browser.
         """
-        async with self._lock:
-            if self._started:
-                return
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if self._started:
+                    return
 
             try:
                 from playwright.async_api import (
@@ -412,9 +454,10 @@ class PlaywrightPool:
                     f"'playwright install chromium'"
                 ) from exc
 
-            self._playwright = playwright
-            self._browser = browser
-            self._started = True
+            async with self._lock:
+                self._playwright = playwright
+                self._browser = browser
+                self._started = True
             _log.info(
                 "Playwright pool started (headless={}, max_contexts={})",
                 self._headless,
@@ -430,22 +473,33 @@ class PlaywrightPool:
         swallowed — the pool is shutting down and raising cannot help
         anything.
 
+        Serialised against :meth:`start` by the lifecycle lock, so a
+        ``start()`` that runs concurrently will wait for the stop to
+        complete before launching a new browser. The ``_started`` flag
+        is flipped to ``False`` **after** cleanup, not before: a caller
+        that inspects ``is_started`` mid-stop sees ``True`` (the pool is
+        still tearing down), which matches what a "the pool is being
+        stopped" observation should return.
+
         After ``stop()`` returns, the pool is in a stopped state and may
         be restarted with a fresh :meth:`start` call. The cumulative
         counters are preserved across restarts; only
         :attr:`PlaywrightPoolStats.total_contexts_created` continues to
         accumulate.
         """
-        async with self._lock:
-            if not self._started:
-                return
-            self._started = False
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if not self._started:
+                    return
+                # Snapshot the resources so cleanup runs without holding
+                # the state lock (cleanup awaits, and the lock must be
+                # released to avoid blocking stats() for seconds).
+                active = list(self._active_contexts.values())
+                browser = self._browser
+                playwright = self._playwright
+                self._active_contexts.clear()
 
-            # Force-close any contexts the caller forgot. The dict is
-            # cleared even if individual closes fail — a browser.close()
-            # follows and closes everything server-side regardless.
-            active = list(self._active_contexts.values())
-            self._active_contexts.clear()
+            # Close every leftover context.
             for context in active:
                 try:
                     await context.close()
@@ -458,9 +512,10 @@ class PlaywrightPool:
                         exc,
                     )
 
-            if self._browser is not None:
+            # Close the browser.
+            if browser is not None:
                 try:
-                    await self._browser.close()
+                    await browser.close()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -469,12 +524,11 @@ class PlaywrightPool:
                         type(exc).__name__,
                         exc,
                     )
-                finally:
-                    self._browser = None
 
-            if self._playwright is not None:
+            # Stop the Playwright driver.
+            if playwright is not None:
                 try:
-                    await self._playwright.stop()
+                    await playwright.stop()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -483,9 +537,14 @@ class PlaywrightPool:
                         type(exc).__name__,
                         exc,
                     )
-                finally:
-                    self._playwright = None
 
+            # Only now clear the state — cleanup is done, resources are
+            # closed, and a fresh ``start()`` (which cannot run until
+            # the lifecycle lock is released) will find a clean slate.
+            async with self._lock:
+                self._browser = None
+                self._playwright = None
+                self._started = False
             _log.info("Playwright pool stopped")
 
     # ------------------------------------------------------------------ #
@@ -529,22 +588,29 @@ class PlaywrightPool:
                 the number of active contexts, so a caller that logs the
                 exception immediately sees why it waited.
         """
-        if not self._started:
-            raise NexusDLPlaywrightError(
-                "PlaywrightPool.acquire() called before start(); "
-                "the composition root must await pool.start() during "
-                "startup"
-            )
-        if self._browser is None:
-            raise NexusDLPlaywrightError(
-                "PlaywrightPool internal error: browser is None after "
-                "start(); the pool is in an inconsistent state"
-            )
-        if not self._browser.is_connected():
-            raise NexusDLPlaywrightError(
-                "Playwright browser has disconnected; call "
-                "pool.stop() then pool.start() to recover"
-            )
+        # Snapshot state under the lock so we do not race a concurrent
+        # ``stop()``. The ``browser`` and ``is_started`` checks below
+        # are the same checks the original code performed — the only
+        # difference is that they are read as a coherent pair.
+        async with self._lock:
+            if not self._started:
+                raise NexusDLPlaywrightError(
+                    "PlaywrightPool.acquire() called before start(); "
+                    "the composition root must await pool.start() during "
+                    "startup"
+                )
+            browser = self._browser
+            if browser is None:
+                raise NexusDLPlaywrightError(
+                    "PlaywrightPool internal error: browser is None after "
+                    "start(); the pool is in an inconsistent state"
+                )
+            if not browser.is_connected():
+                raise NexusDLPlaywrightError(
+                    "Playwright browser has disconnected; call "
+                    "pool.stop() then pool.start() to recover"
+                )
+            active_snapshot = len(self._active_contexts)
 
         effective_timeout = (
             timeout if timeout is not None else self._timeout_ms / 1000.0
@@ -555,10 +621,12 @@ class PlaywrightPool:
         # to the acquire, not to the caller's block.
         if effective_timeout <= 0:
             if self._semaphore.locked():
-                self._total_timeouts += 1
+                async with self._lock:
+                    self._total_timeouts += 1
+                    active_snapshot = len(self._active_contexts)
                 raise SessionTimeoutError(
                     f"Playwright pool acquire timed out immediately "
-                    f"(active={len(self._active_contexts)}, "
+                    f"(active={active_snapshot}, "
                     f"max={self._max_contexts})"
                 )
             await self._semaphore.acquire()
@@ -568,20 +636,19 @@ class PlaywrightPool:
                     self._semaphore.acquire(), timeout=effective_timeout
                 )
             except TimeoutError as exc:
-                self._total_timeouts += 1
+                async with self._lock:
+                    self._total_timeouts += 1
+                    active_snapshot = len(self._active_contexts)
                 raise SessionTimeoutError(
                     f"Playwright pool acquire timed out after "
                     f"{effective_timeout:.1f}s "
-                    f"(active={len(self._active_contexts)}, "
+                    f"(active={active_snapshot}, "
                     f"max={self._max_contexts})"
                 ) from exc
 
         context: BrowserContext | None = None
         try:
-            # ``_started`` is True and ``_browser`` is non-None here — the
-            # checks above guarantee it. The ``type: ignore`` would be
-            # needed only if the assertions were removed.
-            context = await self._browser.new_context(
+            context = await browser.new_context(
                 user_agent=self._user_agent,
                 viewport={
                     "width": self._viewport[0],
@@ -636,9 +703,9 @@ class PlaywrightPool:
 
         Returns:
             A :class:`PlaywrightPoolStats` reflecting the current
-            state. Safe to call at any time, from any coroutine —
-            reads are lock-free once the ``_active_contexts`` dict
-            has been copied under the lock.
+            state. Safe to call at any time, from any coroutine — the
+            ``_active_contexts`` dict is read under the state lock so
+            the counts are coherent with the rest of the snapshot.
         """
         async with self._lock:
             return PlaywrightPoolStats(
@@ -661,7 +728,15 @@ class PlaywrightPool:
         return self._max_contexts
 
     def __repr__(self) -> str:
-        """Return a compact debug representation."""
+        """Return a compact debug representation.
+
+        ``active`` is read without a lock for two reasons: this is
+        called by interactive debugging tools (``repr`` in a REPL),
+        where awaiting a lock is not an option, and the value is
+        diagnostic only — a stale count is acceptable, a corrupted one
+        is not, and ``len()`` on a dict is atomic in CPython. See the
+        module docstring's "Diagnostic accuracy" section.
+        """
         return (
             f"PlaywrightPool(started={self._started}, "
             f"max_contexts={self._max_contexts}, "

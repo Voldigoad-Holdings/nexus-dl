@@ -8,8 +8,8 @@ from :mod:`nexusdl.interfaces.cli.widgets` plus Textual's own
 primitives; none reimplements what another screen or a widget
 provides.
 
-Seven screens, one root
------------------------
+Seven screens, one protocol, one root
+-------------------------------------
 * :class:`~nexusdl.interfaces.cli.screens.main.MainScreen` — the
   **root dashboard**. The first screen the app pushes at startup and
   the one every other screen is pushed from. It surfaces the app's
@@ -22,8 +22,8 @@ Seven screens, one root
 * :class:`~nexusdl.interfaces.cli.screens.library.LibraryScreen` — the
   collection viewer. Browse and search across the local library,
   paginated, activated by any manga card the user opens.
-* :class:`~nexusdl.interfaces.cli.screens.download.DownloadScreen` —
-  the execution surface. Selects chapters, picks a packaging format,
+* :class:`~nexusdl.interfaces.cli.screens.download.DownloadScreen` — the
+  execution surface. Selects chapters, picks a packaging format,
   starts a download, and shows the live progress panel.
 * :class:`~nexusdl.interfaces.cli.screens.settings.SettingsScreen` — a
   read-only inspector of the loaded :class:`~nexusdl.core.config.Settings`.
@@ -31,6 +31,17 @@ Seven screens, one root
   full-screen host for the live log stream.
 * :class:`~nexusdl.interfaces.cli.screens.help.HelpScreen` — the
   keyboard-shortcut catalog.
+
+The eighth export is **not** a screen:
+:class:`~nexusdl.interfaces.cli.screens.logs.LogRouter` is a structural
+:class:`typing.Protocol` the composition root implements to route log
+entries to the currently attached viewers. It is re-exported here
+because a caller that wires up the log subsystem (the composition
+root, and any test that injects a stub router) needs the type to
+satisfy ``mypy --strict`` — and importing it from
+:mod:`~nexusdl.interfaces.cli.screens.logs` directly is less
+discoverable than importing it from the package's top level alongside
+the seven screens.
 
 **Navigation is centralised.** ``MainScreen`` is the only file in this
 package that imports another screen from the package. Every other
@@ -50,9 +61,11 @@ Every screen in this package follows the same contract:
   the :class:`~nexusdl.core.downloader.manager.DownloadManager`,
   the :class:`~nexusdl.core.library.database.LibraryDatabase`, the
   shared :class:`~nexusdl.core.events.EventBus`, the
-  :class:`~nexusdl.core.session.http_session.HttpSession`, and the
-  :class:`~nexusdl.core.config.Settings`. A screen never constructs
-  its own service.
+  :class:`~nexusdl.core.session.http_session.HttpSession`,
+  the :class:`~nexusdl.core.config.Settings`, and — for
+  :class:`~nexusdl.interfaces.cli.screens.main.MainScreen` only —
+  the :class:`~nexusdl.interfaces.cli.screens.logs.LogRouter`. A
+  screen never constructs its own service.
 * **Translator injection.** Every screen accepts an optional
   ``translator: Translator | None`` argument; when ``None``, the
   process-wide default from :func:`~nexusdl.core.i18n.get_default_translator`
@@ -80,14 +93,17 @@ screen stack.
 Composition example
 -------------------
 The composition root wires the app and pushes the main screen at
-startup::
+startup. Every service the screens need is constructed by the app and
+injected::
 
     from nexusdl.core.config import Settings
-    from nexusdl.core.library.database import LibraryDatabase
     from nexusdl.core.downloader.manager import DownloadManager
+    from nexusdl.core.events import EventBus
+    from nexusdl.core.library.database import LibraryDatabase
     from nexusdl.core.registry.site_registry import SiteRegistry
     from nexusdl.core.session.http_session import HttpSession
     from nexusdl.interfaces.cli.screens import MainScreen
+    from nexusdl.interfaces.cli.screens.logs import LogRouter
 
     class NexusDLApp(App[None]):
         def __init__(
@@ -98,6 +114,8 @@ startup::
             database: LibraryDatabase,
             manager: DownloadManager,
             session: HttpSession,
+            event_bus: EventBus,
+            log_router: LogRouter,
         ) -> None:
             super().__init__()
             self._settings = settings
@@ -105,9 +123,8 @@ startup::
             self._database = database
             self._manager = manager
             self._session = session
-            # ``event_bus`` and ``log_router`` are also held by the app;
-            # see :mod:`nexusdl.core.events` and
-            # :mod:`nexusdl.interfaces.cli.screens.logs`.
+            self._event_bus = event_bus
+            self._log_router = log_router
 
         def on_mount(self) -> None:
             self.push_screen(MainScreen(
@@ -117,7 +134,15 @@ startup::
                 manager=self._manager,
                 session=self._session,
                 event_bus=self._event_bus,
+                log_router=self._log_router,
             ))
+
+The `event_bus` and `log_router` are held by the app because
+``MainScreen`` passes both through to its destination screens — see
+:class:`~nexusdl.interfaces.cli.screens.main.MainScreen`'s
+``action_goto_library`` and ``action_goto_logs``. A test that
+constructs ``MainScreen`` directly must supply both; the composition
+root above is the canonical source of them.
 
 Import cost
 -----------
@@ -134,6 +159,13 @@ and pay only for that screen's dependencies. In practice every consumer
 of this package is the TUI app, which pushes ``MainScreen`` and pulls
 in the entire graph through its imports; the submodule path is a test
 convenience.
+
+The eager import here — no PEP 562 ``__getattr__`` lazy loading, unlike
+:mod:`nexusdl.core` and :mod:`nexusdl.core.session` — is **deliberate**.
+Those packages are consumed by many callers that may want a single
+lightweight symbol; this package is consumed by exactly one caller (the
+TUI app) that always wants all seven screens. The lazy machinery would
+be dead weight.
 
 Stability
 ---------

@@ -16,13 +16,19 @@ Security model
 * **File permissions** — ``chmod 600`` on every write. On POSIX, only
   the owning user can read or modify the file. On Windows, the
   corresponding permission bit is set but the semantics differ; the
-  encryption is the real defense on every platform.
+  encryption is the real defense on every platform. On POSIX, a
+  failed ``chmod`` raises — a cookie file world-readable is a security
+  defect, not a warning.
 * **Debug-safe reprs** — :class:`CookieEntry` redacts its value in
   ``repr`` and ``str``. Logging a full cookie jar by accident prints
   ``value='***'`` instead of the session token.
 * **In memory** — cookie values are plain :class:`str`. The
   encryption protects them **at rest**; runtime access is limited by
   process isolation, which is the OS's job, not this module's.
+* **Value validation** — cookie values are validated on construction:
+  CR/LF/NUL are rejected (header injection / protocol errors), and
+  semicolons are rejected (they would smuggle a second cookie when
+  the value is interpolated into the ``Cookie`` header).
 
 Encryption is not optional. A deployment that wants a plaintext file is
 one bad configuration away from leaking every auth token on the host, and
@@ -38,7 +44,11 @@ The effective cookie jar for a site is the **union** of two layers:
 2. **Environment variables** — cookies injected by the operator via
    ``NEXUSDL_<SITE>_<COOKIE>=value``, typically used to seed a
    Cloudflare clearance or a manually-obtained session token before the
-   first request.
+   first request. The ``NEXUSDL_`` prefix is matched case-insensitively
+   (matching :class:`~nexusdl.core.config.Settings`'s
+   ``case_sensitive=False``); the site id is matched case-insensitively
+   against ``known_sites``; the cookie name is preserved in its original
+   case.
 
 **Environment variables win over the file.** Rationale: an operator who
 sets ``NEXUSDL_MANGADEX_cf_clearance=xyz`` in ``.env`` wants that exact
@@ -112,7 +122,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -145,7 +155,9 @@ __all__ = [
 FILE_VERSION: Final[int] = 1
 
 #: Prefix for environment-variable cookie overrides. See
-#: :func:`_parse_env_cookies` for the exact format.
+#: :func:`_parse_env_cookies` for the exact format. Matched
+#: case-insensitively against the env var name (matching
+#: ``Settings.case_sensitive=False``).
 ENV_PREFIX: Final[str] = "NEXUSDL_"
 
 #: Default threshold, in seconds, for :meth:`CookieManager.needs_refresh`.
@@ -157,6 +169,14 @@ DEFAULT_REFRESH_THRESHOLD_SECONDS: Final[float] = 3600.0
 #: Number of bytes of the Fernet key. Fernet requires a 32-byte URL-safe
 #: base64 string (44 characters including padding).
 _FERNET_KEY_LENGTH: Final[int] = 44
+
+#: Characters that must never appear in a cookie value: CR/LF/NUL break
+#: the HTTP header protocol, and ``;`` would smuggle a second cookie
+#: through the ``Cookie:`` header interpolation done by
+#: :class:`~nexusdl.core.session.http_session.HttpSession`.
+_FORBIDDEN_VALUE_CHARS: Final[frozenset[str]] = frozenset(
+    {"\r", "\n", "\0", ";"}
+)
 
 _log = logger.bind(component="session.cookie")
 
@@ -174,8 +194,17 @@ class CookieEntry:
     boundary is the on-disk file, not the in-memory object. The
     :meth:`__repr__` redacts the value so a log line never leaks a token.
 
+    **Value validation.** The value is checked at construction time for
+    characters that would corrupt the ``Cookie`` header when the
+    session interpolates it (CR, LF, NUL) and for ``;`` which would
+    smuggle a second cookie into the header. This protects against
+    server-side attacks (a malicious ``Set-Cookie``) and operator
+    mistakes (a malformed env override). Rejected values raise
+    :class:`ValueError`; the error message redacts the value.
+
     Attributes:
         value: The cookie's value, as it goes into the ``Cookie`` header.
+            Must not contain CR, LF, NUL, or ``;``.
         expires_at: Optional Unix timestamp (seconds) at which the cookie
             becomes invalid. ``None`` means "session cookie" — valid
             until the process exits. A numeric value means the server
@@ -187,6 +216,33 @@ class CookieEntry:
 
     value: str
     expires_at: float | None = None
+
+    def __post_init__(self) -> None:
+        """Validate the cookie value.
+
+        Raises:
+            TypeError: If ``value`` is not a :class:`str`.
+            ValueError: If ``value`` contains CR, LF, NUL, or ``;``.
+                The error message includes the offending character
+                category but never the value itself.
+        """
+        if not isinstance(self.value, str):
+            raise TypeError(
+                f"CookieEntry.value must be a str, got "
+                f"{type(self.value).__name__}"
+            )
+        for char in _FORBIDDEN_VALUE_CHARS:
+            if char in self.value:
+                category = {
+                    "\r": "CR",
+                    "\n": "LF",
+                    "\0": "NUL",
+                    ";": "semicolon (would smuggle a second cookie)",
+                }[char]
+                raise ValueError(
+                    f"cookie value contains a forbidden {category}; "
+                    f"refusing to construct CookieEntry"
+                )
 
     def is_expired(
         self,
@@ -518,10 +574,16 @@ class CookieManager:
         :meth:`Path.replace`'d onto the final path. A crash or I/O
         failure at any point leaves the previous file intact.
 
+        On POSIX, a failed ``chmod`` **raises** :class:`CookieEncryptionError`
+        — a cookie file readable by other users on the host is a
+        security defect, not a warning. On Windows, the failure is
+        logged at DEBUG (the underlying ``os.chmod`` sets the read-only
+        bit, which is cosmetic; the encryption layer provides the real
+        protection).
+
         Raises:
-            CookieEncryptionError: If serialization or encryption fails
-                (a symptom of a bug — the in-memory data is already
-                validated at construction time).
+            CookieEncryptionError: If serialization or encryption fails,
+                or if ``chmod`` fails on POSIX.
             OSError: If the file cannot be written. The previous file
                 (if any) is preserved.
         """
@@ -547,9 +609,13 @@ class CookieManager:
                     fh.write(ciphertext)
                     fh.flush()
                     os.fsync(fh.fileno())
+                # chmod BEFORE replace: the final path must never be
+                # visible with default umask. On POSIX a failure here
+                # is fatal (see docstring); on Windows it is a
+                # best-effort no-op.
                 _chmod_owner_only(temp_path)
                 temp_path.replace(self._path)
-            except OSError:
+            except (OSError, CookieEncryptionError):
                 temp_path.unlink(missing_ok=True)
                 raise
 
@@ -784,6 +850,11 @@ class CookieManager:
             cookies: The cookie values to merge in. A value of ``str`` is
                 treated as a session cookie; a ``CookieEntry`` carries
                 its own expiry.
+
+        Raises:
+            ValueError: If a cookie name is not a non-empty string, or
+                if a value (after coercion to :class:`CookieEntry`)
+                contains a forbidden character (CR, LF, NUL, ``;``).
         """
         with self._lock:
             existing = self._site_cookies.setdefault(site_id, {})
@@ -907,11 +978,24 @@ def _coerce_entry(
     Raises:
         TypeError: If *value* is neither a string nor a
             :class:`CookieEntry`.
+        ValueError: If the resulting :class:`CookieEntry` fails value
+            validation (CR/LF/NUL/semicolon).
     """
     if isinstance(value, CookieEntry):
+        # A caller-constructed entry has already passed validation in
+        # its own __post_init__; re-validating is unnecessary.
         return value
     if isinstance(value, str):
-        return CookieEntry(value=value, expires_at=None)
+        # Construction runs __post_init__, which rejects forbidden
+        # characters. The error message references the site/cookie
+        # names so the operator can identify the offending Set-Cookie.
+        try:
+            return CookieEntry(value=value, expires_at=None)
+        except ValueError as exc:
+            raise ValueError(
+                f"cookie {cookie_name!r} for site {site_id!r} has an "
+                f"invalid value: {exc}"
+            ) from exc
     raise TypeError(
         f"cookie {cookie_name!r} for site {site_id!r} must be a str "
         f"or CookieEntry, got {type(value).__name__}"
@@ -927,7 +1011,9 @@ def _parse_entry(
     """Parse one cookie entry from a loaded JSON document.
 
     Raises:
-        CookieEncryptionError: If the entry has the wrong shape.
+        CookieEncryptionError: If the entry has the wrong shape, or if
+            the value contains a forbidden character (a defensive check
+            against a corrupted or malicious file).
     """
     if not isinstance(raw, dict):
         raise CookieEncryptionError(
@@ -948,10 +1034,20 @@ def _parse_entry(
             f"{cookie_name!r} has an invalid expires_at "
             f"({type(expires_at).__name__})"
         )
-    return CookieEntry(
-        value=value,
-        expires_at=float(expires_at) if expires_at is not None else None,
-    )
+    try:
+        return CookieEntry(
+            value=value,
+            expires_at=float(expires_at) if expires_at is not None else None,
+        )
+    except ValueError as exc:
+        # A corrupted file, or a file written by an older version that
+        # did not enforce value validation. Treat as a load failure so
+        # the operator is forced to investigate, rather than silently
+        # accepting a value that will break the Cookie header.
+        raise CookieEncryptionError(
+            f"cookie file {path}: site {site_id!r} cookie "
+            f"{cookie_name!r} has an invalid value: {exc}"
+        ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -962,22 +1058,34 @@ def _parse_entry(
 def _chmod_owner_only(path: Path) -> None:
     """Set *path*'s permissions to owner-read-write-only (``0600``).
 
-    Best-effort. On POSIX the call succeeds and the file's mode is set
-    precisely. On Windows the underlying :func:`os.chmod` sets the
-    read-only bit but does not enforce user-only access; the encryption
-    layer is the real protection there, and the check is not treated as
-    an error.
+    On POSIX, a failure raises :class:`CookieEncryptionError` — a
+    cookie file readable by other users on the host is a security
+    defect, not a warning, and the caller must know. On Windows, the
+    underlying :func:`os.chmod` sets the read-only bit which is
+    cosmetic (the OS-level ACL model provides the real protection);
+    a failure there is logged at ``DEBUG`` and swallowed.
 
     Args:
         path: The file whose permissions to set.
+
+    Raises:
+        CookieEncryptionError: On POSIX, if :func:`os.chmod` raises
+            :class:`OSError`.
     """
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
     except OSError as exc:
-        # Silently tolerate: on Windows this may set the read-only bit
-        # and the encryption layer provides the real protection. On a
-        # POSIX filesystem this is a genuine failure but does not block
-        # the save — the caller sees an Info-level note.
+        if os.name == "posix":
+            raise CookieEncryptionError(
+                f"could not set 0600 permissions on {path}: "
+                f"{type(exc).__name__}: {exc}. On POSIX this leaves "
+                f"the cookie file readable by other users on the host. "
+                f"Check the filesystem's permission model (a read-only "
+                f"mount, an unusual umask, or a FUSE mount that does "
+                f"not support chmod)."
+            ) from exc
+        # Windows: chmod sets the read-only bit; the encryption layer
+        # is the real protection. Not worth a warning.
         _log.debug(
             "Could not set 0600 permissions on {}: {}: {}",
             path,
@@ -1004,6 +1112,10 @@ def _parse_env_cookies(
     where ``<SITE_ID>`` matches one of *known_sites* (case-insensitive)
     and ``<COOKIE_NAME>`` is the cookie name **in its original case**
     (mixed case is common: ``cf_clearance`` vs ``PHPSESSID``).
+
+    The ``NEXUSDL_`` prefix is matched **case-insensitively**, matching
+    ``Settings.case_sensitive=False``. A ``.env`` written entirely in
+    lowercase (a common 12-factor convention) therefore still works.
 
     Because site ids may contain underscores, the parser disambiguates
     by trying the longest matching site id first. For example, with
@@ -1035,11 +1147,15 @@ def _parse_env_cookies(
     site_lookup = {site.lower(): site for site in sorted_sites}
 
     result: dict[str, dict[str, str]] = {}
+    prefix_upper = ENV_PREFIX.upper()
     prefix_len = len(ENV_PREFIX)
 
     for var_name, var_value in env.items():
-        if not var_name.startswith(ENV_PREFIX):
+        # Case-insensitive prefix match (Settings is case-insensitive).
+        if var_name[:prefix_len].upper() != prefix_upper:
             continue
+        # Extract the remainder preserving the cookie name's original
+        # case — ``cf_clearance`` must remain lowercase.
         remainder = var_name[prefix_len:]
         if not remainder:
             continue
@@ -1065,6 +1181,20 @@ def _parse_env_cookies(
                 var_name,
             )
             continue
+
+        # A cookie name that still contains an underscore may indicate
+        # a `known_sites` misconfiguration (a site id with an
+        # underscore that was not registered). Log at DEBUG so the
+        # operator can see the interpretation the parser chose.
+        if "_" in matched_cookie:
+            _log.debug(
+                "Env cookie {!r} parsed as site={!r}, cookie={!r}; "
+                "the cookie name contains '_', which may indicate a "
+                "missing site in known_sites",
+                var_name,
+                matched_site,
+                matched_cookie,
+            )
 
         result.setdefault(matched_site, {})[matched_cookie] = var_value
 

@@ -7,11 +7,11 @@ one-per-item to build its page.
 
 The widget is **display-plus-activation**: it renders the manga it was
 constructed with, and it posts a :class:`MangaCard.Selected` message
-when the user activates it — either by pressing ``Enter`` / ``Space``
-while it is focused, or by clicking on it. It does not navigate, does
-not fetch data, and does not react to events from the rest of the
-pipeline. Navigation belongs to the parent screen; the card's job stops
-at "the user picked this manga".
+when the user activates it — either by pressing ``Enter`` while it is
+focused, or by clicking on it. It does not navigate, does not fetch
+data, and does not react to events from the rest of the pipeline.
+Navigation belongs to the parent screen; the card's job stops at "the
+user picked this manga".
 
 What the card shows
 -------------------
@@ -44,12 +44,17 @@ Two activation paths, one message:
 
 * **Keyboard** — when the card has focus (it is focusable via
   ``can_focus = True`` and the parent screen's focus navigation), the
-  ``Enter`` and ``Space`` bindings fire :meth:`MangaCard.action_select`,
-  which posts :class:`MangaCard.Selected`.
-* **Mouse** — a click fires ``on_click``, which delegates to the same
-  action. A click **also** focuses the card (Textual's default
-  behaviour for focusable widgets) before the message is posted, so a
-  subsequent keyboard activation acts on the just-clicked card.
+  ``Enter`` binding fires :meth:`MangaCard.action_select`, which posts
+  :class:`MangaCard.Selected`. The ``Space`` binding is **not** on the
+  card: ``Space`` is reserved for page-down scrolling in the
+  scrollable card list, and binding it to activation would surprise a
+  user who is used to ``less``-style scroll keys. A parent screen that
+  wants ``Space`` for activation can add it via its own ``BINDINGS``.
+* **Mouse** — a click fires ``on_click(event)``, which stops the
+  event from bubbling to the parent and delegates to the same action.
+  A click **also** focuses the card (Textual's default behaviour for
+  focusable widgets) before the message is posted, so a subsequent
+  keyboard activation acts on the just-clicked card.
 
 The parent screen handles the message with::
 
@@ -95,6 +100,14 @@ The card introduces nine translation keys under ``manga.card.*``:
   the chapter count, resolved via
   :meth:`~nexusdl.core.i18n.Translator.plural`.
 
+The language code on the meta line (``"en"``, ``"fr"``, ``"ja"``) is
+rendered as its ISO 639-1 value rather than a translated name: the
+codes are universal, short, and unambiguous, while a translated name
+("Anglais") would overflow the column on most terminals. A future
+release that adds a `manga.card.language.*` key group for a
+settings-driven "verbose language" mode would extend the meta-line
+builder, not this docstring's contract.
+
 Like every other widget in this package, a missing key renders the key
 verbatim, which makes the missing translation visible in the UI and
 greppable in the catalogs. The contract is documented by
@@ -117,6 +130,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, ClassVar, Final
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -218,7 +232,7 @@ class MangaCard(Vertical):
 
     #: The card is focusable — the parent screen's focus navigation
     #: (arrow keys, Tab) moves between cards, and the focused card is
-    #: the one the ``Enter`` / ``Space`` bindings activate.
+    #: the one the ``Enter`` binding activates.
     can_focus = True
 
     #: Default CSS for the card. Textual applies it automatically; the
@@ -255,12 +269,18 @@ class MangaCard(Vertical):
     }
     """
 
-    #: Keyboard bindings — both fire the same action, so the user can
-    #: activate a focused card without leaving the home row. Neither
-    #: conflicts with Textual's built-in focus / help / quit bindings.
+    #: Keyboard bindings. Only ``Enter`` — ``Space`` is deliberately
+    #: absent because the parent screens mount cards inside a
+    #: ``VerticalScroll``, where ``Space`` is conventionally a
+    #: page-down key in every TUI the pipeline targets. A user who
+    #: presses ``Space`` expecting to scroll would activate the focused
+    #: card instead — a worse surprise than the loss of one keystroke
+    #: shortcut. A parent that wants ``Space`` for activation can add
+    #: the binding on its own screen's ``BINDINGS`` list, where the
+    #: scroll-vs-activate trade-off is a deliberate choice at the call
+    #: site rather than a hidden widget default.
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("enter", "select", "Select", show=False),
-        Binding("space", "select", "Select", show=False),
     ]
 
     # ------------------------------------------------------------------ #
@@ -348,21 +368,29 @@ class MangaCard(Vertical):
     def action_select(self) -> None:
         """Post a :class:`MangaCard.Selected` message for this card's manga.
 
-        Bound to ``Enter`` and ``Space``; called by :meth:`on_click`
-        for mouse activation. The single entry point for every
-        activation path keeps the "one card = one message" invariant
-        trivially auditable.
+        Bound to ``Enter``; called by :meth:`on_click` for mouse
+        activation. The single entry point for every activation path
+        keeps the "one card = one message" invariant trivially
+        auditable.
         """
         self.post_message(self.Selected(self._manga))
 
-    def on_click(self) -> None:
+    def on_click(self, event: events.Click) -> None:
         """Activate the card on a mouse click.
 
         Delegates to :meth:`action_select` so the mouse and keyboard
         paths are the same. Textual's default focus handling has
         already focused the card before this handler runs, so a
         click-then-Enter flow acts on the clicked card.
+
+        The ``event`` parameter is **required**: Textual 2.x and later
+        pass the ``Click`` event to the handler, and a handler
+        declared without it raises ``TypeError`` at dispatch time —
+        the click would be silently unhandled. The event is stopped
+        from bubbling so the parent screen's own click handler (if
+        any) does not double-fire on the same gesture.
         """
+        event.stop()
         self.action_select()
 
     # ------------------------------------------------------------------ #
@@ -422,7 +450,12 @@ class MangaCard(Vertical):
         """Return the author line, with the localised "by" prefix.
 
         Only called when :attr:`Manga.author` is set — see
-        :meth:`compose`.
+        :meth:`compose`. The method still falls back to an empty
+        string if ``author`` turns out to be ``None`` (a defensive
+        guard for a future model change that makes ``author``
+        nullable in a way the caller's narrowing does not cover);
+        :meth:`Text.append` requires a ``str``, and passing ``None``
+        would raise.
         """
         text = Text()
         text.append(
@@ -430,7 +463,6 @@ class MangaCard(Vertical):
             style="italic",
         )
         text.append(" ", style="")
-        # ``self._manga.author`` is guaranteed non-None by the caller.
         text.append(self._manga.author or "", style="")
         return text
 

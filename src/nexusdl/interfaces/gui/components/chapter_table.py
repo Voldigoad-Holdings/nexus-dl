@@ -24,6 +24,37 @@ Universal design notes:
       when it changes. :meth:`refresh_theme` is exposed for manual use.
     * Callbacks are isolated — a misbehaving parent never breaks Tk.
     * Cleans up after itself on ``<Destroy>``.
+
+Selection across re-renders
+---------------------------
+:meth:`ChapterTable._render_all` clears the underlying ``ttk.Treeview``
+and re-inserts every visible row. A naive implementation would drop the
+user's selection on every sort change, filter change, or batch row
+update — a user who selects five chapters, then clicks a header to sort,
+would find their selection gone and have to re-select.
+
+The implementation captures ``Treeview.selection()`` before the clear,
+and re-applies it after the insert loop, skipping ids that are no longer
+in the tree (a row filtered out by a predicate change). The user keeps
+their selection as long as the rows survive the re-render, which is what
+every table UI in every framework does.
+
+Theme polling safety
+--------------------
+:meth:`ChapterTable._check_theme` runs every second to detect a CTk
+appearance-mode change. The re-application of the ttk style
+(:meth:`ChapterTable._apply_theme`) touches three separate Tk surfaces —
+the style configure, the tag colours, and the row re-render — and any
+one of them can raise :class:`tkinter.TclError` (a Tk version mismatch,
+a destroyed tree, a font not loaded).
+
+The polling loop therefore wraps the whole detection-and-apply sequence
+in a ``try/finally`` that always reschedules the next poll. Without the
+``finally``, a single failure would stop the polling loop for the
+widget's lifetime, leaving the table stuck on the previous theme and
+silently dark-on-light in the user's next session. The ``finally`` is
+the cheapest way to make the poll cycle self-healing — the next tick
+retries the transition on the (by now hopefully fixed) system.
 """
 from __future__ import annotations
 
@@ -184,13 +215,22 @@ _THEME_POLL_MS = 1000
 # Helpers
 # ---------------------------------------------------------------------------
 
-_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
+#: Matches an integer or a decimal number, with **either** ``.`` or ``,``
+#: as the decimal separator. Continental European locales emit
+#: ``"1,5"`` where Anglo locales emit ``"1.5"``; a natural-sort
+#: implementation that only handled ``.`` would sort ``"1,5"`` as text
+#: (after ``"2"``, before ``"bonus"``) instead of as a number (before
+#: ``"2"``). The ``replace(",", ".")`` normalisation happens in
+#: :func:`_natural_key`.
+_NUMBER_RE = re.compile(r"(\d+(?:[.,]\d+)?)")
 
 
 def _natural_key(value: str) -> tuple:
     """Natural ordering key for ``value``.
 
     ``"1"`` < ``"2"`` < ``"10"`` < ``"12.5"`` < ``"bonus"``.
+    Both ``"."`` and ``","`` are accepted as decimal separators so a
+    French chapter list (``"1,5"``) sorts before ``"2"``.
     """
     parts: list[tuple[int, object]] = []
     for chunk in _NUMBER_RE.split(value):
@@ -198,7 +238,8 @@ def _natural_key(value: str) -> tuple:
             continue
         if _NUMBER_RE.fullmatch(chunk):
             try:
-                parts.append((0, float(chunk)))
+                normalized = chunk.replace(",", ".")
+                parts.append((0, float(normalized)))
             except ValueError:
                 parts.append((1, chunk.lower()))
         else:
@@ -238,14 +279,24 @@ def _sort_value(row: ChapterRowData, spec: ColumnSpec) -> object:
 
 
 def _ensure_clam_theme() -> None:
-    """Ensure the ``clam`` ttk theme is active (required for styling)."""
+    """Ensure the ``clam`` ttk theme is active (required for styling).
+
+    ``clam`` is the only ttk theme that reliably honours
+    ``tag_configure(background=...)`` and ``style.configure(...)`` on
+    every platform. The other built-in themes — ``default`` on
+    Windows, ``aqua`` on macOS, ``alt`` — either ignore background
+    colours entirely (Windows ``vista``) or re-apply their own
+    internal theming at render time (macOS ``aqua``). The switch is
+    therefore made **unconditionally** (except when ``clam`` is already
+    active), not just when the current theme is missing from a list.
+    """
     global _CLAM_INITIALIZED
     if _CLAM_INITIALIZED:
         return
     try:
         style = ttk.Style()
         current = style.theme_use()
-        if current not in ("clam", "default", "alt"):
+        if current != "clam":
             style.theme_use("clam")
     except tk.TclError:
         _log.debug("ttk theme switch skipped (Tk not ready)")
@@ -343,7 +394,7 @@ class ChapterTable(ctk.CTkFrame):
         self._build(height=height, row_height=row_height)
         self._apply_theme()
 
-        self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_theme_check()
 
     # ------------------------------------------------------------------
@@ -572,6 +623,16 @@ class ChapterTable(ctk.CTkFrame):
     def _render_all(self) -> None:
         if self._destroyed:
             return
+
+        # Capture the current selection *before* clearing the tree. A
+        # sort, filter, or batch-update must not silently drop the
+        # user's selection — see the module docstring's
+        # "Selection across re-renders" section.
+        try:
+            previous_selection = set(self._tree.selection())
+        except tk.TclError:
+            previous_selection = set()
+
         self._clear_tree()
         rows = self._visible_rows()
 
@@ -589,6 +650,18 @@ class ChapterTable(ctk.CTkFrame):
             except tk.TclError:
                 # Duplicate iid (should not happen) — log and skip.
                 _log.warning("ChapterTable: duplicate chapter_id {!r}", row.chapter_id)
+
+        # Restore selection for rows that survived the re-render. A row
+        # filtered out by a predicate change is no longer in the tree,
+        # and ``selection_add`` for a missing iid is silently ignored
+        # by Tk — the guard on ``exists`` is what makes the call cheap.
+        if previous_selection:
+            try:
+                for iid in previous_selection:
+                    if self._tree.exists(iid):
+                        self._tree.selection_add(iid)
+            except tk.TclError:
+                pass
 
         self._apply_status_tag_colors(status_colors)
         self._update_heading_sort_indicators()
@@ -782,6 +855,7 @@ class ChapterTable(ctk.CTkFrame):
         if self._destroyed:
             return
         theme = self._theme()
+
         try:
             style = ttk.Style()
             style.configure(
@@ -814,12 +888,20 @@ class ChapterTable(ctk.CTkFrame):
             )
         except tk.TclError:
             _log.exception("ChapterTable: failed to apply ttk style")
+            return  # don't touch tags or rows if the style itself failed
 
         self._current_status_colors = self._status_colors_for_theme()
-        self._apply_status_tag_colors(self._current_status_colors)
+        try:
+            self._apply_status_tag_colors(self._current_status_colors)
+        except tk.TclError:
+            _log.exception("ChapterTable: failed to apply tag colors")
+
         # Re-render visible rows to pick up the alternating bg correctly.
         if self._rows:
-            self._render_all()
+            try:
+                self._render_all()
+            except Exception:
+                _log.exception("ChapterTable: failed to re-render on theme change")
 
     def _schedule_theme_check(self) -> None:
         if self._destroyed:
@@ -830,11 +912,16 @@ class ChapterTable(ctk.CTkFrame):
         self._theme_after_id = None
         if self._destroyed:
             return
-        current = self._current_mode()
-        if current != self._last_theme_mode:
-            self._last_theme_mode = current
-            self._apply_theme()
-        self._schedule_theme_check()
+        try:
+            current = self._current_mode()
+            if current != self._last_theme_mode:
+                self._last_theme_mode = current
+                self._apply_theme()
+        finally:
+            # Always reschedule — a single failure in ``_apply_theme``
+            # must not stop the polling loop for the widget's lifetime.
+            # See the module docstring's "Theme polling safety" section.
+            self._schedule_theme_check()
 
     # ------------------------------------------------------------------
     # Misc
@@ -852,6 +939,8 @@ class ChapterTable(ctk.CTkFrame):
 
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._destroyed:
             return
         self._destroyed = True
         for attr in ("_select_after_id", "_theme_after_id"):

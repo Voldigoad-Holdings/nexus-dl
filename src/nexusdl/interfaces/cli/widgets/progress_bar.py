@@ -37,6 +37,26 @@ active, the overall bar reads ``100%`` and the completed tasks remain
 visible — the user can see the final state of a just-finished batch
 without the panel disappearing.
 
+Info column width and truncation
+--------------------------------
+The info column reserves a fixed width of :data:`_INFO_WIDTH` cells
+and is right-aligned. Every string that goes into it is **truncated**
+to that width before being passed to ``Static.update`` — the widget
+never relies on Textual's overflow clipping to keep the column
+boundaries. The truncation is silent (no ellipsis; see
+:func:`_truncate`) but it is **applied uniformly** across all phases,
+including the "done" / "cancelled" / "waiting" markers and the
+percentage-ETA-phase line for active tasks.
+
+An earlier version only truncated the failure case; the active-task
+line (``"100%  45m 12s  packaging"`` — 25 characters) could overflow
+the 24-cell column and be clipped by the CSS, cutting off the phase
+label mid-word. The current code sizes the column at
+:data:`_INFO_WIDTH` = 30 cells to fit the worst realistic case (a
+three-digit percentage, a duration up to hours, and a "packaging"
+label) and truncates every phase uniformly so a future locale that
+produces a longer string cannot silently break the layout.
+
 Incremental rendering
 ---------------------
 :meth:`update_snapshot` is designed to be called many times per second.
@@ -63,6 +83,17 @@ the order the ``ProgressTracker`` produces from its snapshots. Terminal
 tasks appear **below** the active ones, most-recently-completed first.
 This is the layout a download manager uses: the things you are watching
 in progress at the top, the things that just finished underneath.
+
+The ordering relies on ``ProgressSnapshot.tasks`` preserving insertion
+order — a contract documented on the tracker (see
+:mod:`nexusdl.core.downloader.progress`). If a future tracker version
+returns tasks in a different order (for example, sorted by
+``task_id``), the widget's "most-recently-completed first" promise
+silently degrades to "last in id order first". The tracker's docstring
+is the authority for this invariant; the widget does not defensively
+re-sort because sorting by ``task_id`` would produce a *different*
+wrong order and would hide the tracker's regression rather than
+surface it.
 
 Task labels
 -----------
@@ -189,9 +220,12 @@ _PHASE_LABEL: Final[dict[str, str]] = {
     PHASE_PACKAGING: "packaging",
 }
 
-#: Width of the info column, in cells. Large enough for
-#: ``"99%  59m 59s  packaging"``.
-_INFO_WIDTH: Final[int] = 24
+#: Width of the info column, in cells. Sized for the worst realistic
+#: case: ``"100%  23h 59m 59s  packaging"`` (28 characters) with two
+#: cells of slack. Every string is truncated to this width by
+#: :func:`_truncate` before being passed to ``Static.update`` — see
+#: the module docstring's "Info column width and truncation" section.
+_INFO_WIDTH: Final[int] = 30
 
 
 # --------------------------------------------------------------------------- #
@@ -363,7 +397,10 @@ class ProgressBar(Vertical):
         disappeared, or moved are added or removed.
 
         A call made before the widget is mounted is safe — the snapshot
-        is stored and rendered by :meth:`on_mount`.
+        is stored and rendered by :meth:`on_mount`. A call made during
+        unmount is a no-op: the widget's children may already be
+        detached, and rendering against a torn-down tree would raise
+        ``NoMatches`` from ``query_one``.
 
         Args:
             snapshot: The current progress snapshot, as produced by
@@ -443,6 +480,12 @@ class ProgressBar(Vertical):
         Active tasks first, in submission order (the order the snapshot
         preserves from the tracker); then up to ``max_completed_visible``
         terminal tasks, most recently finished first.
+
+        The ordering relies on ``ProgressSnapshot.tasks`` preserving
+        insertion order — see the module docstring's "Task ordering"
+        section. The widget does **not** re-sort: sorting by task id
+        would produce a different wrong order and would hide the
+        tracker's regression rather than surface it.
         """
         active = tuple(t for t in snapshot.tasks if not t.is_terminal)
         terminal = tuple(t for t in snapshot.tasks if t.is_terminal)
@@ -595,25 +638,33 @@ class ProgressBar(Vertical):
         * ``pending`` — ``"waiting"``.
         * ``pages`` / ``packaging`` — percentage, ETA (when known), and
           the phase label.
+
+        **Every** branch passes its result through :func:`_truncate` to
+        :data:`_INFO_WIDTH`, not just the ``failed`` one. An earlier
+        version only truncated the error string and could overflow the
+        column for an active task whose phase label combined with a
+        long ETA (``"100%  23h 59m 59s  packaging"`` is 28 cells
+        against a 24-cell column). The uniform truncation is defensive
+        against a future locale that produces a longer label.
         """
         if task.phase == PHASE_DONE:
-            return "done"
+            return _truncate("done", _INFO_WIDTH)
         if task.phase == PHASE_FAILED:
             err = task.error or "failed"
             return _truncate(err, _INFO_WIDTH)
         if task.phase == PHASE_CANCELLED:
-            return "cancelled"
+            return _truncate("cancelled", _INFO_WIDTH)
         if task.phase == PHASE_PENDING:
-            return "waiting"
+            return _truncate("waiting", _INFO_WIDTH)
 
         pct = int(task.progress * 100)
         phase_label = _PHASE_LABEL.get(task.phase, "")
         eta = task.remaining_seconds
         if eta is not None and eta > 0:
-            return (
-                f"{pct}%  {format_duration(eta)}  {phase_label}"
-            )
-        return f"{pct}%  {phase_label}"
+            line = f"{pct}%  {format_duration(eta)}  {phase_label}"
+        else:
+            line = f"{pct}%  {phase_label}"
+        return _truncate(line, _INFO_WIDTH)
 
     def _status_text(self, snapshot: ProgressSnapshot) -> str:
         """Return the header status line for *snapshot*.
@@ -648,7 +699,12 @@ def _truncate(value: str, width: int) -> str:
     The info column already reserves a fixed width; an ellipsis would
     overflow into the next column. Dropping the tail is the safest
     behaviour for an error message where the beginning is typically the
-    most informative part.
+    most informative part — and for the active-task line where the
+    phase label ("packaging") is the part a reader would most want to
+    see, the column is sized (see :data:`_INFO_WIDTH`) so that the
+    worst realistic combination still fits with slack. Truncation
+    therefore never fires in normal operation; it is a defensive guard
+    for a future locale or phase label that exceeds the budget.
     """
     if len(value) <= width:
         return value

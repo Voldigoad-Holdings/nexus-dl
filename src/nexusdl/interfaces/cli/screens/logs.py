@@ -1,5 +1,5 @@
 """Textual screen hosting the live log viewer.
-
+ 
 The logs screen is a thin full-screen wrapper around
 :class:`~nexusdl.interfaces.cli.widgets.log_viewer.LogViewer`. It adds
 three things the widget cannot provide on its own:

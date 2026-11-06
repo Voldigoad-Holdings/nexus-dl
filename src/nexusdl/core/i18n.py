@@ -70,12 +70,25 @@ not broken.
 
 Interpolation
 -------------
-Placeholders use Python's :meth:`str.format_map` syntax: ``{name}``,
-``{count}``, ``{site}``. A missing parameter is left as the literal
-placeholder in the output (``"Hello {name}"`` with no ``name`` stays
-``"Hello {name}"``) — the caller sees that something is missing,
-rather than getting a :class:`KeyError` from deep inside a UI widget.
-Malformed templates (unclosed braces) are returned verbatim.
+Placeholders use the :meth:`str.format` mini-language: ``{name}``,
+``{count}``, ``{site}``, plus the two extensions that mini-language
+offers — an optional conversion (``{name!r}``, ``{name!s}``,
+``{name!a}``) and an optional format spec (``{count:>3}``,
+``{price:.2f}``).
+
+The interpolation contract for **missing** parameters is deliberately
+conservative:
+
+* The **whole placeholder** is left unchanged — ``"Hello {name}"``
+  with no ``name`` stays ``"Hello {name}"``, and so does
+  ``"Hello {name!r}"`` with no ``name`` (the conversion is dropped,
+  the placeholder survives verbatim). This is true **regardless of
+  whether other parameters are present**: a template with a mix of
+  present and absent placeholders interpolates the present ones and
+  leaves the absent ones untouched.
+* Malformed templates (unclosed braces, invalid format specs) are
+  returned verbatim. The caller sees their own bug rather than
+  crashing the UI.
 
 The ``count`` parameter is injected automatically by
 :meth:`Translator.plural`, so a plural template can reference
@@ -123,7 +136,7 @@ What this module deliberately does **not** do
   A future migration that changes the JSON structure would be gated by
   a version field added to ``_meta``, not by this module.
 * **No ICU MessageFormat.** Plural and interpolation rules are simple
-  enough that :meth:`str.format_map` covers every case the pipeline
+  enough that :meth:`str.format` covers every case the pipeline
   needs. ICU adds a parser, a formatter, and a compatibility surface
   that is orders of magnitude larger than this module.
 * **No locale negotiation from an HTTP request.** A Web deployment that
@@ -139,7 +152,7 @@ What this module deliberately does **not** do
 
 Dependency graph (no cycles)::
 
-    importlib.resources, json, threading (stdlib)
+    importlib.resources, json, string, threading (stdlib)
 
 This module is a **pure leaf** on the project side — it imports nothing
 from ``nexusdl`` and nothing from third parties. It could be lifted into
@@ -150,6 +163,7 @@ a standalone utility library together with the
 from __future__ import annotations
 
 import json
+import string
 import threading
 from collections.abc import Mapping
 from importlib.resources import files as _resource_files
@@ -555,6 +569,12 @@ class Translator:
         A missing or malformed file is cached as ``None`` so it is not
         re-read on every subsequent call. This is a deliberate choice:
         a broken catalog is a bug to fix, not a condition to retry.
+
+        The lock is held during the load. For the four bundled catalogs
+        this is fine — each is under 50 KiB and the load happens once
+        per process. If the catalog set ever grows to dozens of files,
+        the load should be hoisted outside the lock (double-checked
+        pattern, like :mod:`nexusdl.core.compliance`'s ``_get_robots``).
         """
         with self._lock:
             if code in self._catalogs:
@@ -670,27 +690,90 @@ def _plural_suffix(count: int) -> str:
     return "_one" if count == 1 else "_other"
 
 
-class _SafeFormatMap(dict[str, Any]):
-    """A dict subclass whose ``__missing__`` preserves the placeholder.
+class _MissingPlaceholder:
+    """Marker for a format field whose value is absent from the params.
 
-    Used by :func:`_safe_format` so an interpolation like
-    ``"Hello {name}"`` rendered without a ``name`` parameter produces
-    ``"Hello {name}"`` — the placeholder is visible to the caller
-    rather than triggering a :class:`KeyError`.
+    Returned by :meth:`_SafeFormatter.get_value` when a field is missing,
+    intercepted by :meth:`_SafeFormatter.convert_field` (so ``!r``,
+    ``!s``, ``!a`` are not applied) and :meth:`_SafeFormatter.format_field`
+    (so ``format_spec`` is not applied), and rendered verbatim as
+    ``"{key}"``. The whole point is that a missing placeholder survives
+    exactly as the translator wrote it, regardless of the surrounding
+    template's use of conversions or specs.
+
+    The ``key`` may be a :class:`str` (named field, ``{name}``) or an
+    :class:`int` (positional field, ``{0}``) — both are preserved.
     """
 
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
+    __slots__ = ("key",)
+
+    def __init__(self, key: str | int) -> None:
+        self.key = key
+
+    def render(self) -> str:
+        """Return the placeholder as ``"{key}"``."""
+        return "{" + str(self.key) + "}"
+
+
+class _SafeFormatter(string.Formatter):
+    """A :class:`string.Formatter` that leaves missing fields untouched.
+
+    The three hooks are overridden so that a missing field:
+
+    * does not trigger a :class:`KeyError` / :class:`IndexError`
+      (:meth:`get_value` returns a :class:`_MissingPlaceholder`
+      instead of raising),
+    * does not have its ``!r`` / ``!s`` / ``!a`` conversion applied
+      (:meth:`convert_field` short-circuits),
+    * does not have its ``format_spec`` applied
+      (:meth:`format_field` short-circuits).
+
+    The net effect is that ``"{name}"``, ``"{name!r}"``, and
+    ``"{name:>10}"`` all survive verbatim when ``name`` is missing —
+    which is the documented interpolation contract.
+    """
+
+    def get_value(
+        self,
+        key: str | int,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> Any:
+        try:
+            return super().get_value(key, args, kwargs)  # type: ignore[arg-type]
+        except (KeyError, IndexError):
+            return _MissingPlaceholder(key)
+
+    def convert_field(
+        self,
+        value: Any,
+        conversion: str | None,
+    ) -> Any:
+        if isinstance(value, _MissingPlaceholder):
+            return value
+        return super().convert_field(value, conversion)
+
+    def format_field(self, value: Any, format_spec: str) -> str:
+        if isinstance(value, _MissingPlaceholder):
+            return value.render()
+        return super().format_field(value, format_spec)
+
+
+_SAFE_FORMATTER: Final[_SafeFormatter] = _SafeFormatter()
 
 
 def _safe_format(template: str, params: Mapping[str, Any]) -> str:
-    """Interpolate *params* into *template*, tolerating errors.
+    """Interpolate *params* into *template*, tolerating missing fields.
 
-    Uses :meth:`str.format_map` with a ``_SafeFormatMap`` so missing
-    parameters are left as placeholders. A malformed template (an
-    unclosed brace) or an unsupported field access returns the template
-    unchanged — the caller sees their own bug rather than crashing the
-    UI.
+    Present parameters are substituted; absent parameters leave the
+    **whole placeholder** untouched — the key survives verbatim and
+    the ``!r`` / ``!s`` / ``!a`` conversion, if any, is dropped
+    (dropping a conversion on a missing field is the only way to leave
+    the placeholder intact; see the module docstring).
+
+    A malformed template (unclosed brace, invalid format spec,
+    non-string attribute access) is returned verbatim — the caller
+    sees their own bug rather than crashing the UI.
 
     Args:
         template: The translation string, with ``{var}`` placeholders.
@@ -698,16 +781,18 @@ def _safe_format(template: str, params: Mapping[str, Any]) -> str:
 
     Returns:
         The interpolated string, or *template* unchanged when
-        interpolation fails.
+        interpolation fails as a whole.
     """
     if not params:
         return template
     try:
-        return template.format_map(_SafeFormatMap(params))
-    except (KeyError, ValueError, IndexError, AttributeError):
-        # A malformed template or an attribute access that raised.
-        # Returning the template unchanged keeps the UI functional
-        # while surfacing the malformed string in the display.
+        return _SAFE_FORMATTER.vformat(template, (), dict(params))
+    except (ValueError, IndexError, AttributeError, TypeError):
+        # ValueError: unclosed brace or invalid format spec.
+        # IndexError / AttributeError / TypeError: a nested attribute
+        # or index access on a field this formatter did not intercept
+        # (e.g. `{obj[0]}` when `obj` is missing — `get_field` walks
+        # the accessor before `get_value` returns the placeholder).
         return template
 
 

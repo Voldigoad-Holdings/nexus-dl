@@ -99,10 +99,11 @@ import.  As a direct consequence:
     # → True, and now ``nexusdl.interfaces.web`` is populated in sys.modules.
 
 If a subpackage fails to import (missing optional dependency, broken
-installation), the failure is raised as :class:`AttributeError` — required
-by PEP 562 so that ``hasattr`` and ``getattr(x, name, default)`` behave
-correctly — with the original :class:`ImportError` chained as
-``__cause__`` so the operator sees the real reason in a traceback.
+installation, syntax error, runtime initialisation error), the failure is
+raised as :class:`AttributeError` — required by PEP 562 so that
+``hasattr`` and ``getattr(x, name, default)`` behave correctly — with the
+original exception chained as ``__cause__`` so the operator sees the real
+reason in a traceback.
 
 Which interface should a caller use?
 ------------------------------------
@@ -183,10 +184,13 @@ def __getattr__(name: str) -> Any:
         AttributeError: When *name* is not one of the three public
             subpackages, when the subpackage cannot be imported (a missing
             optional dependency such as CustomTkinter for ``gui``, a syntax
-            error in the subpackage, or a broken installation), or when the
-            import succeeds but does not bind a module of the expected
-            name.  ``AttributeError`` — rather than ``ImportError`` — is
-            required by PEP 562.
+            error in the subpackage, a runtime initialisation error, or a
+            broken installation), or when the import succeeds but does not
+            bind a module of the expected name.  ``AttributeError`` —
+            rather than the underlying exception — is required by PEP 562
+            so that ``hasattr`` and ``getattr(x, name, default)`` behave
+            correctly.  The original exception is chained as ``__cause__``
+            so the real reason is visible in a traceback.
     """
     if name not in __all__:
         raise AttributeError(
@@ -202,18 +206,47 @@ def __getattr__(name: str) -> Any:
     dotted_name = f"{__name__}.{name}"
     try:
         module = importlib.import_module(dotted_name)
-    except ImportError as exc:
-        # The subpackage is part of the source tree but failed to import.
-        # Typical causes: ``gui`` on a headless server without Tkinter,
-        # ``web`` without the ``web`` extras installed, or a genuine import
-        # error deeper in the subpackage's module tree.  Convert to
-        # ``AttributeError`` (as PEP 562 requires) while chaining the
-        # underlying error as ``__cause__`` so the operator sees the real
-        # reason in a traceback.
+    except Exception as exc:
+        # Broad catch — not just ``ImportError`` — by design.
+        #
+        # PEP 562 requires ``__getattr__`` to raise ``AttributeError``
+        # (and nothing else) for names it cannot provide, so that
+        # ``hasattr`` and ``getattr(x, name, default)`` behave correctly.
+        # A subpackage import can fail for reasons that are *not* an
+        # ``ImportError``:
+        #
+        #   * a genuine ``SyntaxError`` in a subpackage module
+        #   * a ``RuntimeError`` / ``ValueError`` raised by a module-level
+        #     initialiser (e.g. a dependency version check, a "Chromium
+        #     not installed" guard in the playwright bootstrap, an
+        #     environment probe in the web backend)
+        #   * any ``Exception`` from a broken installation (missing data
+        #     file, corrupt package manifest, …)
+        #
+        # In all cases the correct behaviour is to surface the failure as
+        # ``AttributeError`` (with the original exception chained as
+        # ``__cause__``), never to let a raw ``SyntaxError`` /
+        # ``RuntimeError`` escape — otherwise ``hasattr(interfaces, "gui")``
+        # would raise instead of returning ``False``, defeating the whole
+        # point of the lazy-loading contract.
         raise AttributeError(
             f"Cannot access interface {name!r}: the subpackage "
             f"{dotted_name!r} is not importable.  Underlying error: {exc}"
         ) from exc
+
+    # ``importlib.import_module`` normally returns the module whose
+    # canonical name is ``dotted_name``.  Defensive check: an import hook
+    # (PEP 302 / PEP 451), a namespace-package edge case, or a stale
+    # ``sys.modules`` entry could theoretically return a different object.
+    # If that happens, treat it as a broken import rather than return a
+    # module the caller cannot safely use.
+    if getattr(module, "__name__", None) != dotted_name:
+        raise AttributeError(
+            f"Cannot access interface {name!r}: importing "
+            f"{dotted_name!r} returned an object whose ``__name__`` is "
+            f"{getattr(module, '__name__', None)!r} instead of "
+            f"{dotted_name!r}."
+        )
 
     # ``importlib.import_module`` normally binds the imported module as an
     # attribute of the parent package, but only if the import goes through
@@ -228,20 +261,23 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Return the public interface names for interactive introspection.
+    """Return the package's visible attributes, including lazy subpackages.
 
-    Python's default :func:`dir` implementation collects a module's
-    ``__dict__`` and, when the module defines ``__getattr__``, calls it
-    with each candidate name to decide whether to include it.  Because
-    ``cli``, ``gui`` and ``web`` are not present in ``__dict__`` at import
-    time, an unmodified :func:`dir` would not list them — the package
-    would appear empty in a REPL.
+    Python's default :func:`dir` implementation for modules already lists
+    ``__dict__`` keys together with any ``__all__`` entries that are not
+    yet bound — so without this override, ``cli`` / ``gui`` / ``web``
+    would still appear.  Keeping the override explicit serves two
+    purposes:
 
-    This override fixes that by returning :data:`__all__` (the three
-    interfaces) alongside the standard module dunders that a user typically
-    expects to see when exploring a package.  The order is alphabetical so
-    that the output is stable across Python versions.
+    1. It documents that the three lazy interfaces are *intentional*
+       attributes of this package, not accidental names.
+    2. It guarantees the same output even if a future refactor changes how
+       ``__all__`` is built or removes it entirely.
+
+    The result is the union of everything actually present in the module's
+    namespace (dunders, ``TYPE_CHECKING``, ``Any``, ``__all__`` itself,
+    and any subpackage already imported) plus the still-unimported
+    subpackages declared in ``__all__``.  Ordering is alphabetical for
+    stability across Python versions.
     """
-    return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
-    )
+    return sorted(set(globals()) | set(__all__))

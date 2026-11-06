@@ -88,7 +88,7 @@ import random
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Final, Literal, Protocol
 from urllib.parse import urlparse
 
 from loguru import logger
@@ -101,6 +101,7 @@ __all__ = [
     "ProxyConfig",
     "ProxyHealth",
     "ProxyManager",
+    "ProxySectionProtocol",
     "ProxyStats",
     "RotationStrategy",
     "load_proxy_configs",
@@ -136,6 +137,30 @@ DEFAULT_COOLDOWN_SECONDS: Final[float] = 300.0
 RotationStrategy = Literal["round_robin", "random"]
 
 _log = logger.bind(component="session.proxy")
+
+
+# --------------------------------------------------------------------------- #
+# Settings-section protocol                                                   #
+# --------------------------------------------------------------------------- #
+
+
+class ProxySectionProtocol(Protocol):
+    """Structural protocol for the ``Settings.proxy`` section.
+
+    :func:`load_proxy_configs` takes any object matching this shape,
+    which keeps :mod:`nexusdl.core.session.proxy_manager` from importing
+    :mod:`nexusdl.core.config` (a cycle: ``config`` imports nothing from
+    ``session`` but the reverse direction is forbidden by the project's
+    layering rules).
+
+    The concrete implementation is
+    :class:`nexusdl.core.config.ProxySection`, which satisfies this
+    protocol structurally; no inheritance is involved.
+    """
+
+    enabled: bool
+    url: SecretStr | None
+    urls: Sequence[SecretStr]
 
 
 # --------------------------------------------------------------------------- #
@@ -188,20 +213,31 @@ class ProxyConfig:
                 f"proxy URL scheme must be one of "
                 f"{sorted(_ALLOWED_SCHEMES)}, got {parsed.scheme!r}"
             )
+
+        # Evaluate ``parsed.port`` eagerly so a malformed port raises
+        # here — before the hostname check below, which uses
+        # ``self.redacted`` and must not see an invalid port.
+        port_ok = True
+        try:
+            _ = parsed.port
+        except ValueError:
+            port_ok = False
+
         if not parsed.hostname:
             raise ValueError(
                 f"proxy URL is missing a hostname: {self.redacted!r}"
             )
-
-        # ``parsed.port`` raises ``ValueError`` if the port is malformed
-        # (e.g. ``"http://host:notaport"``); force evaluation to surface
-        # it here rather than at request time.
-        try:
-            _ = parsed.port
-        except ValueError as exc:
-            raise ValueError(
-                f"proxy URL has an invalid port: {self.redacted!r}: {exc}"
-            ) from exc
+        if not port_ok:
+            # Re-evaluate to raise the original exception with its
+            # message, but only after the hostname is known to be
+            # present (so ``self.redacted`` is safe to call).
+            try:
+                _ = parsed.port
+            except ValueError as exc:
+                raise ValueError(
+                    f"proxy URL has an invalid port: {self.redacted!r}: "
+                    f"{exc}"
+                ) from exc
 
         has_user = parsed.username is not None
         has_pass = parsed.password is not None
@@ -218,14 +254,30 @@ class ProxyConfig:
         ``http://user:secret@host:8080`` becomes
         ``http://user:***@host:8080``. A URL with no credentials is
         returned unchanged (nothing to redact). Always safe to log.
+
+        The implementation is deliberately defensive: it **never
+        raises**, even for a URL that would fail :meth:`__post_init__`.
+        A ``redacted`` used inside an error message must not itself
+        raise — that would mask the original validation error under a
+        secondary one. If ``urlparse`` cannot extract the port, the
+        redacted form drops it rather than propagating the failure.
         """
         raw = self.url.get_secret_value()
         parsed = urlparse(raw)
         if parsed.password is None:
             return raw
         masked = f"{parsed.username}:***@{parsed.hostname}"
-        if parsed.port is not None:
-            masked = f"{masked}:{parsed.port}"
+        try:
+            port = parsed.port
+        except ValueError:
+            # A malformed port makes ``parsed.port`` raise; the
+            # redacted form simply omits it. This path is only
+            # reachable from ``__post_init__``'s error message, which
+            # is trying to report a different problem — raising a
+            # ValueError about the port here would mask the real one.
+            port = None
+        if port is not None:
+            masked = f"{masked}:{port}"
         return parsed._replace(netloc=masked).geturl()
 
     def __repr__(self) -> str:
@@ -259,6 +311,10 @@ class ProxyHealth:
             success. Zero for a healthy proxy.
         last_error: Human-readable description of the most recent
             failure, or ``None`` if the proxy has never failed.
+        last_failure_at: Monotonic timestamp of the most recent failure,
+            or ``None``. Exposed for correlation with other timestamps
+            (site health checks, request traces) — the concrete value is
+            only meaningful relative to the manager's own clock.
         cooldown_remaining_seconds: Seconds until the benched proxy
             returns to the available pool. ``0.0`` for an available
             proxy.
@@ -271,6 +327,7 @@ class ProxyHealth:
     redacted_url: str
     consecutive_failures: int
     last_error: str | None
+    last_failure_at: float | None
     cooldown_remaining_seconds: float
     is_available: bool
 
@@ -510,10 +567,20 @@ class ProxyManager:
     ) -> None:
         """Record a successful request through *proxy*.
 
-        Clears the proxy's failure streak and any active cooldown. Unknown
-        proxies (an object the manager does not know about) are ignored
-        silently — a session that calls ``mark_success`` on a proxy it
-        was not handed is not a bug worth surfacing.
+        Clears the proxy's failure streak and any active cooldown. The
+        ``proxy`` argument may be either a :class:`ProxyConfig` or a raw
+        URL string; both forms are resolved to the manager's internal
+        URL key.
+
+        An unknown proxy is **not** an error — a session that calls
+        ``mark_success`` on a URL the manager was not configured with
+        (e.g. a proxy injected by a test fixture, a future feature that
+        uses an out-of-band proxy) gets a no-op, but the situation is
+        logged at ``DEBUG`` so a caller chasing "why is my proxy still
+        benched?" sees the mismatch. This mirrors the duplicate-URL
+        policy in :meth:`__init__`: the constructor **rejects** the
+        configuration mistake; the runtime path **records** it without
+        stopping the pipeline.
 
         Args:
             proxy: The config that was used, or the URL string. Both
@@ -525,6 +592,11 @@ class ProxyManager:
         async with self._lock:
             state = self._states.get(url_key)
             if state is None:
+                _log.debug(
+                    "mark_success called for a proxy the manager does "
+                    "not know: {}",
+                    _redact_url(url_key),
+                )
                 return
             state.consecutive_failures = 0
             state.last_failure_at = None
@@ -551,6 +623,9 @@ class ProxyManager:
         the cooldown — the proxy is benched until ``cooldown_until``
         regardless of how many more failures it produces.
 
+        An unknown proxy is a no-op, logged at ``DEBUG`` — same policy
+        as :meth:`mark_success`.
+
         Args:
             proxy: The config that was used, or the URL string. See
                 :meth:`mark_success` for why both forms are accepted.
@@ -563,6 +638,11 @@ class ProxyManager:
         async with self._lock:
             state = self._states.get(url_key)
             if state is None:
+                _log.debug(
+                    "mark_failure called for a proxy the manager does "
+                    "not know: {}",
+                    _redact_url(url_key),
+                )
                 return
             state.consecutive_failures += 1
             state.last_failure_at = now
@@ -643,6 +723,7 @@ class ProxyManager:
                         redacted_url=state.config.redacted,
                         consecutive_failures=state.consecutive_failures,
                         last_error=state.last_error,
+                        last_failure_at=state.last_failure_at,
                         cooldown_remaining_seconds=remaining,
                         is_available=available,
                     )
@@ -712,7 +793,9 @@ class ProxyManager:
 # --------------------------------------------------------------------------- #
 
 
-def load_proxy_configs(config: object | None) -> tuple[ProxyConfig, ...]:
+def load_proxy_configs(
+    config: ProxySectionProtocol | None,
+) -> tuple[ProxyConfig, ...]:
     """Extract :class:`ProxyConfig` instances from a ``Settings.proxy`` section.
 
     Defensive against every shape the section can take:
@@ -731,7 +814,8 @@ def load_proxy_configs(config: object | None) -> tuple[ProxyConfig, ...]:
     :class:`~pydantic.SecretStr` before constructing the config.
 
     Args:
-        config: The ``settings.proxy`` object. Any object that exposes
+        config: The ``settings.proxy`` object, satisfying
+            :class:`ProxySectionProtocol`. Any object that exposes
             ``enabled``, ``url``, and ``urls`` attributes works — the
             function uses :func:`getattr` with defaults so a partially-
             populated section is handled gracefully.
@@ -787,3 +871,29 @@ def _extract_url(proxy: ProxyConfig | str) -> str:
     if isinstance(proxy, ProxyConfig):
         return proxy.url.get_secret_value()
     return proxy
+
+
+def _redact_url(url: str) -> str:
+    """Return a best-effort redacted form of *url* for logging.
+
+    Used only on the ``DEBUG`` paths that report an unknown proxy to
+    the manager. The URL might not parse — the manager accepts raw
+    strings from ``mark_success`` / ``mark_failure``, and a caller can
+    pass anything. Never raises; if parsing fails the raw URL is
+    returned truncated. For the normal, parseable case the password is
+    replaced with ``***`` like :attr:`ProxyConfig.redacted`.
+    """
+    try:
+        parsed = urlparse(url)
+    except (ValueError, AttributeError):
+        return url[:64]
+    if parsed.password is None:
+        return url
+    masked = f"{parsed.username}:***@{parsed.hostname}"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None:
+        masked = f"{masked}:{port}"
+    return parsed._replace(netloc=masked).geturl()

@@ -49,8 +49,14 @@ The protocol therefore exposes **only** :meth:`LogRouter.attach_with_seed`,
 which the router implements atomically: it takes the seed snapshot, adds
 the viewer to the live-forward list, and pushes the seed entries to the
 viewer — all under the router's own lock. No entry is missed, none is
-duplicated. See the docstring on the protocol method for the exact
-guarantee the router must uphold.
+duplicated.
+
+The protocol method additionally documents a **transactional guarantee**:
+if it raises, the viewer is not attached — a broken implementation that
+partially attaches and then raises would leave a dead viewer in the
+router's forwarding list, with no detach callback in the screen to clean
+it up. This is a contract on the router, not something the screen can
+recover from. See the method's docstring.
 
 Reopening the screen
 --------------------
@@ -66,7 +72,9 @@ history a fresh viewer receives. A larger value surfaces more history
 but costs a bigger initial push to the viewer's queue (which the widget
 then renders on the next drain tick). 500 is a good balance — a typical
 TUI session sees fewer than 500 entries before the user opens the
-screen.
+screen. The limit is clamped to :data:`_MAX_SEED_LIMIT` at construction
+time so a typo (``seed_limit=1_000_000``) cannot turn the first opening
+of the screen into a multi-second freeze.
 
 Why a full screen, not a panel
 ------------------------------
@@ -104,7 +112,7 @@ The screen imports exactly one widget from its sibling package
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import ClassVar, Final, Protocol
 
 from textual.app import ComposeResult
@@ -133,6 +141,15 @@ _ID_HINT: Final[str] = "logs-screen-hint"
 #: tuned so a typical TUI session sees most of its history on first
 #: opening. A caller can override via ``seed_limit``.
 _DEFAULT_SEED_LIMIT: Final[int] = 500
+
+#: Hard upper bound on the seed limit, applied at construction time.
+#: A caller that passes ``seed_limit=1_000_000`` (a typo, a config
+#: mistake) would otherwise make the first opening of the screen push
+#: a million entries to the viewer's queue — a multi-second freeze
+#: that looks like a hang. Clamping at construction keeps the failure
+#: mode "history beyond the cap is not seeded" rather than "the screen
+#: freezes".
+_MAX_SEED_LIMIT: Final[int] = 10_000
 
 
 # --------------------------------------------------------------------------- #
@@ -184,8 +201,13 @@ class LogRouter(Protocol):
 
     Not marked ``@runtime_checkable`` — no call site needs
     ``isinstance`` checks against it. A structural conformance failure
-    would surface as an ``AttributeError`` on the first ``attach_with_seed``
-    call, which is the correct loud failure for a missing wiring.
+    would surface as an ``AttributeError`` on the first
+    ``attach_with_seed`` call, which is the correct loud failure for a
+    missing wiring. A caller that genuinely needs ``isinstance`` (for a
+    plugin-verification tool, for example) can decorate the class with
+    :func:`typing.runtime_checkable` locally — the class is small
+    enough that the runtime check is cheap — without affecting the
+    shipped code.
     """
 
     def attach_with_seed(
@@ -206,6 +228,16 @@ class LogRouter(Protocol):
           delivered to *viewer* exactly once.
 
         No entry may be missed or duplicated in the transition.
+
+        **Transactional guarantee.** If this method raises, the router
+        **must not** have attached the viewer. The caller sees either a
+        fully-attached viewer with a valid detach callback, or an
+        exception with **no attachment** — the router's forwarding
+        list must not contain the viewer on the exception path. This is
+        a contract on the router, not something the screen can recover
+        from: on the exception path the screen has no detach callback
+        to clean up with, so a partially-attached viewer would leak
+        forever in the router's forwarding list.
 
         Args:
             viewer: The viewer to seed and attach. The router does not
@@ -244,7 +276,13 @@ class LogsScreen(Screen[None]):
             :func:`~nexusdl.core.i18n.get_default_translator`.
         seed_limit: Maximum number of historical entries to seed the
             viewer with on mount. Defaults to
-            :data:`_DEFAULT_SEED_LIMIT`.
+            :data:`_DEFAULT_SEED_LIMIT`. Values above
+            :data:`_MAX_SEED_LIMIT` are clamped, and negative values
+            are treated as zero. The clamp is a defence against a
+            typo turning the first opening of the screen into a
+            multi-second freeze; the message is still honest about
+            what was seeded (the clamped value, not the caller's
+            request).
         name: Optional Textual screen name.
         id: Optional Textual screen id.
         classes: Optional Textual CSS classes.
@@ -298,7 +336,7 @@ class LogsScreen(Screen[None]):
         self._translator = (
             translator if translator is not None else get_default_translator()
         )
-        self._seed_limit = max(0, seed_limit)
+        self._seed_limit = max(0, min(seed_limit, _MAX_SEED_LIMIT))
 
         #: The viewer this screen hosts. Created once in ``__init__`` so
         #: :meth:`compose` can yield it, seeded and attached in
@@ -342,7 +380,12 @@ class LogsScreen(Screen[None]):
         No try/except around the attach: a router that fails to provide
         the expected method is a **composition root wiring bug**, and
         failing loudly is the correct outcome. The screen's job is to
-        trust the interface it was given.
+        trust the interface it was given — and the interface's
+        transactional guarantee (see
+        :meth:`LogRouter.attach_with_seed`'s docstring) is what makes
+        "failing loudly" safe: on the exception path the viewer was
+        not attached, so there is no detach callback the screen would
+        need to remember.
         """
         self._detach = self._log_router.attach_with_seed(
             self._viewer, limit=self._seed_limit
@@ -357,6 +400,11 @@ class LogsScreen(Screen[None]):
         :attr:`_detach` to ``None`` ensures a second ``on_unmount``
         invocation (should it ever occur) does not call a stale
         callback.
+
+        The ``finally`` guarantees the reset even if the detach itself
+        raises — a router whose detach callback throws must not leave
+        the screen in a state where a second ``on_unmount`` would call
+        the same broken callback again.
         """
         if self._detach is not None:
             try:

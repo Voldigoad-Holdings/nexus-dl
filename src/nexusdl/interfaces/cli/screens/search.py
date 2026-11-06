@@ -50,6 +50,15 @@ was running has been superseded" and the worker returns cleanly. This
 is a purely synchronous check — no reliance on Textual's scheduling
 guarantees — and it eliminates the ghost-card window entirely.
 
+**The post-loop final-status write is guarded by the same epoch
+check.** A worker whose loop exits normally must not overwrite the
+status line if a newer worker has started in the meantime: without the
+guard, a superseded worker that yields one more result and exits
+would race its successor for the status line, and the user could see
+the old query's "no results" message flash across a running new
+query. The guard is a single ``if epoch != self._search_epoch:
+return`` immediately before the final status write.
+
 Adult-content filter
 --------------------
 The screen's initial value of the adult-content filter is
@@ -60,6 +69,16 @@ search the general catalogue. This is the only "extra" filter the
 screen exposes — language, status, and rating filtering belong to a
 different screen (the library's advanced search) whose data model is
 fully loaded mangas, not search results.
+
+When the user toggles the filter, the screen re-runs the search on the
+**current input value**, not on the last submitted query. A user who
+types ``"naruto"`` into the input after a completed search for
+``"one piece"``, then clicks the adult button, expects the search to
+reflect what they see in the input. Reading the input at toggle time
+(rather than reusing :attr:`_query`) closes the "stale query" gap. If
+the input is empty at toggle time, the screen does not re-run any
+search — the user has not submitted a new query, and re-running the
+last one would be surprising.
 
 SearchResult → Manga
 --------------------
@@ -132,6 +151,14 @@ both for the displayed card and for the id → result map. Skipping
 keeps the displayed card count equal to ``len(_results_by_manga_id)``
 and therefore to the number in the status bar; mounting both would
 make the status bar undercount relative to what the user sees.
+
+Empty submit
+------------
+Pressing Enter on an empty or whitespace-only input is treated as a
+**clear** gesture, not a no-op. A user who empties the input and
+presses Enter expects the search to reset — showing the previous
+query's results while the input is empty is confusing. The behaviour
+matches the Clear button and :meth:`_clear_all`.
 
 Dependency graph (no cycles)::
 
@@ -358,12 +385,17 @@ class SearchScreen(Screen[None]):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Start a search when the user presses Enter in the input.
 
-        A blank or whitespace-only submission is a no-op — the status
-        line keeps whatever it was showing (typically the previous
-        query's results).
+        A blank or whitespace-only submission is treated as a **clear**
+        gesture — matching the Clear button's behaviour — rather than a
+        no-op. A user who empties the input and presses Enter expects
+        the search to reset, not to keep displaying the previous
+        query's results while the input shows nothing.
+
+        See the module docstring's "Empty submit" section.
         """
         query = event.value.strip()
         if not query:
+            self._clear_all()
             return
         self._start_search(query)
 
@@ -415,7 +447,9 @@ class SearchScreen(Screen[None]):
         ``@work(exclusive=True)`` decorator also cancels the previous
         worker, but the epoch check inside the worker's loop is what
         guarantees no ghost card is mounted during the cancellation
-        window.
+        window — and the same check before the final status write
+        guarantees a superseded worker does not overwrite the status
+        line of its successor.
         """
         self._query = query
         self._search_epoch += 1
@@ -460,7 +494,9 @@ class SearchScreen(Screen[None]):
                 if epoch != self._search_epoch:
                     # This worker has been superseded — stop cleanly.
                     # The generator's own ``finally`` will cancel and
-                    # await the per-site tasks it started.
+                    # await the per-site tasks it started. The
+                    # ``return`` exits this coroutine entirely, so the
+                    # post-loop final-status write below is skipped.
                     return
                 self._mount_result(result, results_container)
         except asyncio.CancelledError:
@@ -481,6 +517,16 @@ class SearchScreen(Screen[None]):
                         "search.status.error", error=str(exc)
                     )
                 )
+            return
+
+        # Only the *current* worker writes the final status. The
+        # check is redundant with the in-loop check for the common
+        # case (the loop exits after the last result, at which point
+        # the epoch matches), but it is required for the case where
+        # the epoch was bumped *between* the last yield and the loop
+        # exit — without it, the superseded worker would clobber the
+        # successor's status line with a message about the old query.
+        if epoch != self._search_epoch:
             return
 
         count = len(self._results_by_manga_id)
@@ -522,11 +568,22 @@ class SearchScreen(Screen[None]):
     # ------------------------------------------------------------------ #
 
     def _toggle_adult(self) -> None:
-        """Flip the adult filter, update the button, re-run the search."""
+        """Flip the adult filter, update the button, re-run the search.
+
+        Re-runs on the **current input value**, not on the last
+        submitted query. A user who types a new query into the input
+        after a completed search, then clicks the adult button,
+        expects the search to reflect what they see in the input —
+        not to silently re-run the previous query with the new
+        filter state. If the input is empty, no search is started:
+        the user has not submitted a new query, and re-running the
+        last one would be surprising.
+        """
         self._include_adult = not self._include_adult
         self._update_adult_button()
-        if self._query:
-            self._start_search(self._query)
+        current = self.query_one(f"#{_ID_INPUT}", Input).value.strip()
+        if current:
+            self._start_search(current)
 
     def _clear_all(self) -> None:
         """Clear the input, the results, the query, and the status.

@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import inspect
 import json
 import time
 import uuid
@@ -258,13 +259,17 @@ class RateLimitConfig:
         store: The counter backend. Defaults to
             :class:`InMemoryRateLimitStore` (single-process).
         clock: Monotonic clock in seconds. Injectable for tests.
-            Defaults to :func:`time.monotonic`.
+            Defaults to :func:`time.monotonic`. When the default store
+            is used, the clock is forwarded to it so that
+            :meth:`RateLimitStore.cleanup` stays consistent with
+            :meth:`RateLimitStore.check`.
         default_fail_open: Behavior when ``rule.fail_open`` is ``None``
             and the store raises. ``True`` (default) lets the request
             through; ``False`` rejects with a 429 — recommended for auth
             endpoints via per-rule ``fail_open=False``.
         emit_headers: Whether to add ``X-RateLimit-*`` headers to
-            responses. Default ``True``.
+            responses. Default ``True``. The standard ``Retry-After``
+            header on 429 is emitted regardless of this flag.
         trust_forwarded_for: Read ``X-Forwarded-For`` for the client IP.
             Default ``False`` — spoofable otherwise. Enable only behind
             a known reverse proxy.
@@ -276,8 +281,9 @@ class RateLimitConfig:
             ``/health/ready`` — Kubernetes probes must never be
             throttled.
         on_rate_limited: Optional callback for observability, called on
-            every 429. Isolated — exceptions are logged at ``debug`` and
-            swallowed.
+            every 429. Sync callables and async callables are both
+            supported — the middleware awaits a returned awaitable.
+            Exceptions are isolated: logged at ``error`` and swallowed.
         cleanup_interval_s: How often :meth:`InMemoryRateLimitStore.cleanup`
             runs when :meth:`RateLimitMiddleware.start` was called.
     """
@@ -374,10 +380,18 @@ class InMemoryRateLimitStore:
     of globally.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         self._windows: dict[str, _WindowState] = {}
         self._buckets: dict[str, _BucketState] = {}
         self._lock = asyncio.Lock()
+        # Kept consistent with ``RateLimitConfig.clock`` when the
+        # middleware owns the store — see ``RateLimitMiddleware.__init__``.
+        # Prevents ``cleanup()`` from using a different clock source than
+        # ``check()``, which would silently evict active entries under an
+        # injected (frozen / shifted) clock.
+        self._clock = clock
 
     async def check(
         self,
@@ -498,7 +512,11 @@ class InMemoryRateLimitStore:
         (all timestamps past the window). Buckets: entries whose tokens
         have fully refilled (equivalent to "no active limiting").
         """
-        now = time.monotonic()
+        # Use the injected clock — MUST match the clock ``check()`` uses
+        # via the ``now`` parameter, otherwise an injected (frozen or
+        # shifted) clock would cause active entries to be evicted as
+        # "expired" and silently reset the rate limiter under test.
+        now = self._clock()
         removed = 0
 
         # Empty windows — nothing to evict by time alone without knowing
@@ -547,9 +565,13 @@ class RateLimitMiddleware:
     ) -> None:
         self.app = app
         self.config = config
-        self.store: RateLimitStore = (
-            config.store or InMemoryRateLimitStore()
-        )
+        # Preserve the caller's store (if any) exactly, and forward the
+        # config's clock to the default in-memory store so that
+        # ``cleanup()`` and ``check()`` observe the same clock.
+        if config.store is not None:
+            self.store: RateLimitStore = config.store
+        else:
+            self.store = InMemoryRateLimitStore(clock=config.clock)
 
         self._cleanup_task: asyncio.Task[None] | None = None
         self._stopped = False
@@ -786,7 +808,12 @@ class RateLimitMiddleware:
 
         if self.config.on_rate_limited is not None:
             try:
-                self.config.on_rate_limited(event)
+                callback_result = self.config.on_rate_limited(event)
+                # Support async callbacks (metrics exporters, alerting
+                # webhooks) — a sync callable returns a non-awaitable
+                # and falls through unchanged.
+                if inspect.isawaitable(callback_result):
+                    await callback_result
             except Exception:
                 _log.exception(
                     "on_rate_limited callback raised for rule {!r}",
@@ -822,10 +849,17 @@ class RateLimitMiddleware:
         headers = [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(payload)).encode("ascii")),
+            # ``Retry-After`` is a standard HTTP header (RFC 7231) and
+            # must be present on every 429, regardless of ``emit_headers``.
+            # It is deliberately NOT delegated to ``_format_headers`` to
+            # avoid emitting it twice.
             (b"retry-after", str(result.retry_after_int).encode("ascii")),
         ]
         if self.config.emit_headers:
-            headers.extend(_format_headers(result, include_retry_after=True))
+            # ``include_retry_after=False`` — the manual entry above
+            # already covers it; asking for it again would produce a
+            # duplicate header on every 429.
+            headers.extend(_format_headers(result, include_retry_after=False))
 
         await send(
             {
@@ -997,7 +1031,24 @@ def _decode_jwt_sub_unverified(token: str) -> str | None:
 
 
 def _extract_request_id(scope: dict[str, Any]) -> str | None:
-    """Return the request id from the ``X-Request-ID`` header, if present."""
+    """Return the request id, honoring upstream middleware.
+
+    Priority matches :func:`main._get_request_id`:
+
+    1. ``scope["state"]["request_id"]`` — set by
+       :class:`~.middleware.logging.LoggingMiddleware` (which runs
+       *before* the rate-limit middleware, per the middleware stack
+       order). This is the authoritative value for log correlation.
+    2. ``X-Request-ID`` header — set by the client or a trusted
+       upstream proxy. Bounded to 128 characters to avoid log
+       injection.
+    """
+    state = scope.get("state") or {}
+    if isinstance(state, Mapping):
+        rid = state.get("request_id")
+        if isinstance(rid, str) and rid:
+            return rid
+
     raw = _header_value(scope, b"x-request-id")
     if not raw:
         return None
@@ -1005,9 +1056,6 @@ def _extract_request_id(scope: dict[str, Any]) -> str | None:
     raw = raw.strip()
     if not raw or len(raw) > 128:
         return None
-    # Generate a fresh one if the client one looks bogus? No — echo
-    # whatever the client sent, guarded by the length check above. A
-    # middleware upstream can replace it if needed.
     return raw
 
 

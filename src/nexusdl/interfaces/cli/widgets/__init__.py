@@ -1,9 +1,10 @@
 """Reusable Textual widgets for the NexusDL TUI.
 
-The five widgets in this package are the visual building blocks the TUI
-screens compose together. Every screen in ``nexusdl.interfaces.cli.screens``
-is built from these widgets (and Textual's own built-in widgets, of
-course); nothing in a screen reimplements what a widget here provides.
+The six classes in this package — five widgets and one plain-data
+record — are the visual building blocks the TUI screens compose
+together. Every screen in ``nexusdl.interfaces.cli.screens`` is built
+from these widgets (and Textual's own built-in widgets, of course);
+nothing in a screen reimplements what a widget here provides.
 
 Widgets in this package
 -----------------------
@@ -15,6 +16,7 @@ Widgets in this package
 
     LogViewer        a live stream of loguru records with level filter
     LogEntry         the plain-data record shape LogViewer consumes
+                     (not a widget — a record type)
 
     MangaCard        one manga rendered as a focusable card
                      → MangaCard.Selected
@@ -80,10 +82,25 @@ Every widget in this package follows the same three conventions:
 
 Localisation
 ------------
-The five widgets introduce **32 translation keys** under four
+The five widgets introduce **32 translation keys** under five
 namespaces (``site.selector.*``, ``downloads.progress.*``,
 ``manga.card.*``, ``logs.viewer.*``, ``chapter.list.*``). Each widget's
 module docstring lists its own keys with example English values.
+
+The breakdown is:
+
+* ``site.selector.*`` — 5 keys: title, count (2 plural forms), and
+  two empty-state messages (unfiltered / filtered).
+* ``downloads.progress.*`` — 4 keys: title and three status
+  messages (empty, no-downloads, no-active).
+* ``manga.card.*`` — 9 keys: five status names, the "by" author
+  prefix, the no-description placeholder, and two chapter-count
+  plural forms.
+* ``logs.viewer.*`` — 5 keys: title, level placeholder, pause and
+  resume labels, and the clear button.
+* ``chapter.list.*`` — 9 keys: two title plural forms, two selected
+  plural forms, three column headers, the empty-state placeholder,
+  and the activate hint.
 
 A key that is missing from the active catalog falls back through the
 chain documented in :mod:`nexusdl.core.i18n` — a French catalog without
@@ -116,6 +133,14 @@ and pay for only that widget's dependencies. In practice, every
 consumer of this package is a TUI screen, which loads every widget
 anyway when the app renders the screen; the submodule-import case is a
 test convenience, not a production optimization.
+
+The eager import here — no PEP 562 ``__getattr__`` lazy loading, unlike
+:mod:`nexusdl.core` and :mod:`nexusdl.core.session` — mirrors the
+choice made in :mod:`nexusdl.interfaces.cli.screens`. Those core
+packages are consumed by many callers that may want a single
+lightweight symbol; this package is consumed by exactly one family of
+callers (the TUI screens) that always want all five widgets. The lazy
+machinery would be dead weight.
 
 Stability
 ---------

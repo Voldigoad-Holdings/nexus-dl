@@ -186,7 +186,7 @@ jobs:
       # the attestation in its metadata, and ``pip install --require-
       # attestations nexusdl`` will then verify it at install time.
       - name: Sign the artifacts with Sigstore
-        uses: sigstore/gh-action-sigstore-python@v3.0.0
+        uses: sigstore/gh-action-sigstore-python@v3.5.0
         with:
           inputs: |
             dist/*.whl

@@ -293,7 +293,7 @@ jobs:
       # management process can flip ``exit-code`` to ``1`` and
       # ``severity`` to ``CRITICAL,HIGH`` at the tag step only.
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           # Scan the local image, not the registry — the image is not
           # pushed on PRs, so ``image-ref`` must point at the local
@@ -317,7 +317,7 @@ jobs:
 
       # ── SBOM (CycloneDX) ───────────────────────────────────────
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0.17.0
+        uses: anchore/sbom-action@v0.24.3
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.name }}:${{ steps.meta.outputs.version }}
           format: cyclonedx-json

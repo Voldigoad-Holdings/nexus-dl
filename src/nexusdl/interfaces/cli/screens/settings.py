@@ -38,7 +38,9 @@ A two-panel split:
 Section grouping
 ----------------
 The screen's ten sections are a **logical grouping** of the twenty-four
-sections that :class:`~nexusdl.core.config.Settings` declares. The
+configuration section models that :class:`~nexusdl.core.config.Settings`
+declares (plus the three root URLs and the three root secrets, which
+live at the ``Settings`` top level rather than inside a section). The
 mapping is deliberate, not incidental:
 
 * **Overview** — app identity, the three root URLs, and the three
@@ -59,8 +61,10 @@ mapping is deliberate, not incidental:
   enabled, and where it points.
 * **Server** — the API server, WebSocket tuning, and the TUI / GUI
   preferences. What a deployment serving HTTP needs to confirm.
-* **Plugins** — plugin roots, disabled plugins, and runtime site
-  overrides. What a plugin author or operator looks at.
+* **Plugins** — plugin roots, disabled plugins, runtime site overrides,
+  and every plugin-subsystem knob (enabled, auto-discover, install
+  directory, network/filesystem permissions, per-hook timeout and
+  memory budget).
 * **Advanced** — performance, development, storage, and library. The
   remaining knobs, grouped so a user who does not need them never
   needs to scroll through them.
@@ -72,7 +76,12 @@ The screen displays three classes of secret:
 * **Root secrets** — ``secret_key``, ``jwt_secret``,
   ``cookie_encryption_key`` (all :class:`~pydantic.SecretStr`). Shown
   as ``"*** (N chars)"`` — the length confirms the value is set and
-  plausible without revealing it.
+  plausible without revealing it. For the two fixed-length secrets
+  (``secret_key`` and ``cookie_encryption_key``, both 44-character
+  URL-safe base64 strings) the length is diagnostic; for
+  ``jwt_secret``, which has no fixed length, the displayed length is
+  informational only and does not narrow an attacker's search any
+  more than the fact that the value exists.
 * **Proxy URLs** — ``proxy.url`` and each ``proxy.urls`` entry (also
   :class:`~pydantic.SecretStr`). Shown as ``"***"`` regardless of
   length; a proxy URL can embed credentials, and a "length" hint would
@@ -139,6 +148,17 @@ pathological value in a dict-typed field — is caught by
 placeholder that names the exception. A broken section does not take
 the screen down; the user sees that the section is broken and can
 report it, while the other nine sections render normally.
+
+.. note::
+
+   A field named ``validate`` on any configuration section would be
+   shadowed by :meth:`pydantic.BaseModel.validate` (the deprecated v1
+   compatibility shim in Pydantic v2) and reading
+   ``settings.image.validate`` would return the **method**, not the
+   boolean. The config model therefore exposes the field as
+   ``validate_on_download``, and this screen reads
+   ``settings.image.validate_on_download`` — see
+   :class:`~nexusdl.core.config.ImageSection`.
 
 Dependency graph (no cycles)::
 
@@ -406,6 +426,7 @@ class SettingsScreen(Screen[None]):
                 ("slug", APP_SLUG),
                 ("bundled_name", APP_NAME),
                 ("data_package", DATA_PACKAGE),
+                ("config_version", str(self._settings.config_version)),
                 ("debug", self._bool(self._settings.app.debug)),
                 ("language", self._settings.app.language),
                 ("timezone", self._settings.app.timezone),
@@ -494,11 +515,15 @@ class SettingsScreen(Screen[None]):
         )
 
         i = self._settings.image
+        # NB: read ``validate_on_download``, not ``validate`` — the
+        # latter is shadowed by Pydantic's BaseModel.validate method
+        # and would always render as "yes" regardless of the actual
+        # configuration value. See the module docstring's note.
         self._append_group(
             text,
             "Image",
             [
-                ("validate", self._bool(i.validate)),
+                ("validate", self._bool(i.validate_on_download)),
                 ("optimize", self._bool(i.optimize)),
                 ("optimize_jpeg_quality", str(i.optimize_jpeg_quality)),
                 (
@@ -742,6 +767,7 @@ class SettingsScreen(Screen[None]):
                 ("ping_interval", f"{w.ping_interval}s"),
                 ("ping_timeout", f"{w.ping_timeout}s"),
                 ("max_message_size", human_readable_size(w.max_message_size)),
+                ("progress_throttle_hz", str(w.progress_throttle_hz)),
             ],
         )
 
@@ -752,6 +778,10 @@ class SettingsScreen(Screen[None]):
             [
                 ("theme", t.theme),
                 ("animations", self._bool(t.animations)),
+                ("refresh_rate_hz", str(t.refresh_rate_hz)),
+                ("show_progress_bars", self._bool(t.show_progress_bars)),
+                ("mouse_enabled", self._bool(t.mouse_enabled)),
+                ("vim_keys", self._bool(t.vim_keys)),
             ],
         )
 
@@ -763,13 +793,22 @@ class SettingsScreen(Screen[None]):
                 ("theme", g.theme),
                 ("window_width", str(g.window_width)),
                 ("window_height", str(g.window_height)),
+                (
+                    "remember_window_position",
+                    self._bool(g.remember_window_position),
+                ),
+                ("start_minimized", self._bool(g.start_minimized)),
+                ("tray_enabled", self._bool(g.tray_enabled)),
+                ("notifications", self._bool(g.notifications)),
+                ("font_scale", str(g.font_scale)),
             ],
         )
 
         return text
 
     def _section_plugins(self) -> Text:
-        """Plugin roots, disabled plugins, and runtime site overrides."""
+        """Plugin roots, disabled plugins, runtime site overrides, and
+        every plugin-subsystem knob."""
         text = Text()
 
         p = self._settings.plugins
@@ -777,6 +816,8 @@ class SettingsScreen(Screen[None]):
             text,
             "Plugins",
             [
+                ("enabled", self._bool(p.enabled)),
+                ("auto_discover", self._bool(p.auto_discover)),
                 (
                     "dirs",
                     (
@@ -801,6 +842,18 @@ class SettingsScreen(Screen[None]):
                         else self._t("settings.value.none")
                     ),
                 ),
+                (
+                    "install_dir",
+                    (
+                        str(p.install_dir)
+                        if p.install_dir is not None
+                        else self._t("settings.value.none")
+                    ),
+                ),
+                ("allow_network", self._bool(p.allow_network)),
+                ("allow_filesystem", self._bool(p.allow_filesystem)),
+                ("timeout_seconds", str(p.timeout_seconds)),
+                ("max_memory_mb", str(p.max_memory_mb)),
             ],
         )
 
@@ -834,6 +887,18 @@ class SettingsScreen(Screen[None]):
                 ("asyncio_debug", self._bool(perf.asyncio_debug)),
                 ("http_pool_size", str(perf.http_pool_size)),
                 ("image_workers", str(perf.image_workers)),
+                ("gc_threshold", str(perf.gc_threshold)),
+                ("uvloop", self._bool(perf.uvloop)),
+                ("use_orjson", self._bool(perf.use_orjson)),
+                (
+                    "batch_page_downloads",
+                    str(perf.batch_page_downloads),
+                ),
+                ("prefetch_pages", str(perf.prefetch_pages)),
+                (
+                    "streaming_chunk_size_kb",
+                    str(perf.streaming_chunk_size_kb),
+                ),
             ],
         )
 
@@ -845,6 +910,14 @@ class SettingsScreen(Screen[None]):
                 ("is_development", self._bool(dev.is_development)),
                 ("show_traceback", self._bool(dev.show_traceback)),
                 ("mock_sites", self._bool(dev.mock_sites)),
+                ("reload_on_change", self._bool(dev.reload_on_change)),
+                ("profile_enabled", self._bool(dev.profile_enabled)),
+                ("mock_network", self._bool(dev.mock_network)),
+                ("debug_endpoints", self._bool(dev.debug_endpoints)),
+                (
+                    "seed_db_on_startup",
+                    self._bool(dev.seed_db_on_startup),
+                ),
             ],
         )
 
@@ -933,13 +1006,17 @@ class SettingsScreen(Screen[None]):
     def _mask_root_secret(self, secret: SecretStr) -> str:
         """Render a root :class:`~pydantic.SecretStr` with a length hint.
 
-        A root secret's length is safe to reveal — cryptographic keys
-        have well-defined expected lengths (a Fernet key is exactly 44
-        characters), so the length helps the user confirm "yes, the key
-        is set" without revealing the value. This is a deliberate
-        difference from the proxy URL masking, which reveals nothing —
-        a proxy URL's length is not diagnostic and can hint at the
-        embedded credentials' shape.
+        A root secret's length is informational only — it confirms that
+        the value is set without revealing it. For the two fixed-length
+        secrets (``secret_key`` and ``cookie_encryption_key``, both
+        44-character URL-safe base64 strings) the length is diagnostic;
+        for ``jwt_secret``, which has no fixed length, the displayed
+        length does not narrow an attacker's search more than the fact
+        that the value exists.
+
+        This is a deliberate difference from the proxy URL masking,
+        which reveals nothing — a proxy URL's length is not diagnostic
+        and can hint at the embedded credentials' shape.
         """
         value = secret.get_secret_value()
         if not value:

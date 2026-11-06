@@ -33,6 +33,40 @@ Universal design notes:
       do not re-theme themselves).
     * All callbacks are isolated — a misbehaving host never breaks Tk.
     * Cleans up after itself on ``<Destroy>``.
+
+Layout rebuild semantics
+------------------------
+:meth:`MainView.set_nav_position` and :meth:`MainView.set_state` may call
+:meth:`MainView._rebuild_layout`, which tears down the nav frame, the
+content frame, and every live view instance before rebuilding them under
+the new grid layout.
+
+The teardown is **explicit and hook-respecting**: for every live view, the
+shell calls ``on_deactivate()`` (giving the view a chance to release
+threads, subscriptions, and other resources), then destroys the widget.
+A layout switch is a legitimate time for a view to lose transient state
+(a window resize is not a UX-level navigation event, but a left-to-right
+swap is a large change that the host should observe). The alternative —
+silently destroying the widgets without calling ``on_deactivate`` —
+leaks whatever the view's ``__init__`` acquired.
+
+Because the views are destroyed, the current view is re-activated after
+the rebuild: its factory is called again and ``on_activate`` is called
+on the fresh instance. The view spec is responsible for rebuilding the
+state it needs from its own source (the database, the settings object,
+the last request). A view that cannot rebuild its state from scratch
+should be marked ``destroy_on_hide=False`` and register itself in the
+shell's preload list — the layout rebuild respects that.
+
+Idempotent set_state
+--------------------
+:meth:`MainView.set_state` used to call ``set_nav_position`` and
+``set_current`` unconditionally. When the target state matched the
+current one, this triggered a full ``_rebuild_layout`` (destroying and
+recreating every live view) followed by another view swap — a double
+``on_activate`` and unnecessary work. The current implementation checks
+each field against the current one and only acts when it actually
+changes.
 """
 from __future__ import annotations
 
@@ -89,6 +123,7 @@ class MainViewLabels:
     status_info: str = ""
     status_warning: str = "Warning"
     status_error: str = "Error"
+    status_success: str = "OK"
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +143,7 @@ _THEME_LIGHT = {
     "status_info": "#1A1A1A",
     "status_warning": "#7A5A00",
     "status_error": "#C0392B",
+    "status_success": "#1E6E39",
 }
 
 _THEME_DARK = {
@@ -123,13 +159,14 @@ _THEME_DARK = {
     "status_info": "#DCDCDC",
     "status_warning": "#FFD966",
     "status_error": "#E74C3C",
+    "status_success": "#A4E5B8",
 }
 
 _THEME_POLL_MS = 1000
 _STATUS_HIDE_MS = 5000
 _COLLAPSED_WIDTH = 52
 _NAV_POSITIONS = ("left", "top")
-_STATUS_KINDS = ("info", "warning", "error")
+_STATUS_KINDS = ("info", "warning", "error", "success")
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +284,7 @@ class MainView(ctk.CTkFrame):
 
         self.set_current(self._initial_view_id, notify=False)
 
-        self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_theme_check()
 
     # ------------------------------------------------------------------
@@ -423,15 +460,28 @@ class MainView(ctk.CTkFrame):
 
         Unknown or missing keys are silently ignored — safe against version
         drift.
+
+        Each field is checked against the current one and only acted upon
+        when it actually changes. A state that matches the current one is
+        a no-op — without the idempotency check, a "same state" call
+        would rebuild the layout (destroying every live view) and then
+        rebuild it back, causing a double ``on_activate`` on the current
+        view for no visible reason.
         """
         if self._destroyed:
             return
+        # Phase 1: layout state (may rebuild the structure).
         pos = state.get("nav_position")
-        if isinstance(pos, str) and pos in _NAV_POSITIONS:
+        if (
+            isinstance(pos, str)
+            and pos in _NAV_POSITIONS
+            and pos != self._nav_position
+        ):
             self.set_nav_position(pos)
         coll = state.get("nav_collapsed")
-        if isinstance(coll, bool):
+        if isinstance(coll, bool) and coll != self._collapsed:
             self.set_nav_collapsed(coll)
+        # Phase 2: current view (no rebuild).
         current = state.get("current_view")
         if isinstance(current, str) and current in self._views_by_id:
             self.set_current(current)
@@ -443,18 +493,44 @@ class MainView(ctk.CTkFrame):
     def _build(self) -> None:
         self._rebuild_layout()
 
-        if self._show_status_bar:
-            self._status_bar = ctk.CTkFrame(
-                self, corner_radius=0, fg_color=self._theme()["status_bg"]
-            )
-            self._status_label = ctk.CTkLabel(
-                self._status_bar, text="", anchor="w", font=("", 11)
-            )
-            self._status_label.pack(fill="x", padx=10, pady=4)
-
     def _rebuild_layout(self) -> None:
-        """(Re)construct the outer grid based on nav_position."""
-        # Clear existing structural widgets.
+        """(Re)construct the outer grid based on nav_position.
+
+        Every live view is deactivated (``on_deactivate()``) and
+        destroyed before the structural frames are torn down — the views
+        live inside ``_content_frame`` and destroying the frame without
+        notifying them would leak whatever they hold (threads, event
+        subscriptions, async tasks). The current view is re-activated
+        after the rebuild; its factory is called fresh, and the view is
+        responsible for reconstructing the state it needs.
+
+        See the module docstring's "Layout rebuild semantics" section.
+        """
+        # Phase 1: deactivate every live view and destroy them
+        # explicitly so a view's on_deactivate hook always runs.
+        for view_id in list(self._instances.keys()):
+            instance = self._instances.get(view_id)
+            if instance is None:
+                continue
+            if isinstance(instance, _DeactivatableView) and callable(
+                getattr(instance, "on_deactivate", None)
+            ):
+                try:
+                    instance.on_deactivate()
+                except Exception:
+                    _log.exception(
+                        "on_deactivate raised for view {!r} during layout "
+                        "rebuild",
+                        view_id,
+                    )
+            try:
+                instance.destroy()
+            except Exception:
+                pass
+        self._instances.clear()
+        self._nav_buttons.clear()
+
+        # Phase 2: tear down the structural frames.
         for attr in ("_nav_frame", "_content_frame", "_status_bar"):
             existing = getattr(self, attr, None)
             if existing is not None:
@@ -468,8 +544,8 @@ class MainView(ctk.CTkFrame):
                 child.destroy()
             except Exception:
                 pass
-        self._nav_buttons.clear()
 
+        # Phase 3: build the new layout.
         if self._nav_position == "left":
             self.grid_columnconfigure(0, weight=0)
             self.grid_columnconfigure(1, weight=1)
@@ -528,22 +604,12 @@ class MainView(ctk.CTkFrame):
             )
             self._status_label.pack(fill="x", padx=10, pady=4)
 
-        # Re-parent existing view instances into the new content frame.
-        for view_id, instance in list(self._instances.items()):
-            try:
-                instance.master  # type: ignore[attr-defined]
-            except Exception:
-                continue
-            try:
-                instance.destroy()
-            except Exception:
-                pass
-            self._instances.pop(view_id, None)
-
-        # Re-activate the current view in the new layout.
+        # Phase 4: re-activate the current view (if any). Its instance
+        # was destroyed in phase 1, so this rebuilds it from the spec.
         if self._current_view_id is not None:
+            current_id = self._current_view_id
             self._current_view_id = None
-            self.set_current(self._initial_view_id, notify=False)
+            self.set_current(current_id, notify=False)
 
     def _rebuild_nav(self) -> None:
         if not hasattr(self, "_nav_frame") or self._nav_frame is None:
@@ -708,6 +774,9 @@ class MainView(ctk.CTkFrame):
     def _install_shortcuts(self) -> None:
         if not self._shortcuts_enabled:
             return
+        # Idempotent — a second install would attach duplicate handlers
+        # to the top-level window.
+        self._uninstall_shortcuts()
         try:
             top = self.winfo_toplevel()
         except Exception:
@@ -826,11 +895,15 @@ class MainView(ctk.CTkFrame):
         self._theme_after_id = None
         if self._destroyed:
             return
-        current = self._current_mode()
-        if current != self._last_theme_mode:
-            self._last_theme_mode = current
-            self._apply_theme()
-        self._schedule_theme_check()
+        try:
+            current = self._current_mode()
+            if current != self._last_theme_mode:
+                self._last_theme_mode = current
+                self._apply_theme()
+        finally:
+            # Always reschedule — a single failure in ``_apply_theme``
+            # must not stop the polling loop for the widget's lifetime.
+            self._schedule_theme_check()
 
     # ------------------------------------------------------------------
     # Misc
@@ -848,6 +921,8 @@ class MainView(ctk.CTkFrame):
 
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._destroyed:
             return
         self._destroyed = True
         self._uninstall_shortcuts()

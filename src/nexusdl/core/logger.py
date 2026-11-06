@@ -135,6 +135,18 @@ the class, so it is imported from ``loguru._logger`` under
 ``from __future__ import annotations``, the annotation is never evaluated
 at runtime — the import is only visible to mypy/pyright, not to the
 interpreter. See the module-level import block for the exact form.
+
+Frozen-environment note
+-----------------------
+The :class:`_InterceptHandler`'s frame-walking loop compares each
+frame's ``co_filename`` against :data:`_STDLIB_LOGGING_FILE`, the
+value of ``logging.__file__`` captured once at import time. In a
+frozen binary (PyInstaller, cx_Freeze, Nuitka) or an embedded
+interpreter, ``logging.__file__`` may be ``None``; the constant then
+holds ``None`` and the walk short-circuits to the standard depth,
+which is the best-effort behaviour — the stdlib frames cannot be
+identified without the path, so loguru's default two-frame skip is
+used. This is documented in the handler's ``emit`` docstring as well.
 """
 
 from __future__ import annotations
@@ -184,6 +196,17 @@ _PRETTY_FORMAT: Final[str] = (
     "<level>{level: <8}</level> | "
     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
     "<level>{message}</level>"
+)
+
+#: Value of ``logging.__file__``, captured once at import time so the
+#: frame-walking loop in :meth:`_InterceptHandler.emit` does not
+#: re-read the attribute on every record (a negligible cost, but the
+#: captured value is also useful as a module-level constant that a test
+#: can monkeypatch). ``None`` in a frozen binary or embedded
+#: interpreter — the loop tolerates it. See the module docstring's
+#: "Frozen-environment note" section.
+_STDLIB_LOGGING_FILE: Final[str | None] = getattr(
+    logging, "__file__", None
 )
 
 #: Type alias for the ``format`` parameter, matching
@@ -240,14 +263,25 @@ class _InterceptHandler(logging.Handler):
         # documented "traceback depth" for direct calls; the loop keeps
         # walking while we are still inside the stdlib logging module
         # (some libraries wrap logging via a shim that adds more frames).
+        #
+        # ``_STDLIB_LOGGING_FILE`` is captured once at import time (see
+        # its definition). When it is ``None`` — frozen binaries,
+        # embedded interpreters — the comparison below can never match,
+        # so the loop exits on the first iteration and ``depth`` stays
+        # at 2, which is loguru's documented default. The output then
+        # names the immediate stdlib handler as the caller rather than
+        # the user code; that is a cosmetic degradation, not a crash,
+        # and the alternative (walking blindly by depth) would be
+        # wrong on any other stdlib-wrapper shim.
         frame: Any = logging.currentframe()
         depth = 2
-        while frame is not None:
-            if frame.f_code.co_filename == logging.__file__:
-                frame = frame.f_back
-                depth += 1
-            else:
-                break
+        if _STDLIB_LOGGING_FILE is not None:
+            while frame is not None:
+                if frame.f_code.co_filename == _STDLIB_LOGGING_FILE:
+                    frame = frame.f_back
+                    depth += 1
+                else:
+                    break
 
         logger.opt(depth=depth, exception=record.exc_info).log(
             level, record.getMessage()
@@ -387,6 +421,14 @@ def configure_logging(
     # formatted stdlib streams are worse than losing a caller's custom
     # handlers; a caller that needs a custom handler installs it after
     # this function returns.
+    #
+    # ``level=0`` sets the root logger's level to NOTSET so that every
+    # record reaches ``_InterceptHandler.emit``. Loguru's own level
+    # filter (the ``level=`` argument on the sinks above) is what
+    # actually gates output — the stdlib level is deliberately not a
+    # second filter. Passing anything other than 0 here would silently
+    # drop DEBUG/TRACE records from third-party libraries before they
+    # ever reach loguru.
     logging.basicConfig(
         handlers=[_InterceptHandler()],
         level=0,

@@ -2,8 +2,8 @@
 
 This package is the **CLI and TUI interface layer** — the adapters that
 turn the framework in :mod:`nexusdl.core` into a usable, interactive
-terminal experience. It is divided into four sub-systems, each with its
-own composition root and its own collaborators:
+terminal experience. It is divided into four sub-system **modules**,
+each with its own composition root and its own collaborators:
 
 * :mod:`~nexusdl.interfaces.cli.cli_entry` — the **CLI entry point and
   composition root**. Defines the root :class:`typer.Typer` application
@@ -104,16 +104,27 @@ Dependency graph (no cycles)::
     nexusdl.interfaces.cli
     ├── cli_entry  → typer, all core.*, .commands
     ├── commands   → typer, rich, all core.*
-    ├── app        → textual, .config, .screens.main, .widgets.log_viewer
+    ├── app        → textual, .config, .screens.main, .widgets.log_viewer,
+    │                theme.tcss (via CSS_PATH)
     ├── config     → textual.theme, loguru, core.constants
     ├── screens    → textual, .widgets, core.*
     └── widgets    → textual, core.*
 
-The submodules are **independent at the module level** — no submodule
-imports a sibling except ``cli_entry → commands`` and
-``app → config / screens / widgets``. Both of those are one-directional
-and match the composition-root pattern: the entry point is the only
-authority that assembles its collaborators.
+The diagram shows **module-level** imports. Two rules follow from it:
+
+* **Cross-module imports are limited and one-directional.**
+  ``cli_entry`` imports ``commands`` (the entry point assembles the
+  command tree). ``app`` imports ``config``, ``screens``, and
+  ``widgets`` (the TUI composition root assembles its collaborators).
+  No other pair of top-level modules imports each other, and every
+  arrow points from a composition root to its subordinates.
+
+* **Intra-package imports are unconstrained.** Within ``screens/``,
+  ``main.py`` imports every other screen (it is the TUI's screen-graph
+  composition root — see its module docstring). Within ``widgets/``,
+  widgets are independent leaves and never import each other. The
+  ``screens → widgets`` arrow in the diagram covers the whole
+  sub-package relationship, not just a single module's imports.
 """
 
 from __future__ import annotations

@@ -24,13 +24,33 @@ loguru sink may run in any thread (including worker threads spawned by
 thread. The bridge is a :class:`queue.SimpleQueue`: the sink enqueues,
 a :class:`textual.timer.Timer` started on mount drains every 100 ms.
 
+Clearing under concurrent pushes
+--------------------------------
+:meth:`LogViewer.clear` does **not** replace the pending
+:class:`queue.SimpleQueue`. Replacing it would race a concurrent
+:meth:`LogViewer.push_entry` from a worker thread: the sink reads the
+``SimpleQueue`` reference, then ``clear`` reassigns the attribute, then
+the sink enqueues into the orphaned queue — which the next drain
+iteration will never read. The entry is silently dropped.
+
+Instead, the queue is **stable** across clears, and each enqueued entry
+carries a **generation number**. ``clear`` increments the generation;
+the drain loop discards entries whose generation does not match the
+current one. The queue is never reassigned, so a concurrent push always
+lands in the live queue; the generation check makes sure an entry
+queued just before a ``clear`` does not surface after it.
+
+The generation counter is a plain :class:`int`. Reads and writes of
+``int`` are atomic in CPython, so the counter does not need its own
+lock — the atomicity of the ``SimpleQueue`` does the rest.
+
 Ring buffer and filter rebuild
 ------------------------------
 Two buffers, two purposes:
 
 * **Pending queue** — a :class:`queue.SimpleQueue` holding entries the
   sink has pushed since the last drain. Thread-safe and unbounded (in
-  practice drained every 100 ms).
+  practice drained every 100 ms). Stable across ``clear`` — see above.
 * **Ring buffer** — a :class:`collections.deque` with
   ``maxlen=_RING_SIZE`` holding the most recent entries. Bounded so a
   long-running session's memory footprint stays flat.
@@ -54,6 +74,14 @@ This is the standard "freeze the view" model used by every log viewer
 in every IDE. The alternative — stopping entry ingestion while paused —
 would silently drop log lines from the ring buffer, which is a data-loss
 surprise the user did not ask for.
+
+The same pause rule applies to the filter-change rebuild: while paused,
+changing the level does not scroll the display, so the user who paused
+to read a specific line does not lose their place when they refine the
+filter. The rebuild writes every passing entry with
+``scroll_end=False`` and only calls ``scroll_end(animate=False)`` at
+the end when the widget is not paused — the same final state as the
+drain path, expressed uniformly.
 
 Localisation
 ------------
@@ -230,10 +258,14 @@ class LogEntry:
             A level name the widget does not recognise is treated as
             ``INFO`` for filtering and rendered with the default style —
             the widget never rejects a log record.
-        timestamp: Timezone-aware datetime, produced by loguru's record
-            field ``time``. The widget displays only the time-of-day
-            component; the full timestamp is retained for a future
-            "export" or "inspect line" feature.
+        timestamp: Wall-clock datetime, produced by loguru's record
+            field ``time``. Loguru in its default configuration emits
+            **timezone-naive** datetimes in the process's local
+            timezone; the widget displays only the time-of-day
+            component (``HH:MM:SS.mmm``), which is what the user reads.
+            A caller that wants UTC display must convert before
+            constructing the entry — the widget does not silently
+            reinterpret a value the producer chose.
         component: The ``component`` extra set by
             :func:`~nexusdl.core.logger.get_logger` (or by a module's
             direct ``logger.bind(component=...)`` call). Empty when the
@@ -291,7 +323,7 @@ class LogEntry:
         if isinstance(timestamp_raw, datetime):
             timestamp = timestamp_raw
         else:
-            timestamp = datetime.now(UTC)
+            timestamp = datetime.now()
 
         extra_raw: Any = record.get("extra") or {}
         if isinstance(extra_raw, Mapping):
@@ -341,7 +373,8 @@ class LogViewer(Vertical):
     """A Textual widget displaying a live stream of log records.
 
     See the module docstring for the stream contract, the ring buffer /
-    filter rebuild model, the pause semantics, and the colour palette.
+    filter rebuild model, the pause semantics, the concurrent-clear
+    guarantee, and the colour palette.
 
     Args:
         translator: The localisation service. When ``None`` (the
@@ -427,8 +460,22 @@ class LogViewer(Vertical):
 
         #: The pending queue, filled by :meth:`push_entry` from any
         #: thread and drained by :meth:`_drain` on the app thread.
-        #: Reassigned on :meth:`clear` to drop in-flight entries.
-        self._pending: SimpleQueue[LogEntry] = SimpleQueue()
+        #:
+        #: **Never reassigned** — see the module docstring's "Clearing
+        #: under concurrent pushes" section. A reassignment would race
+        #: a concurrent push from a worker thread, and the entry would
+        #: land in an orphaned queue. Clears are expressed via the
+        #: ``_generation`` counter instead.
+        self._pending: SimpleQueue[tuple[int, LogEntry]] = SimpleQueue()
+
+        #: Monotonic generation, incremented by :meth:`clear`. Each
+        #: enqueued entry carries the generation that was current at
+        #: ``push_entry`` time; the drain loop discards entries whose
+        #: generation does not match, so an entry queued just before a
+        #: clear never surfaces after it. The value is a plain ``int``
+        #: — reads and writes are atomic in CPython — so no lock is
+        #: needed around the counter itself.
+        self._generation: int = 0
 
     # ------------------------------------------------------------------ #
     # Compose                                                            #
@@ -485,18 +532,19 @@ class LogViewer(Vertical):
 
         **Thread-safe and non-blocking** — may be called from a loguru
         sink running in any thread, including worker threads. The entry
-        is queued and processed on the app thread by the drain timer
-        within 100 ms.
-
-        The call is a no-op under no conditions; entries are always
-        queued. If the widget has been cleared concurrently, an entry
-        queued just before the clear may or may not be displayed —
-        acceptable for a sub-100-ms race in a log display.
+        is queued with the current generation stamp and processed on
+        the app thread by the drain timer within 100 ms.
 
         Args:
             entry: The record to display.
         """
-        self._pending.put(entry)
+        # Read the generation once; if a clear happens between this
+        # read and the enqueue, the entry carries the pre-clear
+        # generation and the next drain discards it — exactly the
+        # behaviour the "Clearing under concurrent pushes" section
+        # describes.
+        generation = self._generation
+        self._pending.put((generation, entry))
 
     def toggle_pause(self) -> None:
         """Flip the auto-scroll pause state.
@@ -514,12 +562,20 @@ class LogViewer(Vertical):
     def clear(self) -> None:
         """Clear every displayed entry and the internal ring buffer.
 
-        In-flight entries queued before the call may still appear — the
-        pending queue is replaced, so a fresh queue accepts new pushes
-        without racing against an about-to-be-drained old queue.
+        Increments the generation counter, so any entry that was queued
+        by a concurrent :meth:`push_entry` **before** this call is
+        discarded by the next drain rather than surfacing after the
+        clear. Entries queued after this call carry the new generation
+        and are displayed normally.
+
+        The pending :class:`queue.SimpleQueue` is **not** reassigned —
+        see the module docstring's "Clearing under concurrent pushes"
+        section. A concurrent push that reads the queue reference
+        before this call therefore still lands in the live queue; the
+        generation check is what prevents the entry from being shown.
         """
+        self._generation += 1
         self._ring.clear()
-        self._pending = SimpleQueue()
         self.query_one(f"#{_ID_BODY}", RichLog).clear()
 
     def action_clear(self) -> None:
@@ -562,14 +618,21 @@ class LogViewer(Vertical):
 
         Runs on the app thread (started by :meth:`on_mount` via
         ``set_interval``). Bounded by the pending queue's current size,
-        which is bounded by the push rate over 100 ms.
+        which is bounded by the push rate over 100 ms. Entries with a
+        stale generation stamp (queued before a ``clear``) are
+        discarded without being appended.
         """
         rich_log = self.query_one(f"#{_ID_BODY}", RichLog)
+        current_generation = self._generation
         while True:
             try:
-                entry = self._pending.get_nowait()
+                generation, entry = self._pending.get_nowait()
             except Empty:
                 break
+            if generation != current_generation:
+                # Entry was queued before a ``clear()`` — discard
+                # silently. See "Clearing under concurrent pushes".
+                continue
             self._ring.append(entry)
             if self._passes_filter(entry):
                 rich_log.write(
@@ -584,6 +647,10 @@ class LogViewer(Vertical):
         back every retained entry that passes the new filter, so a user
         who changes the filter sees the maximum amount of history the
         widget retained — not just entries logged after the change.
+
+        The pause state is respected: while paused, the rebuild does
+        not scroll the display, so a user who paused to read a line
+        does not lose their place when they refine the filter.
         """
         rich_log = self.query_one(f"#{_ID_BODY}", RichLog)
         rich_log.clear()

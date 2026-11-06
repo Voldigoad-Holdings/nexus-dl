@@ -30,8 +30,11 @@ What this module implements
   - ``5xx``, network failure, timeout → **allow all** (RFC 9309
     §2.3.1.4 "Unreachable"). A site whose ``robots.txt`` is broken is
     not the site that wants to be left alone; it is the site whose
-    operators have a bug to fix.
-  - Parse failure on a 200 response → **allow all**, with a log line.
+    operators have a bug to fix. This case is also tracked as a
+    **soft-fail** and surfaced as :attr:`ComplianceStatus.UNKNOWN`
+    by :meth:`ComplianceChecker.get_status`.
+  - Parse failure on a 200 response → **allow all** (soft-fail), with
+    a log line.
 
 * **The :class:`ComplianceError` raise is opt-in via** :meth:`check`.
   Callers that want strict refusal call :meth:`check`; callers that
@@ -74,9 +77,9 @@ What this module deliberately does **not** do
 Design invariants
 -----------------
 * **Soft fail, never crash.** A ``robots.txt`` that cannot be fetched,
-  times out, or contains garbage is treated as "allow all" and logged.
-  A compliance check that brings the pipeline down is worse than no
-  compliance check at all.
+  times out, returns a ``5xx``, or contains garbage is treated as
+  "allow all" and logged. A compliance check that brings the pipeline
+  down is worse than no compliance check at all.
 * **Cancellation propagates.** ``asyncio.CancelledError`` from the
   underlying session fetch propagates untouched — a cancelled
   compliance check leaves the cache unchanged and re-raises to the
@@ -120,7 +123,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Protocol
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 from loguru import logger
 
@@ -439,10 +442,11 @@ class ComplianceStats:
         cached_sites: Number of sites whose ``robots.txt`` is currently
             cached and fresh.
         fetch_failures: Cumulative count of ``robots.txt`` fetches that
-            failed (network, timeout, malformed) and fell back to
-            "allow all". Every increment is a soft-fail — reported here
-            so an operator who trusts compliance can notice the site
-            they are checking against is not actually protecting them.
+            failed (network, timeout, ``5xx`` server error, malformed
+            body) and fell back to "allow all". Every increment is a
+            soft-fail — reported here so an operator who trusts
+            compliance can notice the site they are checking against is
+            not actually protecting them.
     """
 
     checked_urls: int
@@ -510,15 +514,12 @@ class ComplianceChecker:
             enabled=settings.compliance.respect_robots_txt,
             user_agent="NexusDL",
         )
-        try:
-            await checker.check(
-                "https://example.org/manga/xyz", site_id="example"
-            )
-            response = await session.get(
-                "https://example.org/manga/xyz", site_id="example"
-            )
-        finally:
-            pass  # nothing to close — the checker owns no resources
+        await checker.check(
+            "https://example.org/manga/xyz", site_id="example"
+        )
+        response = await session.get(
+            "https://example.org/manga/xyz", site_id="example"
+        )
 
     Args:
         http_session: Session used to fetch ``robots.txt``. Must
@@ -590,8 +591,11 @@ class ComplianceChecker:
         self._fetch_timeout = float(fetch_timeout_seconds)
         self._clock = clock
 
-        #: Cache key → (parsed robots, expiry timestamp).
-        self._cache: dict[str, tuple[RobotsTxt, float]] = {}
+        #: Cache key → (parsed robots, expiry timestamp, was soft-fail).
+        #: The soft-fail flag lets :meth:`get_status` distinguish
+        #: "explicitly allowed" from "we could not fetch a policy and
+        #: fell back to allow-all".
+        self._cache: dict[str, tuple[RobotsTxt, float, bool]] = {}
         self._cache_lock = asyncio.Lock()
 
         self._checked_urls = 0
@@ -681,7 +685,9 @@ class ComplianceChecker:
             return True
 
         cache_key = site_id if site_id is not None else host
-        robots = await self._get_robots(parsed, cache_key)
+        robots, _was_soft_fail = await self._get_robots(
+            parsed, cache_key
+        )
 
         path = parsed.path or "/"
         if parsed.query:
@@ -728,7 +734,9 @@ class ComplianceChecker:
         if not host:
             return None
         cache_key = site_id if site_id is not None else host
-        robots = await self._get_robots(parsed, cache_key)
+        robots, _was_soft_fail = await self._get_robots(
+            parsed, cache_key
+        )
         return robots.crawl_delay
 
     async def get_status(
@@ -740,11 +748,11 @@ class ComplianceChecker:
         """Return the three-way verdict for *url*.
 
         Mirrors :meth:`is_allowed` but preserves the distinction
-        between "explicitly allowed" and "no ``robots.txt`` policy
-        available". A caller rendering a diagnostic table uses this;
-        a caller issuing a request uses :meth:`is_allowed` (the
-        behaviour is identical for ``UNKNOWN`` — soft fail means
-        allowed).
+        between "explicitly allowed", "explicitly disallowed", and
+        "no policy available" (soft-fail). A caller rendering a
+        diagnostic table uses this; a caller issuing a request uses
+        :meth:`is_allowed` (the behaviour is identical for
+        ``UNKNOWN`` — soft fail means allowed).
 
         Args:
             url: The URL to inspect.
@@ -752,10 +760,10 @@ class ComplianceChecker:
 
         Returns:
             :attr:`ComplianceStatus.DISALLOWED` if a rule disallows
-            the URL, :attr:`ComplianceStatus.ALLOWED` if compliance
-            is disabled or the policy is available and allows the URL,
-            :attr:`ComplianceStatus.UNKNOWN` if the ``robots.txt``
-            could not be fetched and the verdict was soft-failed.
+            the URL, :attr:`ComplianceStatus.UNKNOWN` if the
+            ``robots.txt`` could not be fetched (network failure,
+            ``5xx``, timeout, or parse error) and the verdict was
+            soft-failed, :attr:`ComplianceStatus.ALLOWED` otherwise.
         """
         self._checked_urls += 1
 
@@ -769,7 +777,9 @@ class ComplianceChecker:
             return ComplianceStatus.ALLOWED
 
         cache_key = site_id if site_id is not None else host
-        robots = await self._get_robots(parsed, cache_key)
+        robots, was_soft_fail = await self._get_robots(
+            parsed, cache_key
+        )
 
         path = parsed.path or "/"
         if parsed.query:
@@ -778,13 +788,8 @@ class ComplianceChecker:
         if not robots.is_allowed(path):
             self._disallowed_urls += 1
             return ComplianceStatus.DISALLOWED
-        # We cannot distinguish ALLOWED from UNKNOWN without tracking
-        # whether the robots fetch succeeded — the cache stores the
-        # result, not the failure reason. The safe interpretation
-        # matches :meth:`is_allowed`: everything not DISALLOWED is
-        # ALLOWED. A caller that needs the UNKNOWN distinction
-        # inspects :meth:`stats` (`fetch_failures > 0`) or calls
-        # :meth:`get_robots_txt_text` and inspects the raw body.
+        if was_soft_fail:
+            return ComplianceStatus.UNKNOWN
         return ComplianceStatus.ALLOWED
 
     async def get_robots_txt_text(
@@ -844,7 +849,8 @@ class ComplianceChecker:
         now = self._clock()
         async with self._cache_lock:
             fresh_count = sum(
-                1 for _robots, expiry in self._cache.values()
+                1
+                for _robots, expiry, _soft_fail in self._cache.values()
                 if expiry > now
             )
         return ComplianceStats(
@@ -859,46 +865,66 @@ class ComplianceChecker:
     # ------------------------------------------------------------------ #
 
     async def _get_robots(
-        self, parsed: object, cache_key: str
-    ) -> RobotsTxt:
+        self, parsed: ParseResult, cache_key: str
+    ) -> tuple[RobotsTxt, bool]:
         """Return the parsed ``robots.txt`` for *cache_key*, fetching on miss.
 
-        Caller has already resolved *parsed* (the result of
-        ``urlparse``) and *cache_key*. The fetch runs outside the cache
-        lock so a slow fetch for one site does not block checks for
-        another; two concurrent misses for the same site may issue two
-        fetches (accepted — ``robots.txt`` is idempotent).
+        Returns a ``(robots, was_soft_fail)`` tuple. The boolean is
+        ``True`` when the fetch failed (network, timeout, ``5xx``,
+        parse error) and the returned ``robots`` is the allow-all
+        fallback — the caller uses it to surface
+        :attr:`ComplianceStatus.UNKNOWN` when appropriate.
+
+        The fetch runs outside the cache lock so a slow fetch for one
+        site does not block checks for another; two concurrent misses
+        for the same site may issue two fetches (accepted —
+        ``robots.txt`` is idempotent).
         """
         async with self._cache_lock:
             entry = self._cache.get(cache_key)
             if entry is not None and entry[1] > self._clock():
-                return entry[0]
+                return entry[0], entry[2]
 
-        robots = await self._fetch_robots(parsed, cache_key)
+        robots, was_soft_fail = await self._fetch_robots(
+            parsed, cache_key
+        )
 
-        async with self._cache_lock:
-            self._cache[cache_key] = (
-                robots,
-                self._clock() + self._cache_ttl,
-            )
-        return robots
+        # A zero TTL disables caching; skip the write so the cache
+        # does not grow unbounded in a debug configuration.
+        if self._cache_ttl > 0:
+            async with self._cache_lock:
+                self._cache[cache_key] = (
+                    robots,
+                    self._clock() + self._cache_ttl,
+                    was_soft_fail,
+                )
+        return robots, was_soft_fail
 
     async def _fetch_robots(
-        self, parsed: object, cache_key: str
-    ) -> RobotsTxt:
-        """Fetch and parse ``robots.txt``, translating status codes per RFC 9309."""
-        # Late import to keep the module's import surface minimal.
+        self, parsed: ParseResult, cache_key: str
+    ) -> tuple[RobotsTxt, bool]:
+        """Fetch and parse ``robots.txt``, translating status codes per RFC 9309.
+
+        Returns a ``(robots, was_soft_fail)`` tuple. The boolean is
+        ``True`` when the fetch failed and the returned ``robots`` is
+        the allow-all fallback, ``False`` when the server returned a
+        definitive answer (``200``, ``401``/``403``, or another
+        ``4xx`` meaning "no robots.txt").
+        """
         raw, status = await self._fetch_with_status(parsed, cache_key)
 
         if status is None:
             # Network failure or timeout — RFC 9309 §2.3.1.4
             # "Unreachable": soft-fail to allow-all.
             self._fetch_failures += 1
-            return RobotsTxt.allow_all()
+            return RobotsTxt.allow_all(), True
 
         if 200 <= status < 300:
             try:
-                return RobotsTxt.parse(raw or "", user_agent=self._user_agent)
+                return (
+                    RobotsTxt.parse(raw or "", user_agent=self._user_agent),
+                    False,
+                )
             except Exception as exc:  # noqa: BLE001 — parser is total but defensive
                 self._fetch_failures += 1
                 _log.warning(
@@ -907,7 +933,7 @@ class ComplianceChecker:
                     type(exc).__name__,
                     exc,
                 )
-                return RobotsTxt.allow_all()
+                return RobotsTxt.allow_all(), True
 
         if status in (401, 403):
             # RFC 9309 §2.3.1.3 "Unauthorized" — disallow all.
@@ -917,25 +943,36 @@ class ComplianceChecker:
                 cache_key,
                 status,
             )
-            return RobotsTxt.disallow_all()
+            return RobotsTxt.disallow_all(), False
 
-        # 4xx other than 401/403 — RFC 9309 §2.3.1.3 "Unavailable":
-        # allow all. A site whose robots.txt is missing has no policy.
-        return RobotsTxt.allow_all()
+        if 400 <= status < 500:
+            # Other 4xx — RFC 9309 §2.3.1.3 "Unavailable": allow all.
+            # A site whose robots.txt is missing has no policy; this
+            # is a definitive answer, not a soft-fail.
+            return RobotsTxt.allow_all(), False
+
+        # 5xx — RFC 9309 §2.3.1.4 "Unreachable": soft-fail to allow-all.
+        self._fetch_failures += 1
+        _log.debug(
+            "robots.txt for {!r} returned HTTP {}; treating as "
+            "unreachable, allow-all",
+            cache_key,
+            status,
+        )
+        return RobotsTxt.allow_all(), True
 
     async def _fetch_raw(
-        self, parsed: object, site_id: str | None
+        self, parsed: ParseResult, site_id: str | None
     ) -> str | None:
         """Fetch ``robots.txt`` and return the raw text, or ``None`` on failure."""
-        raw, status = await self._fetch_with_status(
-            parsed, site_id or str(parsed)
-        )
+        log_key = site_id or parsed.hostname or "unknown"
+        raw, status = await self._fetch_with_status(parsed, log_key)
         if status is None or not (200 <= status < 300):
             return None
         return raw
 
     async def _fetch_with_status(
-        self, parsed: object, log_key: str
+        self, parsed: ParseResult, log_key: str
     ) -> tuple[str | None, int | None]:
         """Fetch ``robots.txt`` and return ``(text, status_code)``.
 
@@ -1128,6 +1165,11 @@ def _select_group(
     * If multiple groups tie on specificity, their directives are
       concatenated (RFC 9309 requires the merge).
 
+    The specificity of a *group* is computed as the maximum over its
+    agents — a group that lists ``User-agent: foo`` and
+    ``User-agent: bar`` contributes its directives **once** when
+    either token matches, not twice.
+
     Args:
         groups: The output of :func:`_iter_groups`.
         user_agent: The UA token to match. Passed lowercased by the
@@ -1142,19 +1184,31 @@ def _select_group(
     best_directives: list[tuple[str, str]] | None = None
 
     for agents, directives in groups:
+        # Best specificity for THIS group across its agents.
+        group_specificity = -1
         for agent in agents:
             if agent == "*":
-                specificity = 0
+                spec = 0
             elif agent in ua_lower:
-                specificity = len(agent)
+                spec = len(agent)
             else:
                 continue
-            if specificity > best_specificity:
-                best_specificity = specificity
-                best_directives = list(directives)
-            elif specificity == best_specificity and best_directives is not None:
-                # RFC 9309 §2.2.1: multiple groups at the same
-                # specificity are combined.
+            if spec > group_specificity:
+                group_specificity = spec
+
+        if group_specificity < 0:
+            # This group does not match the requested UA at all.
+            continue
+
+        if group_specificity > best_specificity:
+            best_specificity = group_specificity
+            best_directives = list(directives)
+        elif group_specificity == best_specificity:
+            # RFC 9309 §2.2.1: multiple groups at the same
+            # specificity are combined. The per-group loop ensures
+            # each group contributes exactly once, even when several
+            # of its agents match.
+            if best_directives is not None:
                 best_directives.extend(directives)
 
     return best_directives

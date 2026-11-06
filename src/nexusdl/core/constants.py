@@ -41,8 +41,9 @@ Documented duplication
 Several modules were shipped **before** this file existed, and they
 contain private copies of the constants defined here:
 
-* :mod:`nexusdl.core.config` — private ``_APP_NAME = "nexusdl"`` and
-  ``_DEFAULT_YAML_PACKAGE = "nexusdl.data"``.
+* :mod:`nexusdl.core.config` — private ``_APP_NAME = "nexusdl"``,
+  private ``_DEFAULT_YAML_PACKAGE = "nexusdl.data"``, and the field
+  default ``AppSection.name = "NexusDL"``.
 * :mod:`nexusdl.core.registry.loader` — public ``DATA_PACKAGE = "nexusdl.data"``.
 * :mod:`nexusdl.core.registry.validator` — private ``_SCHEMA_PACKAGE = "nexusdl.data"``.
 * :mod:`nexusdl.core.session.user_agents` — private ``_DATA_PACKAGE = "nexusdl.data"``.
@@ -61,13 +62,35 @@ regardless of which module's copy is used. The problem it creates is
 *maintenance*: an edit to a string in one module would silently diverge
 from the others, and there would be no compile-time signal.
 
+.. warning::
+
+   One substitution in the list above is **not obvious** and will
+   silently corrupt existing installations if done naively:
+   ``_APP_NAME`` in :mod:`nexusdl.core.config` is ``"nexusdl"``
+   (the technical slug, lowercase), so it maps to :data:`APP_SLUG` —
+   **not** to :data:`APP_NAME`, which is ``"NexusDL"`` (the display
+   name, mixed case). Replacing ``_APP_NAME`` with ``APP_NAME``
+   inside ``config.py`` would relocate every existing installation's
+   data, cache, log, and plugin directories from ``nexusdl/`` to
+   ``NexusDL/``, silently orphaning cookies, database, and plugins.
+   The safe substitution is::
+
+       from nexusdl.core.constants import APP_SLUG as _APP_NAME
+
+   (or, cleaner, rename the local constant to ``APP_SLUG`` and update
+   the ~10 call sites in ``config.py`` in a single mechanical commit).
+   The ``AppSection.name = "NexusDL"`` field default is the **opposite
+   case**: it *does* map to :data:`APP_NAME`, because it is a
+   user-facing display string and the case matches — substituting it
+   is safe and recommended.
+
 The refactor is **scheduled, not urgent**, and follows the same rule
 used elsewhere in this codebase: each affected module is opened for the
 substitution the next time it is opened **for any other reason**. The
 substitution is a one-line change per module: replace the private
 constant with ``from nexusdl.core.constants import EVENT_...`` (or
-``APP_SLUG`` / ``DATA_PACKAGE``) and use it as before. No call site
-changes; no behaviour changes.
+``APP_SLUG`` / ``APP_NAME`` / ``DATA_PACKAGE``) and use it as before. No
+call site changes; no behaviour changes.
 
 This file will not reopen any of those modules on its own — the user's
 explicit rule is that a delivered file is final, and adding a constant
@@ -176,6 +199,17 @@ APP_NAME: Final[str] = "NexusDL"
 #: directory would move, and existing files would no longer be found.
 #: The only sanctioned way to change it is a new major release with an
 #: accompanying migration that relocates the existing directories.
+#:
+#: .. warning::
+#:
+#:    Do not confuse this constant with the ``_APP_NAME`` private
+#:    constant in :mod:`nexusdl.core.config`. The config-module copy is
+#:    spelled ``_APP_NAME`` for historical reasons but its **value**
+#:    (``"nexusdl"``) and its **role** (platformdirs application name)
+#:    both match this constant, not :data:`APP_NAME`. A refactoring that
+#:    substitutes ``_APP_NAME`` with ``APP_NAME`` would relocate every
+#:    user's data directory to ``NexusDL/`` — see the "Documented
+#:    duplication" warning in the module docstring.
 APP_SLUG: Final[str] = "nexusdl"
 
 #: Python package path from which the pipeline loads its bundled

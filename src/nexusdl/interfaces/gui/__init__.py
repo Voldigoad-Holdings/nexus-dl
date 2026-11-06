@@ -38,6 +38,25 @@ Sub-package shortcuts
 you access, for instance, ``gui.SearchView``, this package forwards to
 ``gui.views.SearchView`` transparently (two-level lazy chain), caching the
 resolved class in ``globals()`` on success.
+
+Public surface
+==============
+
+:data:`__all__` lists sixty-three symbols, split into:
+
+* **four app-level introspection helpers** (:func:`list_views`,
+  :func:`list_components`, :func:`list_symbols`, :func:`get_symbol`)
+  defined locally in this module,
+* **twenty-nine lazy symbols** — the composition root, the view classes,
+  the component classes — resolved on first access from their submodule,
+* **thirty theme symbols** — imported eagerly so a caller can read a
+  theme without paying for `customtkinter`.
+
+Every lazy symbol is registered in :data:`_SYMBOLS`; every local helper
+is registered in :data:`_LOCAL`. Adding a new export is a one-line change
+to :data:`__all__` plus the matching registry entry; :data:`__all__` is
+asserted to equal the union of the two registries at import time, so a
+future addition cannot ship with an inconsistent surface.
 """
 from __future__ import annotations
 
@@ -45,10 +64,17 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 # --- Package version (soft read from nexusdl.version) -----------------------
-
+#
+# A missing ``nexusdl.version`` module is a broken installation, not a
+# runtime error the GUI can recover from — but we do not want to crash
+# the whole package import on a partially-installed environment. The
+# fallback exists so a caller that only wants to inspect the package
+# (e.g. ``list_symbols()`` in a build script) still works. Any other
+# import failure (a SyntaxError in ``nexusdl/version.py``, a circular
+# import) is a genuine bug and must propagate.
 try:
     from nexusdl.version import __version__ as __version__
-except Exception:  # pragma: no cover - defensive fallback
+except ImportError:  # pragma: no cover - broken installation
     __version__ = "3.0.0"
 
 
@@ -198,6 +224,22 @@ _SYMBOLS: dict[str, tuple[str, str]] = {
     "ChapterRowData": ("components", "ChapterRowData"),
 }
 
+#: Names defined *locally* in this module, never routed through
+#: :data:`_SYMBOLS`. They are the four introspection helpers. Kept in a
+#: separate constant rather than inlined so :func:`list_symbols` and the
+#: ``__all__`` consistency check both derive from one place.
+_LOCAL: frozenset[str] = frozenset(
+    {"list_views", "list_components", "list_symbols", "get_symbol"}
+)
+
+#: Names imported eagerly from :mod:`.theme`. They never route through
+#: :func:`__getattr__` — they are already bound in ``globals()`` before
+#: any lazy access happens. The set is the exact complement of
+#: ``_SYMBOLS ∪ _LOCAL`` within ``__all__``.
+_EAGER: frozenset[str] = frozenset(
+    name for name in __all__ if name not in _SYMBOLS and name not in _LOCAL
+)
+
 
 # ===========================================================================
 # Static re-exports for type checkers and IDEs
@@ -264,7 +306,7 @@ def __getattr__(name: str) -> Any:
 
     entry = _SYMBOLS.get(name)
     if entry is None:
-        available = ", ".join(sorted(_SYMBOLS))
+        available = ", ".join(sorted(list(_SYMBOLS) + list(_LOCAL)))
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}. "
             f"Available lazy symbols: {available}"
@@ -290,8 +332,14 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Expose the full public API to ``dir()``, IDEs and tab-completion."""
-    return sorted(list(globals().keys()) + list(__all__))
+    """Expose the full public API to ``dir()``, IDEs and tab-completion.
+
+    The result is deduplicated: a name that has already been resolved
+    (and therefore appears in ``globals()``) must not also appear via
+    :data:`__all__`. Every IDE and every tab-completion engine assumes
+    the list is a set.
+    """
+    return sorted(set(globals().keys()) | set(__all__))
 
 
 # ===========================================================================
@@ -299,26 +347,55 @@ def __dir__() -> list[str]:
 # ===========================================================================
 
 def list_symbols() -> list[str]:
-    """Return the sorted list of top-level lazy symbols.
+    """Return the sorted list of top-level exports (lazy + eager + local).
 
-    Does **not** include theme (eager) symbols — those are already in
-    ``globals()`` and visible via ``dir()``. Use :func:`dir` for the
-    complete picture.
+    The list is the union of:
+
+    * the twenty-nine **lazy** symbols in :data:`_SYMBOLS`,
+    * the thirty **eager** symbols imported from :mod:`.theme`,
+    * the four **local** introspection helpers (:func:`list_views`,
+      :func:`list_components`, :func:`list_symbols`, :func:`get_symbol`).
+
+    This matches :data:`__all__` exactly — the invariant is checked by
+    the module-level assertion at the bottom of this file.
     """
-    return sorted(_SYMBOLS.keys())
+    return sorted(set(_SYMBOLS) | _LOCAL | _EAGER)
 
 
 def get_symbol(name: str) -> Any:
     """Return the top-level symbol registered under ``name``.
 
-    Works for both eager (theme) and lazy (app / views / components)
-    symbols — it just forwards to :func:`getattr`. Convenient for
-    dynamic lookups (config-driven shells, plugins, parametrized tests).
+    Works for **every** public symbol:
+
+    * a **lazy** symbol routes through :func:`__getattr__` so the cache
+      is populated with the same value a plain attribute access would
+      return. The alternative — ``__import__(__name__, fromlist=[name])``
+      — would import a *submodule* whose name matches the attribute (the
+      pattern is fragile if a future export ever shares its name with a
+      subpackage, e.g. a hypothetical ``"views"`` export).
+    * an **eager** theme symbol is already bound in ``globals()`` — a
+      plain dict lookup.
+    * a **local** helper is already bound in ``globals()`` — a plain
+      dict lookup.
+
+    Convenient for dynamic lookups (config-driven shells, plugins,
+    parametrized tests).
 
     Raises:
-        AttributeError: If ``name`` is not a known public symbol.
+        KeyError: If ``name`` is not a public symbol.
     """
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    if (
+        name not in _SYMBOLS
+        and name not in _LOCAL
+        and name not in _EAGER
+    ):
+        available = ", ".join(list_symbols())
+        raise KeyError(
+            f"Unknown symbol {name!r}. Available symbols: {available}"
+        )
+    if name in _LOCAL or name in _EAGER:
+        return globals()[name]
+    return __getattr__(name)
 
 
 def list_views() -> list[str]:
@@ -338,3 +415,29 @@ def list_components() -> list[str]:
     """
     from .components import list_components as _lc
     return _lc()
+
+
+# ===========================================================================
+# Sanity: __all__ must exactly match the union of lazy + local + eager
+# ===========================================================================
+# This assertion runs at import time and would fail on any future edit
+# that adds a symbol to one registry without adding it to __all__ (or
+# vice versa), or that changes the eager import list without updating
+# __all__. The cost is a single set comparison at import; the benefit is
+# that an inconsistent public surface is caught the moment the package
+# loads, not on the first `from nexusdl.interfaces.gui import *` in a
+# caller.
+
+if frozenset(__all__) != (frozenset(_SYMBOLS) | _LOCAL | _EAGER):
+    _missing_from_all = (
+        (frozenset(_SYMBOLS) | _LOCAL | _EAGER) - frozenset(__all__)
+    )
+    _missing_from_exports = frozenset(__all__) - (
+        frozenset(_SYMBOLS) | _LOCAL | _EAGER
+    )
+    raise RuntimeError(
+        "nexusdl.interfaces.gui.__all__ does not match the union of "
+        f"_SYMBOLS, _LOCAL, and _EAGER. Missing from __all__: "
+        f"{sorted(_missing_from_all)}. Listed but not exported: "
+        f"{sorted(_missing_from_exports)}."
+    )

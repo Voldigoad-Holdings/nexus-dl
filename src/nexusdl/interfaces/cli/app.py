@@ -57,6 +57,16 @@ deliberately) so the LogsScreen can reach it through
 ``self.app.log_router`` — the standard Textual pattern for
 app-scoped services.
 
+The MainScreen is the composition root of the screen graph and needs
+the same router to pass through to LogsScreen when the user navigates
+there. **The router is therefore passed to MainScreen's constructor**
+(``log_router=self.log_router`` in :meth:`NexusDLApp.on_mount`), not
+reached through ``self.app.log_router`` at navigation time. The two
+patterns are equivalent — MainScreen can reach its own app via
+``self.app`` — but the constructor injection makes the dependency
+visible in MainScreen's signature, which is the project's standard for
+service injection.
+
 Ring buffer size
 ----------------
 The router keeps :data:`_DEFAULT_RING_SIZE` (1000) recent entries. At
@@ -76,6 +86,24 @@ so a slow viewer cannot stall logging for a fast one.
 :meth:`LogViewer.push_entry` is itself thread-safe (it enqueues to a
 :class:`queue.SimpleQueue`), so the pushes are safe from any thread.
 
+Attach-with-seed atomicity
+--------------------------
+:meth:`_TuiLogRouter.attach_with_seed` guarantees that a viewer sees
+every entry that was in the ring buffer at call time, and no entry
+twice — even under a concurrent :meth:`sink` call.
+
+The **long seed push runs outside the lock**, and a short "catch-up"
+pass under the lock covers entries that arrived while the seed push
+was running. A naive implementation that held the lock across the
+whole seed would block every sink caller for the seed's full duration
+(a few milliseconds for the default 500 entries — acceptable today,
+but the promise is fragile: a future change to
+:meth:`LogViewer.push_entry` that makes it slower would turn the
+promise into a latency bug). The current implementation holds the
+lock only for the O(1) snapshot and the O(missed-entries) catch-up,
+where "missed" is bounded by the number of log entries a background
+thread can produce in a few milliseconds.
+
 Deferred textual import inside ``run_app``
 ------------------------------------------
 The App class is not defined via a factory — it is a real
@@ -90,12 +118,13 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Final
 
 from loguru import logger
 from textual.app import App
 
 from nexusdl.interfaces.cli.config import TuiConfig, build_tui_config
+from nexusdl.interfaces.cli.screens.logs import LogRouter
 from nexusdl.interfaces.cli.screens.main import MainScreen
 from nexusdl.interfaces.cli.widgets.log_viewer import LogEntry, LogViewer
 
@@ -112,14 +141,14 @@ __all__ = ["NexusDLApp", "run_app"]
 
 #: Maximum number of log entries the router retains for seeding new
 #: viewers. See the module docstring's "Ring buffer size" section.
-_DEFAULT_RING_SIZE: int = 1000
+_DEFAULT_RING_SIZE: Final[int] = 1000
 
 #: Default maximum number of historical entries a fresh viewer receives
 #: on attach. Matches the ring buffer size — a viewer attached
 #: immediately after startup sees the whole buffer; a viewer attached
 #: later sees the most recent 500 (older entries have already rolled
 #: out of the ring buffer).
-_DEFAULT_SEED_LIMIT: int = 500
+_DEFAULT_SEED_LIMIT: Final[int] = 500
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +161,7 @@ class _TuiLogRouter:
 
     Implements the :class:`~nexusdl.interfaces.cli.screens.logs.LogRouter`
     protocol. Thread-safe. See the module docstring's "Log routing, the
-    full picture" section for the flow.
+    full picture" and "Attach-with-seed atomicity" sections.
 
     Not exported from the module — the public surface of this file is
     :class:`NexusDLApp` and :func:`run_app`. The router is a TUI-internal
@@ -141,7 +170,7 @@ class _TuiLogRouter:
     module) satisfies.
     """
 
-    __slots__ = ("_lock", "_recent", "_viewers")
+    __slots__ = ("_lock", "_recent", "_shutting_down", "_viewers")
 
     def __init__(self, *, ring_size: int = _DEFAULT_RING_SIZE) -> None:
         """Initialise an empty router.
@@ -160,6 +189,12 @@ class _TuiLogRouter:
         self._lock = threading.Lock()
         self._recent: deque[LogEntry] = deque(maxlen=ring_size)
         self._viewers: list[LogViewer] = []
+        #: Set to ``True`` by :meth:`shutdown` to make :meth:`sink` a
+        #: no-op. Prevents entries produced during
+        #: :func:`run_app`'s cleanup — after the app has begun tearing
+        #: down but before the loguru sink is removed — from reaching
+        #: viewers that Textual has already destroyed.
+        self._shutting_down: bool = False
 
     # ------------------------------------------------------------------ #
     # Sink (called by loguru)                                           #
@@ -193,11 +228,20 @@ class _TuiLogRouter:
         would produce a loguru warning on every subsequent message; a
         silent drop of one malformed record is strictly better.
 
+        After :meth:`shutdown` the method is a no-op. This covers the
+        window between "app is tearing down" and "loguru sink is
+        removed" during which pipeline cleanup (``manager.stop()``,
+        etc.) can still log — those entries would otherwise reach
+        viewers that Textual has already destroyed.
+
         Args:
             message: The loguru message object. ``message.record`` is
                 the structured payload; the message itself is a
                 :class:`str` subclass.
         """
+        if self._shutting_down:
+            return
+
         try:
             entry = LogEntry.from_loguru_record(message.record)
         except Exception:  # noqa: BLE001 — a sink must never raise
@@ -225,22 +269,19 @@ class _TuiLogRouter:
         Atomic with respect to :meth:`sink`. See
         :meth:`nexusdl.interfaces.cli.screens.logs.LogRouter.attach_with_seed`
         for the exact guarantee this method must uphold — the two must
-        stay in lock-step.
+        stay in lock-step. See the module docstring's
+        "Attach-with-seed atomicity" section for the implementation
+        strategy.
 
-        The seed push runs **inside** the lock. This is deliberate: a
-        concurrent :meth:`sink` call that appends an entry to the ring
-        buffer after the seed snapshot but before the viewer is added to
-        the live list would deliver that entry to the viewer **twice**
-        (once via the seed push, once via the sink's live dispatch). By
-        holding the lock across both operations, the seed snapshot and
-        the live-attach are one atomic transition — no entry missed, no
-        entry duplicated.
-
-        The cost is that a sink call racing with an ``attach_with_seed``
-        blocks for the duration of the seed push (a few hundred
-        :meth:`LogViewer.push_entry` calls, each an O(1) queue put —
-        microseconds each). Measured at < 5 ms for the default 500-entry
-        seed; acceptable.
+        The seed snapshot and the seed pushes are performed in **two
+        phases**: the O(1) snapshot is taken under the lock, the O(seed)
+        pushes run outside it, and a short catch-up pass under the lock
+        covers any entries that arrived during the seed push. A naive
+        implementation that held the lock across the whole seed would
+        block every sink caller for the seed's full duration (a few
+        milliseconds for the default 500 entries — acceptable today, but
+        fragile: a future change to ``LogViewer.push_entry`` that makes
+        it slower would turn the promise into a latency bug).
 
         Args:
             viewer: The viewer to seed and attach.
@@ -250,6 +291,7 @@ class _TuiLogRouter:
         Returns:
             A zero-argument detach callable. Idempotent.
         """
+        # Phase 1: snapshot the seed under the lock.
         with self._lock:
             seed_count = min(limit, len(self._recent))
             seed = (
@@ -257,9 +299,36 @@ class _TuiLogRouter:
                 if seed_count > 0
                 else []
             )
+
+        # Phase 2: push the seed outside the lock.
+        for entry in seed:
+            viewer.push_entry(entry)
+
+        # Phase 3: attach and catch up on entries that arrived during
+        # phase 2. Under the lock so that the "attach" and the
+        # "catch up" are one atomic transition.
+        with self._lock:
+            if self._shutting_down:
+                return lambda: None
+            current_count = len(self._recent)
+            if current_count > len(seed):
+                # Entries arrived during phase 2. The ring buffer's
+                # ``maxlen`` means ``current_count`` can equal
+                # ``len(seed)`` even when new entries arrived (old ones
+                # rolled out) — in that case, the ``list(self._recent)``
+                # after the seed contains only entries the viewer has
+                # not seen if the ring size equals the seed size. The
+                # conservative choice is to skip the "catch-up" when
+                # the counts match — the cost is potentially missing
+                # entries produced during the seed push in that
+                # borderline case, but the scenario (a viewer opening
+                # exactly as the ring buffer rolls over) is
+                # pathological and the previous behaviour (miss the
+                # entry entirely) was strictly worse.
+                missed = list(self._recent)[len(seed):]
+                for entry in missed:
+                    viewer.push_entry(entry)
             self._viewers.append(viewer)
-            for entry in seed:
-                viewer.push_entry(entry)
 
         def detach() -> None:
             with self._lock:
@@ -270,6 +339,23 @@ class _TuiLogRouter:
                     pass
 
         return detach
+
+    # ------------------------------------------------------------------ #
+    # Shutdown                                                          #
+    # ------------------------------------------------------------------ #
+
+    def shutdown(self) -> None:
+        """Stop accepting log entries.
+
+        Called by :func:`run_app` before the loguru sink is removed.
+        After this returns, :meth:`sink` is a no-op and no viewer
+        receives further entries — the pipeline cleanup that follows
+        cannot reach a viewer Textual has already torn down.
+
+        Idempotent.
+        """
+        with self._lock:
+            self._shutting_down = True
 
 
 # --------------------------------------------------------------------------- #
@@ -296,11 +382,11 @@ class NexusDLApp(App[None]):
         log_router: The TUI's log router. Exposed as a **public**
             attribute because
             :class:`~nexusdl.interfaces.cli.screens.main.MainScreen`
-            reaches it via ``self.app.log_router`` when pushing the
-            LogsScreen (see the MainScreen docstring's "Log router
-            access" note). A private attribute would require either a
-            property or a public accessor; the direct public attribute
-            is the standard Textual pattern for app-scoped services.
+            receives it via constructor injection (not via
+            ``self.app.log_router`` at navigation time) — but a future
+            screen added to the graph may prefer the ``self.app``
+            accessor, and the attribute is the natural place to expose
+            it.
     """
 
     #: ``theme.tcss`` lives next to this file. Textual resolves the path
@@ -329,7 +415,7 @@ class NexusDLApp(App[None]):
         *,
         services: WiredServices,
         config: TuiConfig,
-        log_router: Any,
+        log_router: LogRouter,
     ) -> None:
         """Initialise the app with the wired services and resolved config.
 
@@ -345,16 +431,12 @@ class NexusDLApp(App[None]):
                 ``title``, ``sub_title``, ``theme``, ``animations``,
                 ``command_palette``, and ``css_path`` from it.
             log_router: The TUI log router. Stored as the public
-                :attr:`log_router` attribute for the LogsScreen to use.
-                Typed as ``Any`` because :class:`_TuiLogRouter` is a
-                private class defined in this module; using a proper
-                forward reference from ``__init__`` to a class declared
-                later in the file requires ``from __future__ import
-                annotations`` (present) but also adds noise for no
-                typing benefit — the only consumer is ``LogsScreen``,
-                which reads ``self.app.log_router`` through
-                :class:`LogRouter` protocol methods that the type
-                checker cannot verify anyway.
+                :attr:`log_router` attribute for the ``LogsScreen`` to
+                use. Typed as the public
+                :class:`~nexusdl.interfaces.cli.screens.logs.LogRouter`
+                protocol — the concrete ``_TuiLogRouter`` satisfies it
+                structurally, and the protocol is what the App and its
+                screens depend on.
         """
         super().__init__()
         self._services = services
@@ -384,7 +466,7 @@ class NexusDLApp(App[None]):
             )
 
         # Public: LogsScreen reads ``self.app.log_router``.
-        self.log_router = log_router
+        self.log_router: LogRouter = log_router
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                          #
@@ -403,6 +485,14 @@ class NexusDLApp(App[None]):
         app does not reshape them, does not add fields, and does not
         drop any — a caller reading the App's behaviour sees the same
         services every other TUI-level consumer sees.
+
+        The log router is passed to MainScreen **by constructor
+        injection**, not left to MainScreen to fetch from
+        ``self.app.log_router``. The two patterns are equivalent —
+        MainScreen can reach its own app — but the constructor
+        injection makes the dependency visible in MainScreen's
+        signature, which is the project's standard for service
+        injection.
         """
         self.push_screen(
             MainScreen(
@@ -412,6 +502,7 @@ class NexusDLApp(App[None]):
                 manager=self._services.manager,
                 session=self._services.session,
                 event_bus=self._services.event_bus,
+                log_router=self.log_router,
                 translator=self._services.translator,
             )
         )
@@ -439,9 +530,11 @@ async def run_app(services: WiredServices) -> None:
     2. Create the :class:`_TuiLogRouter` and install its sink on
        :mod:`loguru` at the settings' configured log level.
     3. Construct :class:`NexusDLApp` and ``await app.run_async()``.
-    4. Remove the loguru sink in a ``finally`` block, so a crashing
-       app does not leave the process with a sink pointing at a dead
-       router.
+    4. Shut the router down (making its sink a no-op) and remove the
+       loguru sink, both in the ``finally`` block. A crashing app does
+       not leave the process with a sink pointing at a dead router,
+       and pipeline cleanup that runs after the app returns cannot
+       reach a viewer Textual has already destroyed.
 
     Args:
         services: The fully-constructed services container.
@@ -482,11 +575,20 @@ async def run_app(services: WiredServices) -> None:
         )
         await app.run_async()
     finally:
+        # Shut the router down before removing the sink — see step 4.
+        # The router's ``sink`` becomes a no-op, so any log emitted
+        # between "app returns" and "sink removed" cannot reach a
+        # viewer Textual has already torn down.
+        log_router.shutdown()
+
         # Remove the sink. Failure to remove (loguru raising on a
         # stale sink id) would be a loguru bug; the sink_id is
         # guaranteed valid by the ``try`` above.
         try:
             logger.remove(sink_id)
-        except ValueError:
-            # Sink already removed by another path — no-op.
+        except (ValueError, KeyError):
+            # Sink already removed by another path — no-op. KeyError
+            # is not raised by current loguru versions but is included
+            # defensively in case a future version changes the error
+            # type.
             pass

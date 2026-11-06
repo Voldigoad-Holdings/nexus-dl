@@ -45,25 +45,35 @@ The hierarchy
     ├── ImageValidationError
     └── ImageConversionError
 
-Two additions beyond the PROMPT MASTER's tree
----------------------------------------------
-* :class:`NexusDLPlaywrightError` — raised by
-  :class:`~nexusdl.core.session.playwright_pool.PlaywrightPool.start`
-  when Playwright is not importable, when Chromium is not installed, or
-  when launch fails for any other reason. A ``SessionError`` subclass
-  (the failure is a session-layer concern), it is **not** retryable by
-  default — a Playwright that failed to launch with "not installed" will
-  fail again one second later. Callers that want retryable Playwright
-  failure handling wrap the launch in
-  :func:`~nexusdl.core.utils.retry.retry_async` explicitly.
-* :class:`RateLimitTimeoutError` — placed as a sibling of
-  :class:`SessionRateLimitError` under :class:`SessionError`, matching
-  the PROMPT MASTER's tree exactly. This is the **deliberate**
-  non-retryable classification: :class:`SessionRateLimitError` is the
-  "server returned 429" case, retryable after backoff;
-  :class:`RateLimitTimeoutError` is "our own limiter gave up after the
-  caller-specified timeout", which means the caller has already waited
-  the configured window and a retry would just wait again.
+Notes on the hierarchy relative to the PROMPT MASTER
+----------------------------------------------------
+Both of the following classes exist to support the PROMPT MASTER's
+requirements, but neither is a silent addition — one is in the spec's
+tree diagram (with a non-obvious classification rationale), and the
+other is specified in prose only and deserves a note here so a reader
+of the tree does not think it is a missing class:
+
+* :class:`NexusDLPlaywrightError` — **in the PROMPT MASTER's prose,
+  absent from its tree diagram**. The spec's ``PlaywrightPool`` section
+  states: *"``start()`` vérifie Chromium installé (sinon
+  ``NexusDLPlaywrightError``)"*. A ``SessionError`` subclass is the
+  natural home (the failure is a session-layer concern), and it is
+  **not** retryable by default — a Playwright that failed to launch
+  with "not installed" will fail again one second later. Callers that
+  want retryable Playwright failure handling wrap the launch in
+  :func:`~nexusdl.core.utils.retry.retry_async` explicitly. This class
+  is therefore *in the spec* but not *in the tree diagram*; adding it
+  here keeps the module's tree diagram self-contained.
+
+* :class:`RateLimitTimeoutError` — **in the PROMPT MASTER's tree
+  diagram**, placed as a sibling of :class:`SessionRateLimitError`
+  under :class:`SessionError`. The classification is **deliberate**
+  and non-obvious: :class:`SessionRateLimitError` is "the server said
+  429", retryable after backoff; :class:`RateLimitTimeoutError` is
+  "our own limiter gave up after the caller-specified timeout", which
+  means the caller has already waited the configured window and a
+  retry would just wait again. Merging the two would confuse the retry
+  classifier's intent, so they remain siblings.
 
 Retry classification
 --------------------
@@ -123,13 +133,49 @@ Diagnostic attributes on the base
   attribute so callers that want to inspect a raised exception's
   message **without** converting it to a string have a sanctioned way
   to do so.
-* :attr:`NexusDLError.context` — an immutable mapping of every keyword
-  argument the specific exception class accepted **beyond** its own
-  declared fields. Used by the base for future extensibility and by
-  diagnostic endpoints that want to render an exception as structured
-  data. Subclasses that declare extra fields also set those fields as
-  named attributes (``exc.site_id``, ``exc.url``); the ``context``
-  mapping is a complementary view, not a replacement.
+* :attr:`NexusDLError.context` — a read-only mapping of the **keyword
+  arguments that the concrete class passed through to the base
+  constructor via ``**context``**. It is **not** a dump of every field
+  the exception carries: a subclass that declares a field (e.g.
+  ``status_code`` on :class:`ParserResponseError`,
+  ``elapsed_seconds`` on :class:`RetryTimeoutError`) exposes it as a
+  named attribute and *may or may not* mirror it in ``context``
+  depending on whether the subclass forwarded it to ``**context``.
+  Concretely:
+
+  - :class:`ParserError` forwards ``url`` and ``site_id`` — both appear
+    in ``context`` and as attributes.
+  - :class:`ParserResponseError` adds ``status_code`` as an attribute
+    but does **not** forward it to ``**context`` — so
+    ``exc.context['status_code']`` raises :class:`KeyError` while
+    ``exc.status_code`` works.
+  - :class:`NexusDLError` constructed directly with ``**context``
+    exposes those kwargs in ``context`` and nowhere else.
+
+  The mapping exists for the base constructor's ``**context``
+  mechanism and for diagnostic endpoints that want a partial, JSON-
+  friendly view of an exception; callers that need a **specific**
+  attribute always use the attribute, never the mapping.
+
+Pickling
+--------
+:class:`NexusDLError` overrides :meth:`__reduce__` and provides
+:meth:`__getstate__` / :meth:`__setstate__` so that **every** slot
+declared on any subclass survives a pickle round-trip. Without this
+override, the base :meth:`BaseException.__reduce__` would return a
+two-tuple ``(type, args)`` — the ``__dict__`` is empty on these
+exceptions because every field is a slot — and the ``context`` mapping
+and every subclass-specific field (``url``, ``status_code``,
+``timeout_seconds``, …) would be silently dropped. Exceptions cross
+process boundaries in :class:`concurrent.futures.ProcessPoolExecutor`
+and in message brokers that pickle payloads; silent data loss on the
+error path is exactly the bug that makes a production incident
+un-diagnosable.
+
+The pickle representation deliberately does **not** try to preserve the
+``MappingProxyType`` wrapper — the wrapper is not picklable in some
+Python versions, and its immutability contract is re-established by
+:meth:`__setstate__` on the receiving side.
 
 Chaining
 --------
@@ -138,7 +184,9 @@ underlying cause. The base class does **not** suppress chaining, so
 ``exc.__cause__`` and ``exc.__context__`` are populated by Python
 automatically. Callers inspecting the cause use the standard
 ``__cause__`` attribute; this module adds nothing on top of the
-mechanism.
+mechanism. Note that ``__cause__`` and ``__context__`` are preserved
+across pickling by :class:`BaseException` itself; our ``__reduce__``
+does not interfere with that.
 
 Not defined here
 ----------------
@@ -158,7 +206,7 @@ Not defined here
 
 Dependency graph (no cycles)::
 
-    (no imports beyond typing)
+    (no imports beyond typing and types)
 
 This module is a **pure leaf** — zero dependencies, zero I/O, zero
 logging. It can be imported from anywhere, including from an early
@@ -202,6 +250,12 @@ __all__ = [
 ]
 
 
+# Shared empty context proxy — avoids creating a fresh empty dict and
+# MappingProxyType for every exception raised without context, which is
+# the common case for the pipeline's "best-effort context" contract.
+_EMPTY_CONTEXT: Final[MappingProxyType[Any]] = MappingProxyType({})
+
+
 # --------------------------------------------------------------------------- #
 # Base                                                                        #
 # --------------------------------------------------------------------------- #
@@ -217,12 +271,13 @@ class NexusDLError(Exception):
     Attributes:
         message: The original message, as a ``str``. Equal to
             ``str(exc)`` and to ``exc.args[0]``.
-        context: A read-only mapping of every keyword argument the
-            concrete class accepted beyond its own declared fields.
-            Empty when the concrete class declared no extras, or when
-            the caller passed none. Stable across the lifetime of the
-            exception — the mapping is populated at construction time
-            and never mutated.
+        context: A read-only mapping of the keyword arguments the
+            concrete class forwarded to this base constructor via
+            ``**context``. **Not** a dump of every attribute the
+            exception carries — see the module docstring's
+            "Diagnostic attributes on the base" section for the
+            distinction. Empty when the concrete class forwarded none,
+            which is the common case.
     """
 
     __slots__ = ("context", "message")
@@ -237,18 +292,18 @@ class NexusDLError(Exception):
                 :attr:`context` as a read-only mapping. Concrete
                 subclasses that accept named keyword arguments (e.g.
                 :class:`ParserError`'s ``url`` and ``site_id``) set
-                those as attributes **and** include them in
-                ``context``; the two views are complementary. A
-                subclass that just wants to expose unstructured context
-                can pass it directly here.
+                those as attributes **and** forward them here; the two
+                views are complementary. A subclass that just wants to
+                expose unstructured context can pass it directly here.
         """
         super().__init__(message)
         self.message = message
         # ``dict(context)`` then wrapped — a caller that later mutates
         # the dict they passed to ``**context`` does not affect the
-        # exception's view.
+        # exception's view. Empty context reuses a shared proxy rather
+        # than constructing a new one on every raise.
         self.context = (
-            MappingProxyType(dict(context)) if context else MappingProxyType({})
+            MappingProxyType(dict(context)) if context else _EMPTY_CONTEXT
         )
 
     def __str__(self) -> str:
@@ -261,6 +316,60 @@ class NexusDLError(Exception):
         ``str(exc)`` returns for every caller that logs it.
         """
         return self.message
+
+    # ------------------------------------------------------------------ #
+    # Pickle support                                                     #
+    # ------------------------------------------------------------------ #
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle the exception with every slot preserved.
+
+        The default :meth:`BaseException.__reduce__` returns a two-tuple
+        ``(type, args)`` when ``self.__dict__`` is empty — which it is
+        here, because every field is a slot. That would silently drop
+        the ``context`` mapping and every subclass-specific field
+        (``url``, ``status_code``, ``timeout_seconds``, …) across a
+        pickle round-trip.
+
+        Returning a three-tuple ``(type, args, state)`` with a
+        pickle-friendly plain-dict ``state`` forces the receiving side
+        through :meth:`__setstate__`, which re-wraps ``context`` in a
+        :class:`~types.MappingProxyType` and restores every slot.
+        """
+        return (type(self), self.args, self.__getstate__())
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Return a pickle-friendly representation of every instance field.
+
+        Enumerates every ``__slots__`` declared on the class and its
+        ancestors, so a subclass added tomorrow is pickled correctly
+        without touching this method. Slot attributes that are not set
+        (because the subclass's ``__init__`` skipped them) are omitted
+        rather than written as ``None``, so a partially-initialised
+        exception round-trips as a partially-initialised exception.
+        """
+        state: dict[str, Any] = {
+            "message": self.message,
+            "context": dict(self.context),
+        }
+        extra: dict[str, Any] = {}
+        for cls in type(self).__mro__:
+            for slot in getattr(cls, "__slots__", ()):
+                if slot in state:
+                    continue
+                try:
+                    extra[slot] = getattr(self, slot)
+                except AttributeError:
+                    continue
+        state["extra"] = extra
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore state produced by :meth:`__getstate__`."""
+        self.message = state["message"]
+        self.context = MappingProxyType(state["context"])
+        for key, value in state.get("extra", {}).items():
+            setattr(self, key, value)
 
 
 # --------------------------------------------------------------------------- #
@@ -340,6 +449,11 @@ class ParserResponseError(ParserError):
         status_code: The HTTP status of the response, when the parser
             could read one. ``None`` for a network-level failure that
             never received a response.
+
+            This field is exposed as an **attribute only** — it is not
+            forwarded to :attr:`NexusDLError.context`. See the module
+            docstring's "Diagnostic attributes on the base" section for
+            the distinction.
     """
 
     __slots__ = ("status_code",)
@@ -565,7 +679,7 @@ class SessionTimeoutError(SessionError):
 
     Attributes:
         timeout_seconds: The timeout value that fired, when the caller
-            knows it.
+            knows it. Attribute only, not mirrored in ``context``.
     """
 
     __slots__ = ("timeout_seconds",)
@@ -593,7 +707,8 @@ class SessionRateLimitError(SessionError):
         retry_after: The server's ``Retry-After`` header value, in
             seconds, when present. ``None`` when the server did not
             provide one (the retry controller falls back to its own
-            backoff policy).
+            backoff policy). Attribute only, not mirrored in
+            ``context``.
     """
 
     __slots__ = ("retry_after",)
@@ -860,20 +975,28 @@ class ImageConversionError(NexusDLError):
 
 
 # --------------------------------------------------------------------------- #
-# Sanity: the module's __all__ must match the classes defined              #
+# Sanity: the module's __all__ must match the classes defined here            #
 # --------------------------------------------------------------------------- #
 # This assertion runs at import time and would fail on any future edit that
 # adds a class without exporting it, or exports a name that does not exist.
 # The cost is a single dict lookup at import; the benefit is that an
 # incomplete exception hierarchy is caught the moment the module loads, not
 # on the first call site that tries to import a missing name.
+#
+# The ``__module__ == __name__`` guard ensures that a re-exported class from
+# another module (a future ``from nexusdl.somewhere import SomeError`` at
+# the top of this file) is NOT counted — it belongs to the other module's
+# ``__all__``, not this one. It also immunises the check against
+# ``typing.Any``-like objects that some Python versions expose as types.
 # --------------------------------------------------------------------------- #
 
 _defined: Final[frozenset[str]] = frozenset(
     name
     for name in dir()
-    if isinstance(globals().get(name, None), type)
-    and issubclass(globals()[name], Exception)
+    if (obj := globals().get(name)) is not None
+    and isinstance(obj, type)
+    and issubclass(obj, Exception)
+    and getattr(obj, "__module__", None) == __name__
 )
 
 if _defined != frozenset(__all__):

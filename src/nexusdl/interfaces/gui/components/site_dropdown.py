@@ -18,9 +18,36 @@ Universal design notes:
       off or changed without touching the rendering code.
     * No hardcoded site names, no hardcoded URLs — display data comes
       exclusively from the ``SiteConfig`` instances passed in.
+
+Flag emoji fallback
+-------------------
+The language column uses emoji flags (``🇫🇷``, ``🇬🇧``, …) which are
+Unicode **Regional Indicator** pairs. They render as the intended
+two-letter flag only when a colour-emoji font is installed — Noto Color
+Emoji on Linux (``fonts-noto-color-emoji``), Segoe UI Emoji on Windows,
+Apple Color Emoji on macOS. On a minimal Linux install without a colour-
+emoji font, Tk falls back to drawing the two Regional Indicators as
+plain letters or as two missing-glyph boxes. The widget does not detect
+this: it always renders the emoji, and a deployment that cares about
+the fallback installs the font. A future ``use_emoji_flags=False``
+option (out of scope for this file) would render ``"FR"``, ``"EN"``
+instead; the strings live in :data:`_LANGUAGE_FLAGS` so the change is a
+single-table swap.
+
+Search and diacritics
+---------------------
+:meth:`SiteDropdown._visible_sites` matches the search query against
+``site.name`` and ``site.id`` using a **diacritic-insensitive**,
+case-insensitive comparison. A user typing ``"equipe"`` matches a site
+named ``"L'Équipe"``, and ``"mangadex"`` matches ``"MangaDex"``. The
+normalisation uses :func:`unicodedata.normalize` with the ``NFKD`` form
+and strips combining marks — the same primitive :func:`slugify.slugify`
+uses internally, kept local here so the widget has no runtime
+dependency on the slugify package.
 """
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Callable, Sequence
 
 import customtkinter as ctk
@@ -80,6 +107,21 @@ BUTTON_HEIGHT = 36
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _normalise_search_text(value: str) -> str:
+    """Return *value* lowercased with combining marks stripped.
+
+    A user typing ``"equipe"`` matches a site named ``"L'Équipe"``; a
+    user typing ``"MangaDex"`` matches ``"mangadex"``. The transform is
+    the same primitive :func:`slugify.slugify` uses internally, kept
+    local so the widget does not depend on the slugify package at
+    runtime.
+    """
+    decomposed = unicodedata.normalize("NFKD", value)
+    return (
+        decomposed.encode("ASCII", "ignore").decode("ASCII").lower()
+    )
+
+
 def _flag_for(language: Language | str) -> str:
     """Return the flag emoji for ``language`` (globe fallback on unknown)."""
     try:
@@ -113,6 +155,29 @@ def _health_of(site: SiteConfig) -> SiteHealth:
         return SiteHealth(value)
     except (TypeError, ValueError):
         return SiteHealth.UNKNOWN
+
+
+def _force_widget_focus(widget) -> None:
+    """Give ``widget`` keyboard focus, bypassing the WM's focus policy.
+
+    Toplevels created with ``overrideredirect(True)`` do not receive
+    WM focus automatically on Windows and on some Linux window
+    managers (i3, sway, GNOME with strict focus). ``focus_set`` waits
+    for the WM and is silently ignored in those environments, so the
+    popup's keyboard navigation (arrow keys, Enter, Escape) would not
+    work until the user clicked inside.
+
+    ``focus_force`` asks Tk to set focus directly without going
+    through the WM, which is what every popular Tk dropdown
+    implementation (combobox, autocomplete) uses for exactly this
+    reason. Wrapped in ``try/except`` because a destroyed widget
+    raises :class:`tkinter.TclError`.
+    """
+    try:
+        widget.focus_force()
+        widget.lift()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +248,10 @@ class SiteDropdown(ctk.CTkFrame):
         self._search_entry: ctk.CTkEntry | None = None
         self._root_bind_id: str | None = None
 
+        #: Set to ``True`` by :meth:`_on_destroy`. Guards the second
+        #: ``<Destroy>`` binding that Tk delivers to child widgets.
+        self._destroyed: bool = False
+
         self._build_button()
 
         if initial_site_id is not None and initial_site_id in self._by_id:
@@ -192,7 +261,10 @@ class SiteDropdown(ctk.CTkFrame):
         else:
             self._refresh_button()
 
-        self.bind("<Destroy>", self._on_destroy)
+        # ``add="+"`` preserves any ``<Destroy>`` binding a future
+        # subclass might add — the widget itself has none today, but
+        # this method may be subclassed.
+        self.bind("<Destroy>", self._on_destroy, add="+")
 
     # ------------------------------------------------------------------
     # Public API
@@ -411,10 +483,14 @@ class SiteDropdown(ctk.CTkFrame):
         except Exception:
             self._root_bind_id = None
 
-        if self._search_entry is not None:
-            self._search_entry.after(10, self._search_entry.focus_set)
-        else:
-            popup.after(10, popup.focus_set)
+        # Give keyboard focus to the popup. ``focus_force`` bypasses
+        # the WM's focus policy, which is required for overrideredirect
+        # Toplevels on Windows and some Linux WMs — a plain
+        # ``focus_set`` would be silently ignored there and the
+        # popup's arrow-key navigation would not work until the user
+        # clicked inside it.
+        focus_target = self._search_entry if self._search_entry is not None else popup
+        popup.after(10, lambda: _force_widget_focus(focus_target))
 
     def _close_popup(self) -> None:
         if self._root_bind_id is not None:
@@ -477,13 +553,15 @@ class SiteDropdown(ctk.CTkFrame):
     def _visible_sites(self) -> list[SiteConfig]:
         query = ""
         if self._searchable and self._search_var is not None:
-            query = self._search_var.get().strip().lower()
+            query = self._search_var.get().strip()
         if not query:
             return list(self._sites)
+        normalised = _normalise_search_text(query)
         return [
             s
             for s in self._sites
-            if query in s.name.lower() or query in s.id.lower()
+            if normalised in _normalise_search_text(s.name)
+            or normalised in _normalise_search_text(s.id)
         ]
 
     def _refresh_list(self) -> None:
@@ -707,4 +785,16 @@ class SiteDropdown(ctk.CTkFrame):
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
             return
-        self._close_popup()
+        if self._destroyed:
+            # A second <Destroy> event for the same widget would re-enter
+            # the cleanup below on a partially-torn-down widget tree.
+            # Guarding makes the callback idempotent.
+            return
+        self._destroyed = True
+        try:
+            self._close_popup()
+        except Exception:
+            # A destroy handler must never raise — Tk would log a
+            # traceback on stderr and continue, which is noisier than
+            # a swallowed cleanup error.
+            pass

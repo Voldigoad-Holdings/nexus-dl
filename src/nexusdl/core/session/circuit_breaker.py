@@ -54,9 +54,38 @@ Concurrency is protected by a :class:`threading.RLock`. The critical
 sections are a handful of attribute updates — nanoseconds — so the lock
 is never contended in practice. ``RLock`` (rather than plain ``Lock``)
 is used because :meth:`CircuitBreaker.stats` refreshes the state machine
-(``_maybe_transition_from_open``) while holding the lock, and
+(``_maybe_transition_from_open_locked``) while holding the lock, and
 ``_open_locked`` / ``reset`` do the same. A plain ``Lock`` would
 self-deadlock on those re-entrant paths.
+
+Half-open concurrency limitation
+--------------------------------
+The ``half_open_max_attempts > 1`` configuration has **subtle
+semantics** that the default ``1`` avoids:
+
+* When a trial request succeeds and the breaker closes, any **other**
+  trial requests that are still in flight when the transition happens
+  will see the breaker in the ``closed`` state when they eventually
+  call :meth:`CircuitBreaker.record_failure`. Their failures are
+  counted as **closed-state** failures (contributing to
+  ``consecutive_failures``), not as half-open failures that would
+  re-open the breaker.
+* Concretely: with ``half_open_max_attempts=3``, a site that admits
+  three trial requests, succeeds on one, and fails on the other two,
+  closes the breaker after the first success. The two failures that
+  arrive afterwards put the breaker on the road back to OPEN via the
+  normal closed-state counter, but they do not flip it immediately.
+  The default ``1`` eliminates this asymmetry by ensuring exactly one
+  trial request is in flight at any time.
+
+The behavior is correct in a state-machine sense — it reflects the
+fact that the breaker is CLOSED once the success threshold is met —
+but it is counter-intuitive for an operator who thinks of HALF_OPEN as
+"three trials, need all to succeed". Callers that want the strict
+semantics should raise ``half_open_success_threshold`` to match
+``half_open_max_attempts``: with ``success_threshold=3`` and
+``max_attempts=3``, the breaker requires all three trials to succeed
+before closing, and any one failure re-opens immediately.
 
 No persistence
 --------------
@@ -87,9 +116,11 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Literal, TypeAlias
+
+from loguru import logger
 
 
 __all__ = [
@@ -135,8 +166,12 @@ DEFAULT_HALF_OPEN_SUCCESS_THRESHOLD: Final[int] = 1
 #: Default number of concurrent requests allowed through in HALF_OPEN.
 #: ``1`` serialises trial requests — the goal is to probe, not to
 #: pipeline. A caller that genuinely wants parallel probes sets a higher
-#: value; most deployments do not.
+#: value; see the module docstring's "Half-open concurrency limitation"
+#: section for the non-obvious behaviour this introduces.
 DEFAULT_HALF_OPEN_MAX_ATTEMPTS: Final[int] = 1
+
+
+_log = logger.bind(component="session.circuit_breaker")
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +241,13 @@ class CircuitBreakerPoolStats:
     listed in the sorted order of their site ids so two snapshots of the
     same pool are diffable by position.
 
+    The snapshot is **not atomic across breakers**: each breaker's
+    stats are read individually, so a breaker can transition between
+    two adjacent reads. The aggregate counts are still internally
+    consistent — ``closed_count + half_open_count + open_count ==
+    total_breakers`` holds for any single call — but the per-site
+    entries may reflect slightly different points in time.
+
     Attributes:
         total_breakers: Total number of breakers the pool has created.
         closed_count: Number of breakers currently in CLOSED.
@@ -249,8 +291,8 @@ class CircuitBreaker:
                                                                OPEN
 
     Every method is synchronous and thread-safe. See the module
-    docstring for the full contract, the reason ``RLock`` is used, and
-    the config defaults.
+    docstring for the full contract, the reason ``RLock`` is used, the
+    config defaults, and the half-open concurrency limitation.
 
     Example:
         >>> breaker = CircuitBreaker(failure_threshold=3, name="mangadex")
@@ -277,7 +319,9 @@ class CircuitBreaker:
             through while in HALF_OPEN. Must be ``>= 1``. With the
             default of ``1``, only one trial request is in flight at a
             time; a second concurrent call gets rejected until the
-            first completes.
+            first completes. See the module docstring's "Half-open
+            concurrency limitation" section for the non-obvious
+            semantics of ``half_open_max_attempts > 1``.
         name: Optional identifier (typically a ``site_id``) surfaced in
             :attr:`CircuitBreakerStats.name` and never anywhere else.
             Empty by default.
@@ -287,6 +331,7 @@ class CircuitBreaker:
 
     Raises:
         ValueError: If any numeric argument is out of range.
+        TypeError: If ``name`` is not a string.
     """
 
     __slots__ = (
@@ -339,6 +384,10 @@ class CircuitBreaker:
             raise ValueError(
                 f"half_open_max_attempts must be >= 1, got "
                 f"{half_open_max_attempts}"
+            )
+        if not isinstance(name, str):
+            raise TypeError(
+                f"name must be a str, got {type(name).__name__}"
             )
 
         self._failure_threshold: int = failure_threshold
@@ -454,6 +503,18 @@ class CircuitBreaker:
             # half_open
             if self._half_open_in_flight > 0:
                 self._half_open_in_flight -= 1
+            else:
+                # A ``record_failure`` in HALF_OPEN with no slot held
+                # means the caller never called ``allow_request`` first
+                # — a caller bug. Log it so the trace points at the
+                # right place; the transition still proceeds because
+                # the failure is real.
+                _log.debug(
+                    "CircuitBreaker {!r}: record_failure() in half_open "
+                    "with no in-flight slot; caller did not call "
+                    "allow_request() first",
+                    self._name,
+                )
             self._transition_to_open_locked()
 
     def reset(self) -> None:
@@ -753,7 +814,9 @@ class CircuitBreakerPool:
         """Return an immutable aggregate snapshot of the pool.
 
         Breakers are listed in ``site_id`` order so two snapshots are
-        position-comparable.
+        position-comparable. The snapshot is **not atomic** across
+        breakers — see :class:`CircuitBreakerPoolStats`'s docstring for
+        the precise guarantee.
         """
         with self._lock:
             site_ids = sorted(self._breakers)
@@ -791,12 +854,23 @@ class CircuitBreakerPool:
     # ------------------------------------------------------------------ #
 
     def _get_or_create(self, site_id: str) -> CircuitBreaker:
-        """Return *site_id*'s breaker, creating it if absent."""
+        """Return *site_id*'s breaker, creating it if absent.
+
+        Logs at ``DEBUG`` when a breaker is created for a site id that
+        was not previously known — a common typo (``"mangadx"`` instead
+        of ``"mangadex"``) would otherwise silently create a breaker
+        that never trips, and the diagnostic trail would be empty.
+        """
         with self._lock:
             breaker = self._breakers.get(site_id)
             if breaker is None:
                 breaker = self._make_breaker(site_id)
                 self._breakers[site_id] = breaker
+                _log.debug(
+                    "CircuitBreakerPool: created a new breaker for "
+                    "unknown site {!r}",
+                    site_id,
+                )
             return breaker
 
     def _get_existing(self, site_id: str) -> CircuitBreaker | None:

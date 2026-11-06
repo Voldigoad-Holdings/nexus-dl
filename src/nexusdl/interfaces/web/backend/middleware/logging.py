@@ -32,7 +32,7 @@ Non-goals
   reverse proxy's job. The middleware logs the *application* surface.
 * Metrics. Use :attr:`LoggingConfig.on_request_completed` to bridge into
   Prometheus / OpenTelemetry. The middleware does not import any metric
-  library.
+  library. Async callbacks are awaited so the bridge can be a coroutine.
 * Authorization. ``user_id`` is populated from
   ``scope["state"]["user_id"]`` (set by an upstream auth middleware) or
   from the **unverified** ``sub`` claim of the bearer token. It is a
@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import time
 import uuid
@@ -159,7 +160,7 @@ class LogLevel(str, Enum):
     """Constrained set of levels the middleware will emit.
 
     Not tied to :mod:`loguru`'s string levels — the enum names are the
-    contract, and :meth:`LoggingMiddleware._log_record` maps them to
+    contract, and :meth:`LoggingMiddleware._emit_log` maps them to
     ``loguru`` calls.
     """
 
@@ -198,7 +199,8 @@ class RedactionConfig:
         capture_response_body: Read and log the response body. Off by
             default for the same reasons, plus the streaming complexity.
         max_body_bytes: Hard cap on bytes captured per direction. Beyond
-            this the buffer truncates.
+            this the buffer truncates and the preview is suffixed with
+            ``"…<truncated>"``.
         max_user_agent_len: Truncate the ``User-Agent`` header before
             logging. Beyond this the value is cut and ``"…"`` appended.
         log_user_agent: Emit the ``User-Agent`` in the log record.
@@ -325,9 +327,13 @@ class LoggingConfig:
             Default ``True``.
         emit_timing_header: Add ``X-Response-Time`` (milliseconds) to
             the response. Default ``False`` — most reverse proxies add
-            one already.
+            one already. The value measures **time-to-first-byte**
+            (request start → ``http.response.start``), since the header
+            must be present before the body streams.
         on_request_completed: Optional callback invoked after the
-            response is sent (or after an exception). Isolated.
+            response is sent (or after an exception). Isolated. Sync and
+            async callables are both supported — a returned awaitable is
+            awaited.
         logger_name: Value bound into ``loguru``'s component field.
             Default ``"web.middleware.logging"`` — the module default.
     """
@@ -412,11 +418,16 @@ class LoggingMiddleware:
             scope.get("query_string", b""), self.config.redaction
         )
 
-        # Body buffers — captured only if enabled.
+        # Body buffers — captured only if enabled. The ``truncated``
+        # mutable bools record whether ``_capture_chunk`` had to drop
+        # bytes; this is what lets ``_body_preview`` add the
+        # ``"…<truncated>"`` suffix that the config promises.
         request_body_chunks: list[bytes] = []
         request_body_total = [0]  # mutable counter
+        request_body_truncated = [False]
         response_body_chunks: list[bytes] = []
         response_body_total = [0]
+        response_body_truncated = [False]
         response_headers_captured: list[tuple[bytes, bytes]] = []
 
         # --- Wrap receive / send ------------------------------------
@@ -436,15 +447,27 @@ class LoggingMiddleware:
                     message.get("body", b""),
                     chunks=request_body_chunks,
                     total=request_body_total,
+                    truncated=request_body_truncated,
                     max_bytes=self.config.redaction.max_body_bytes,
                 )
             return message
 
         request_id_bytes = request_id.encode("ascii")
 
+        # ``status`` is captured here (from ``http.response.start``) and
+        # read in the ``finally`` block below — hence ``nonlocal``.
+        status: int | None = None
+
         async def send_wrapper(message: dict[str, Any]) -> None:
+            nonlocal status
             msg_type = message.get("type")
             if msg_type == "http.response.start":
+                # Capture the status BEFORE augmenting the message —
+                # ``_choose_level`` and the log line depend on it.
+                raw_status = message.get("status")
+                if isinstance(raw_status, int):
+                    status = raw_status
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
                 response_headers_captured.clear()
                 response_headers_captured.extend(
                     message.get("headers", [])
@@ -452,6 +475,15 @@ class LoggingMiddleware:
                 new_headers = list(message.get("headers", []))
                 if self.config.emit_request_id_header:
                     new_headers.append((b"x-request-id", request_id_bytes))
+                if self.config.emit_timing_header:
+                    # Time-to-first-byte — measured now so the header is
+                    # present before the body streams.
+                    new_headers.append(
+                        (
+                            b"x-response-time",
+                            f"{elapsed_ms:.2f}".encode("ascii"),
+                        )
+                    )
                 message["headers"] = new_headers
             elif (
                 redact_response_body
@@ -461,13 +493,13 @@ class LoggingMiddleware:
                     message.get("body", b""),
                     chunks=response_body_chunks,
                     total=response_body_total,
+                    truncated=response_body_truncated,
                     max_bytes=self.config.redaction.max_body_bytes,
                 )
             await send(message)
 
         # --- Invoke the app -----------------------------------------
         started = time.perf_counter()
-        status: int | None = None
         error_class: str | None = None
         error_message: str | None = None
         client_disconnected = False
@@ -476,63 +508,71 @@ class LoggingMiddleware:
             await self.app(scope, receive_wrapper, send_wrapper)
         except asyncio.CancelledError:
             # Client disconnected or the server is shutting down.
+            # ``status`` may or may not have been captured depending on
+            # whether the app already sent ``http.response.start`` — do
+            # NOT overwrite it.
             client_disconnected = True
-            _recompute_status(
-                response_headers_captured,
-                state={"status": status},
-            )
-            status = _status_from_captured(response_headers_captured)
             raise
         except Exception as exc:
             error_class = type(exc).__name__
             error_message = str(exc) or error_class
-            status = _status_from_captured(response_headers_captured)
+            # Same as above: do not overwrite ``status`` — if the app
+            # already sent a start, the client got that status and the
+            # log should reflect it. ``_choose_level`` will still return
+            # ERROR because ``error_class`` is set.
             raise
         finally:
             duration_ms = (time.perf_counter() - started) * 1000.0
 
-            if status is None:
-                status = _status_from_captured(response_headers_captured)
-
-            self._emit_log(
-                request_id=request_id,
-                method=method,
-                path=path,
-                query=redacted_query,
-                status=status,
-                duration_ms=duration_ms,
-                client_ip=client_ip,
-                user_agent=user_agent,
-                user_id=user_id,
-                request_headers=scope.get("headers", ()),
-                response_headers=response_headers_captured,
-                response_bytes=(
-                    response_body_total[0]
-                    if redact_response_body
-                    else _int_header(
-                        response_headers_captured, b"content-length"
-                    )
-                ),
-                request_body=(
-                    b"".join(request_body_chunks)
-                    if redact_request_body and request_body_chunks
-                    else None
-                ),
-                response_body=(
-                    b"".join(response_body_chunks)
-                    if redact_response_body and response_body_chunks
-                    else None
-                ),
-                error_class=error_class,
-                error_message=error_message,
-                client_disconnected=client_disconnected,
-            )
+            try:
+                await self._emit_log(
+                    request_id=request_id,
+                    method=method,
+                    path=path,
+                    query=redacted_query,
+                    status=status,
+                    duration_ms=duration_ms,
+                    client_ip=client_ip,
+                    user_agent=user_agent,
+                    user_id=user_id,
+                    request_headers=scope.get("headers", ()),
+                    response_headers=response_headers_captured,
+                    response_bytes=(
+                        response_body_total[0]
+                        if redact_response_body
+                        else _int_header(
+                            response_headers_captured, b"content-length"
+                        )
+                    ),
+                    request_body=(
+                        b"".join(request_body_chunks)
+                        if redact_request_body and request_body_chunks
+                        else None
+                    ),
+                    request_body_truncated=request_body_truncated[0],
+                    response_body=(
+                        b"".join(response_body_chunks)
+                        if redact_response_body and response_body_chunks
+                        else None
+                    ),
+                    response_body_truncated=response_body_truncated[0],
+                    error_class=error_class,
+                    error_message=error_message,
+                    client_disconnected=client_disconnected,
+                )
+            except Exception:
+                # Never mask the original exception with a log-emission
+                # failure.
+                self._log.exception(
+                    "Failed to emit request log (request_id={})",
+                    request_id,
+                )
 
     # ------------------------------------------------------------------
     # Log emission
     # ------------------------------------------------------------------
 
-    def _emit_log(
+    async def _emit_log(
         self,
         *,
         request_id: str,
@@ -548,7 +588,9 @@ class LoggingMiddleware:
         response_headers: list[tuple[bytes, bytes]],
         response_bytes: int | None,
         request_body: bytes | None,
+        request_body_truncated: bool,
         response_body: bytes | None,
+        response_body_truncated: bool,
         error_class: str | None,
         error_message: str | None,
         client_disconnected: bool,
@@ -609,6 +651,7 @@ class LoggingMiddleware:
                 request_body,
                 content_type=_request_content_type(request_headers),
                 redaction=redaction,
+                truncated=request_body_truncated,
             )
         if response_body is not None:
             context["response_body"] = _body_preview(
@@ -617,13 +660,14 @@ class LoggingMiddleware:
                     response_headers, b"content-type"
                 ),
                 redaction=redaction,
+                truncated=response_body_truncated,
             )
 
         # Single-line log at the chosen level.
         message = _log_message(level, method=method, path=path, status=status)
         _getattr(self._log, level.value)(message, **context)
 
-        # Callback — isolated.
+        # Callback — isolated, supports sync and async callables.
         if self.config.on_request_completed is not None:
             event = RequestCompletedEvent(
                 request_id=request_id,
@@ -642,7 +686,9 @@ class LoggingMiddleware:
                 slow=slow,
             )
             try:
-                self.config.on_request_completed(event)
+                result = self.config.on_request_completed(event)
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 self._log.exception(
                     "on_request_completed callback raised for request_id={}",
@@ -842,20 +888,27 @@ def _capture_chunk(
     *,
     chunks: list[bytes],
     total: list[int],
+    truncated: list[bool],
     max_bytes: int,
 ) -> None:
     """Append ``chunk`` to ``chunks`` until ``max_bytes`` is reached.
 
-    ``total`` is a mutable 1-element list acting as a counter — used
-    instead of ``nonlocal`` so the helper stays free of closure
-    restrictions.
+    ``total`` and ``truncated`` are mutable 1-element lists acting as
+    counters/flags — used instead of ``nonlocal`` so the helper stays
+    free of closure restrictions. ``truncated[0]`` is set to ``True``
+    the moment we have to drop bytes, either because the current chunk
+    is longer than the remaining budget or because we already hit the
+    cap when this call started.
     """
     if max_bytes <= 0:
         return
     current = total[0]
     if current >= max_bytes:
+        truncated[0] = True
         return
     remaining = max_bytes - current
+    if len(chunk) > remaining:
+        truncated[0] = True
     to_add = chunk[:remaining]
     chunks.append(to_add)
     total[0] = current + len(to_add)
@@ -866,23 +919,32 @@ def _body_preview(
     *,
     content_type: str | None,
     redaction: RedactionConfig,
+    truncated: bool,
 ) -> str:
     """Return a redacted, bounded, human-readable preview of ``body``.
 
-    Binary content is reported as ``<binary N bytes>``. Text is decoded
-    as UTF-8 with replacement and truncated to ``max_body_bytes``.
+    Binary content is reported as ``<binary N bytes>`` (with a
+    ``"(truncated)"`` suffix when ``_capture_chunk`` had to drop bytes).
+    Text is decoded as UTF-8 with replacement and suffixed with
+    ``"…<truncated>"`` when the capture was capped.
+
+    The ``truncated`` flag is required because ``_capture_chunk`` caps
+    the byte buffer at ``max_bytes`` before this function runs; the
+    decoded text can therefore never exceed ``max_bytes`` on its own,
+    and the truncation marker must come from the capture layer.
     """
     if not body:
         return ""
     size = len(body)
+    suffix = " (truncated)" if truncated else ""
     if content_type and _is_binary_content_type(content_type):
-        return f"<binary {size} bytes>"
+        return f"<binary {size} bytes{suffix}>"
     try:
         text = body.decode("utf-8", errors="replace")
     except Exception:
-        return f"<undecodable {size} bytes>"
-    if len(text) > redaction.max_body_bytes:
-        text = text[: redaction.max_body_bytes] + "…<truncated>"
+        return f"<undecodable {size} bytes{suffix}>"
+    if truncated:
+        text += "…<truncated>"
     return text
 
 
@@ -938,29 +1000,6 @@ def _request_content_type(
     headers: Iterable[tuple[bytes, bytes]],
 ) -> str | None:
     return _first_header(headers, b"content-type")
-
-
-def _status_from_captured(
-    response_headers: list[tuple[bytes, bytes]],
-) -> int | None:
-    """Return the status code stored alongside headers, if available.
-
-    Headers alone do not carry the status. In the ``send`` wrapper we
-    only see ``http.response.start`` which *does* include ``status``,
-    but we do not currently extract it there. Instead, we keep a simple
-    convention: the status is set into a mutable dict by the send
-    wrapper. Since the current implementation does not do this, return
-    ``None`` — callers fall back to treating the request as failed
-    (which is fine: it means the app never sent a response start).
-    """
-    return None
-
-
-def _recompute_status(
-    response_headers: list[tuple[bytes, bytes]], *, state: dict[str, Any]
-) -> None:
-    """No-op hook kept for future use — see :func:`_status_from_captured`."""
-    return
 
 
 def _truncate(value: str, max_len: int) -> str:

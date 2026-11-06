@@ -31,8 +31,8 @@ Design notes
   rather than silently truncated. ``PasswordPolicy.max_length`` is
   ``72`` by default for that reason; hosts that use a different hasher
   can override.
-* **Timing-safe** comparisons everywhere a secret is compared
-  (``hmac.compare_digest``); passlib handles password verify timing.
+* **Timing safety.** Password verification uses passlib's constant-time
+  comparison internally; callers never compare password hashes manually.
 * **Testability.** Every external dependency is behind a Protocol; a
   fake ``JWTBackend``, in-memory ``RevocationStore``, and a deterministic
   ``token_id_factory`` make full coverage feasible without cryptography.
@@ -72,7 +72,6 @@ Helpers:
 from __future__ import annotations
 
 import asyncio
-import hmac
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -120,10 +119,6 @@ def _now() -> datetime:
 
 def _unix(dt: datetime) -> int:
     return int(dt.timestamp())
-
-
-def _constant_time_eq(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
 
 
 def _default_token_id() -> str:
@@ -283,6 +278,13 @@ class AuthConfig:
     leeway_s: int = DEFAULT_LEEWAY_S
 
     def __post_init__(self) -> None:
+        # The ``secret`` property always produces a ``str`` (it calls
+        # ``str(raw)``), so we must inspect the *raw* value to catch the
+        # dangerous ``None`` case: ``str(None)`` is the literal string
+        # ``"None"``, which is truthy and would otherwise pass validation
+        # and silently become the JWT signing key.
+        if self.secret_key is None:
+            raise ValueError("secret_key must not be None")
         secret = self.secret
         if not isinstance(secret, str) or not secret:
             raise ValueError("secret_key must be a non-empty string")
@@ -486,6 +488,15 @@ class RevocationStore(Protocol):
     Implementations must be safe to call concurrently. Hosts typically back
     this with Redis, but :class:`InMemoryRevocationStore` is provided for
     single-process deployments and tests.
+
+    Note on multi-worker deployments: the :meth:`is_revoked` +
+    :meth:`add` pair is *not* atomic across processes. A naive Redis
+    implementation (``GET`` then ``SET``) will exhibit the same replay
+    race that :class:`AuthService.refresh` guards against intra-process.
+    Multi-worker deployments must implement :meth:`add` atomically
+    (``SETNX`` / Lua script / ``WATCH+MULTI``) so that a second
+    revocation attempt for an already-revoked JTI is detected at write
+    time.
     """
 
     async def add(
@@ -673,6 +684,13 @@ class AuthService:
         self._jwt = jwt_backend or JoseJWTBackend()
         self._policy = policy or PasswordPolicy()
         self._new_id = token_id_factory or _default_token_id
+        # Serializes the check-and-consume phase of refresh(). This closes
+        # the intra-process replay-detection race where two concurrent
+        # refreshes with the same token could both pass ``is_revoked``
+        # before either calls ``add``. Multi-worker deployments must rely
+        # on an atomic :class:`RevocationStore` instead — see its Protocol
+        # docstring.
+        self._refresh_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Password
@@ -793,29 +811,41 @@ class AuthService:
         and :class:`TokenRevokedError` is raised. This neutralises token
         theft: the attacker's rotated token becomes unusable as soon as
         the legitimate client tries to refresh.
+
+        The check-and-consume phase runs under an intra-process lock so
+        two concurrent refreshes with the same token cannot both succeed.
+        Multi-worker deployments must supply an atomic
+        :class:`RevocationStore` — see its Protocol docstring.
         """
         payload = self._decode(refresh_token, expected_type="refresh")
-
-        # 1) Replay check.
-        if await self._revoker.is_revoked(payload.jti, payload.family):
-            if payload.family is not None:
-                await self._revoker.revoke_family(payload.family)
-                _log.warning(
-                    "Refresh-token reuse detected; revoking family. "
-                    "user={} family={} jti={}",
-                    payload.sub,
-                    payload.family,
-                    payload.jti,
-                )
-            raise TokenRevokedError("refresh token has been revoked")
-
-        # 2) Consume the old token (revoke its JTI; keep family id).
         expires_at = datetime.fromtimestamp(payload.exp, tz=timezone.utc)
-        await self._revoker.add(
-            payload.jti, expires_at, family=payload.family
-        )
 
-        # 3) Issue a fresh pair in the same family.
+        # Check-and-consume MUST be atomic with respect to other refreshes
+        # of the same token. Otherwise two concurrent refresh calls would
+        # both observe is_revoked=False, both call add(), and both issue a
+        # fresh pair — completely defeating replay detection.
+        async with self._refresh_lock:
+            # 1) Replay check.
+            if await self._revoker.is_revoked(payload.jti, payload.family):
+                if payload.family is not None:
+                    await self._revoker.revoke_family(payload.family)
+                    _log.warning(
+                        "Refresh-token reuse detected; revoking family. "
+                        "user={} family={} jti={}",
+                        payload.sub,
+                        payload.family,
+                        payload.jti,
+                    )
+                raise TokenRevokedError("refresh token has been revoked")
+
+            # 2) Consume the old token (revoke its JTI; keep family id).
+            await self._revoker.add(
+                payload.jti, expires_at, family=payload.family
+            )
+
+        # 3) Issue a fresh pair in the same family. No shared state is
+        # touched here (only config reads and uuid generation), so this
+        # does not need to hold the lock.
         new_access, _ = self._issue(
             "access",
             payload.sub,

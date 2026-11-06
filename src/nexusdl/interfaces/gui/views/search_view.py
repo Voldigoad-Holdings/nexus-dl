@@ -35,13 +35,46 @@ Universal design notes:
     * Every string comes from an injectable :class:`SearchLabels`.
     * All callbacks are isolated — a misbehaving host never breaks Tk.
     * Cleans up after itself on ``<Destroy>``.
+
+Pagination and the site filter
+------------------------------
+:meth:`SearchView._on_page_nav` re-runs the *exact* request that produced
+the current page (same query, same site), with only the page index
+changed. The previous behaviour fell back on
+:meth:`SearchView.get_selected_site_id` when the request's
+``site_id`` was ``None`` — which meant that a user who selected a site
+in the dropdown *without re-running the search* would see page 2
+filtered to that site, while page 1 had been unfiltered. The bug was
+silent: the dropdown changed the sidebar, the pagination changed the
+underlying query, and nothing in the UI told the user that the
+pagination had switched the site filter on them.
+
+The fix uses a sentinel (``_UNSET``) so that :meth:`_emit_search` can
+distinguish "site_id not provided, use the dropdown" (a new search from
+the search bar) from "site_id explicitly ``None``, search everywhere"
+(a pagination on an unfiltered request).
+
+Reflow column bookkeeping
+-------------------------
+:meth:`SearchView._reflow` recomputes the number of visible columns on
+every resize, and configures the grid accordingly. The previous
+implementation updated ``self._current_cols`` *before* iterating the
+grid configuration, so the iteration range was the **new** column count
+— meaning columns from a wider layout (``weight=1``) were never reset to
+``weight=0`` when the window shrank. The grid then kept reserving space
+for invisible columns, and the visible cards clustered to the left.
+
+The fix tracks the *actually configured* columns in a set, and the loop
+iterates over the union of the old and new sets so a shrinking window
+resets the now-unused columns to ``weight=0``.
 """
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import customtkinter as ctk
 from loguru import logger as _logger
@@ -168,6 +201,14 @@ _RESIZE_DEBOUNCE_MS = 100
 _THEME_POLL_MS = 1000
 _CARD_GAP = 8
 
+#: Sentinel for :meth:`SearchView._emit_search`'s ``site_id`` parameter.
+#: Distinguishes "the caller did not specify a site, use the dropdown"
+#: from "the caller specified ``None`` explicitly, search everywhere".
+#: A plain ``site_id: str | None = None`` default cannot distinguish the
+#: two, and that ambiguity is what made pagination silently re-filter
+#: when the user had changed the dropdown between pages.
+_UNSET: Final[object] = object()
+
 
 # ---------------------------------------------------------------------------
 # Widget
@@ -259,6 +300,11 @@ class SearchView(ctk.CTkFrame):
         self._loading: bool = False
         self._error: str | None = None
         self._current_cols: int = 0
+        #: Columns whose ``weight`` has been set to 1 by a previous
+        #: reflow. Tracked explicitly so that a *shrinking* window can
+        #: reset the now-unused columns to ``weight=0`` — see the module
+        #: docstring's "Reflow column bookkeeping" section.
+        self._configured_cols: set[int] = set()
 
         # Deferred/async state.
         self._reflow_after_id: str | None = None
@@ -270,7 +316,7 @@ class SearchView(ctk.CTkFrame):
         self._apply_theme()
         self._render_empty_state()
 
-        self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_theme_check()
 
     # ------------------------------------------------------------------
@@ -326,8 +372,14 @@ class SearchView(ctk.CTkFrame):
         self._current_page = page
         self._last_successful_request = self._current_request
 
-        # Clear selection: it refers to a previous result set.
+        # Clear selection: it refers to a previous result set. Notify
+        # the host only when the selection was actually non-empty — a
+        # spurious "selection cleared" event on every page change would
+        # make the host's "Download selected" button flicker.
+        had_selection = bool(self._selected_ids)
         self._selected_ids.clear()
+        if had_selection and self._on_selection_change_cb is not None:
+            self._safe_call(self._on_selection_change_cb, [])
 
         self._render_cards(page.items)
         self._render_status_bar()
@@ -615,7 +667,12 @@ class SearchView(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _render_cards(self, items: list[MangaCardData]) -> None:
-        # Tear down previous cards.
+        # Tear down previous cards. ``destroy()`` releases the Tk widget
+        # but the ``CTkImage`` held by each card is only reclaimed by
+        # the Python GC — a paginated browse of 10 pages × 24 cards can
+        # retain 240 covers (~240 MB) until a collection cycle.
+        # ``gc.collect()`` is cheap (microseconds when there is nothing
+        # to collect) and forces the release immediately.
         for card in self._cards.values():
             try:
                 card.destroy()
@@ -623,6 +680,7 @@ class SearchView(ctk.CTkFrame):
                 pass
         self._cards.clear()
         self._card_data_by_id.clear()
+        gc.collect()
 
         if not items:
             self._render_empty_state_for_query(
@@ -725,14 +783,23 @@ class SearchView(ctk.CTkFrame):
             return
         self._current_cols = new_cols
 
-        for col in range(max(self._current_cols, new_cols, 1)):
+        # Configure the columns that are now visible (weight=1) and the
+        # ones that were visible before but are not anymore (weight=0).
+        # The union is what makes a shrinking window reset the stale
+        # columns — a plain ``range(new_cols)`` would leave them at
+        # ``weight=1`` and the grid would keep reserving space for them.
+        columns_to_update = set(range(new_cols)) | self._configured_cols
+        for col in columns_to_update:
             try:
                 self._results_scroll.grid_columnconfigure(
-                    col, weight=1 if col < new_cols else 0,
+                    col,
+                    weight=1 if col < new_cols else 0,
                     uniform="card" if self._layout == SearchLayout.GRID else "",
                 )
             except Exception:
                 pass
+
+        self._configured_cols = set(range(new_cols))
 
         for card in self._cards.values():
             try:
@@ -771,13 +838,29 @@ class SearchView(ctk.CTkFrame):
     def _on_page_nav(self, delta: int) -> None:
         if self._current_page is None or self._current_request is None:
             return
+
+        # Respect the pagination controls even if a stray click lands on
+        # a disabled button.
+        if delta < 0 and not self._current_page.has_prev:
+            return
+        if delta > 0 and not self._current_page.has_next:
+            return
+
         new_page = self._current_page.page + delta
         if new_page < 1:
             return
+
+        # Re-run the exact request that produced the current page. The
+        # previous implementation fell back on the dropdown when the
+        # original request had ``site_id=None``, which silently changed
+        # the site filter for page 2 if the user had interacted with
+        # the dropdown without re-running the search. See the module
+        # docstring's "Pagination and the site filter" section.
+        req = self._current_request
         self._emit_search(
             page=new_page,
-            query=self._current_request.query,
-            site_id=self._current_request.site_id,
+            query=req.query,
+            site_id=req.site_id,
         )
 
     def _handle_site_change(self, selected: SiteConfig | None) -> None:
@@ -792,14 +875,15 @@ class SearchView(ctk.CTkFrame):
         *,
         page: int,
         query: str | None = None,
-        site_id: str | None = None,
+        site_id: str | None | object = _UNSET,
     ) -> None:
         if self._destroyed:
             return
         if query is None:
             query = self.get_query()
-        if site_id is None:
+        if site_id is _UNSET:
             site_id = self.get_selected_site_id()
+        assert site_id is None or isinstance(site_id, str)
 
         request = SearchRequest(
             query=query,
@@ -844,7 +928,8 @@ class SearchView(ctk.CTkFrame):
             pass
         self._render_status_bar()
         self._render_pagination()
-        self._render_empty_state() if not self._cards else None
+        if not self._cards:
+            self._render_empty_state()
 
     def _schedule_theme_check(self) -> None:
         if self._destroyed:
@@ -855,11 +940,15 @@ class SearchView(ctk.CTkFrame):
         self._theme_after_id = None
         if self._destroyed:
             return
-        current = self._current_mode()
-        if current != self._last_theme_mode:
-            self._last_theme_mode = current
-            self._apply_theme()
-        self._schedule_theme_check()
+        try:
+            current = self._current_mode()
+            if current != self._last_theme_mode:
+                self._last_theme_mode = current
+                self._apply_theme()
+        finally:
+            # Always reschedule — a single failure in ``_apply_theme``
+            # must not stop the polling loop for the widget's lifetime.
+            self._schedule_theme_check()
 
     # ------------------------------------------------------------------
     # Misc
@@ -877,6 +966,8 @@ class SearchView(ctk.CTkFrame):
 
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
+            return
+        if self._destroyed:
             return
         self._destroyed = True
         for attr in ("_reflow_after_id", "_theme_after_id"):

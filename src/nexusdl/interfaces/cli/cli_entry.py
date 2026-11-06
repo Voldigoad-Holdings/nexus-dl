@@ -45,6 +45,24 @@ The order is not arbitrary: each step depends on the previous one. The
 registry, session, and event bus; the plugin loader needs the event bus
 and (optionally) the session.
 
+Bootstrap under a running event loop
+------------------------------------
+:meth:`CLIState.ensure` is **synchronous** and can be called from a
+command declared either ``def`` (the common case) or ``async def``
+(Typer dispatches ``async def`` commands inside its own
+:func:`asyncio.run`). The bootstrap itself needs to await two
+coroutines — :meth:`SiteRegistry.initialize` and
+:meth:`LibraryDatabase.init` — which requires an event loop.
+
+The synchronous caller cannot simply do
+``asyncio.run(initialize())``: if the caller is already inside a
+running loop (the ``async def`` command path), that raises
+``RuntimeError: Cannot run the event loop while another loop is
+running``. The bootstrap therefore runs the two coroutines **inside a
+thread-pool task** when a loop is already running, and directly inside
+a fresh loop otherwise. The two code paths are isolated in
+:func:`_run_coroutine` — see its docstring for the exact rule.
+
 Deferred imports
 ----------------
 Two dependencies are imported **inside** the commands that need them,
@@ -83,36 +101,30 @@ runs.
 
 Async commands
 --------------
-Some commands are ``async def`` (search, download, library reads,
-``tui``'s internal bootstrap). Typer dispatches ``async def`` commands
-inside its own :func:`asyncio.run` — the CLI's own event loop is not
-running when a command executes, so this is safe.
+Some commands are ``async def`` (``tui``, ``web`` internal bootstrap).
+Typer dispatches ``async def`` commands inside its own
+:func:`asyncio.run` — the CLI's own event loop is not running when a
+command executes, so calling :meth:`CLIState.ensure` from there is safe
+because ``_run_coroutine`` detects the running loop and offloads the
+awaited work to a thread.
 
 The two interface-launching commands (``tui``, ``web``) are declared
 **sync** and create their own event loop via :func:`asyncio.run`. They
 must do so because both :meth:`textual.app.App.run_async` and
 :meth:`uvicorn.Server.serve` are coroutines that need to own the loop
 for their duration — they cannot be invoked from inside an outer
-:func:`asyncio.run` without nesting loops, which fails on every Python
-version that supports this project.
+:func:`asyncio.run` without nesting loops.
 
-Commands from ``commands.py``
------------------------------
-This module registers seven sub-command groups, each defined as a
-:class:`typer.Typer` instance in
-:mod:`nexusdl.interfaces.cli.commands`:
-
-* ``search_app`` — search across sites.
-* ``download_app`` — download a manga.
-* ``library_app`` — inspect the local library.
-* ``config_app`` — validate and inspect configuration.
-* ``sites_app`` — inspect the site registry.
-* ``plugins_app`` — inspect and manage plugins.
-* ``admin_app`` — administrative operations (``admin init``).
-
-Every command in those groups receives ``ctx: typer.Context`` and reads
-the wired services via ``ctx.obj.ensure()``. See the :class:`CLIState`
-docstring for the exact contract.
+Cleanup on interface exit
+-------------------------
+Both ``tui`` and ``web`` close every service on the ``finally`` path.
+Each cleanup step is **individually wrapped**: a failure to close the
+manager must not prevent the database from being closed, and — more
+importantly — a cleanup failure must not **mask** the exception that
+brought the interface down. A ``raise`` inside a ``finally`` replaces
+the in-flight exception; the user then sees "failed to close database"
+instead of the actual "TUI crashed" traceback. The pattern is: try,
+log, continue.
 
 ``--version`` handling
 ----------------------
@@ -159,9 +171,10 @@ the "Deferred imports" section.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Final
+from typing import TYPE_CHECKING, Annotated, Any, Coroutine, Final, TypeVar
 
 import typer
 
@@ -198,6 +211,8 @@ except ImportError:  # pragma: no cover — never in a correct install
 
 if TYPE_CHECKING:
     from nexusdl.plugins import PluginLoader
+
+_T = TypeVar("_T")
 
 
 __all__ = ["CLIState", "WiredServices", "app", "main"]
@@ -310,9 +325,14 @@ class CLIState:
 
     Args:
         debug: When ``True``, overrides ``settings.app.debug`` and
-            ``settings.logging.level`` before logging is configured.
-            Useful for a command that misbehaves and the user wants a
-            verbose trace without editing ``.env``.
+            raises the logging level to ``DEBUG``. The configured
+            ``format`` is preserved: a deployment that has set
+            ``NEXUSDL_LOGGING__FORMAT=json`` keeps JSON output even
+            under ``--debug`` (a log collector that fails on pretty
+            output would otherwise drop the whole traceback). A
+            ``format`` of ``None`` — the "auto" default — resolves to
+            ``pretty`` under debug, matching the pre-existing
+            behaviour for the common case.
         quiet: When ``True``, overrides ``settings.logging.level`` to
             ``"WARNING"`` — suppresses the routine ``INFO`` lines the
             pipeline emits during a normal run. Mutually exclusive with
@@ -341,6 +361,16 @@ class CLIState:
         :class:`typer.Exit` with code 1 and a message explaining what
         went wrong and how to fix it — the caller does not need to
         catch or wrap the error.
+
+        Safe to call from a synchronous command (Typer runs the
+        callback outside any event loop) and from an asynchronous
+        command (Typer wraps the command in its own
+        :func:`asyncio.run`). The bootstrap's two awaited calls —
+        :meth:`SiteRegistry.initialize` and
+        :meth:`LibraryDatabase.init` — are dispatched by
+        :func:`_run_coroutine`, which detects the running loop and
+        offloads the work to a thread in that case. See that helper's
+        docstring.
 
         Returns:
             The :class:`WiredServices` container.
@@ -391,17 +421,21 @@ class CLIState:
         # Apply the CLI overrides. The `Settings` model is frozen, so
         # the override is applied via ``model_copy`` rather than a
         # mutation. ``quiet`` and ``debug`` are mutually exclusive (see
-        # ``__init__``); a debug run sets the level to DEBUG and
-        # enables app.debug, a quiet run sets it to WARNING, and the
-        # default run leaves both as configured.
+        # ``__init__``); a debug run sets the level to DEBUG, a quiet
+        # run sets it to WARNING, and the default run leaves both as
+        # configured. **Format is never overridden** — see the
+        # class docstring's ``debug`` argument for the rationale.
         if self._debug:
+            debug_update: dict[str, Any] = {"level": "DEBUG"}
+            if settings.logging.format is None:
+                debug_update["format"] = "pretty"
             settings = settings.model_copy(
                 update={
                     "app": settings.app.model_copy(
                         update={"debug": True}
                     ),
                     "logging": settings.logging.model_copy(
-                        update={"level": "DEBUG", "format": "pretty"}
+                        update=debug_update
                     ),
                 }
             )
@@ -454,11 +488,11 @@ class CLIState:
             parser_factory=parser_factory,
             settings=settings,
         )
-        _run_sync(registry.initialize())
+        _run_coroutine(registry.initialize())
 
         # --- 8. Library database -------------------------------------- #
         database = LibraryDatabase(settings.paths.database_file)
-        _run_sync(database.init())
+        _run_coroutine(database.init())
 
         # --- 9. HTTP session ------------------------------------------ #
         from nexusdl.core.session.circuit_breaker import CircuitBreakerPool
@@ -570,34 +604,73 @@ class CLIState:
 # --------------------------------------------------------------------------- #
 
 
-def _run_sync(coro: object) -> None:
-    """Run an awaitable to completion in a fresh event loop.
+def _run_coroutine(coro: Coroutine[Any, Any, _T]) -> _T:
+    """Run *coro* to completion, whether or not an event loop is running.
 
     The bootstrap runs synchronously in the CLI callback's thread, but
-    :meth:`SiteRegistry.initialize` and :meth:`LibraryDatabase.init` are
-    coroutines. This helper bridges the two: it creates a fresh event
-    loop, runs the coroutine, then destroys the loop.
+    the two awaited calls it makes
+    (:meth:`SiteRegistry.initialize` and :meth:`LibraryDatabase.init`)
+    are coroutines. Two cases must be handled:
 
-    A fresh loop is required because the CLI callback runs in a
-    synchronous thread with no running loop (Typer invokes callbacks
-    outside any event loop). Creating and destroying a loop per init
-    call is negligible — the two init calls take a few hundred
-    milliseconds each in the worst case, and the loop setup is
-    microseconds.
+    * **No event loop is running** (the common ``def`` command case) —
+      a fresh event loop is created, the coroutine runs to completion,
+      the loop is closed. This is the same pattern as
+      :func:`asyncio.run` and produces the same observable behaviour.
+
+    * **An event loop is already running** (the ``async def`` command
+      case: Typer wraps every ``async def`` command in its own
+      :func:`asyncio.run`, so :meth:`CLIState.ensure` can be called
+      from inside an active loop) — a fresh loop cannot be created in
+      this thread without raising ``RuntimeError: Cannot run the event
+      loop while another loop is running``. The coroutine is therefore
+      offloaded to a worker thread that creates its own loop and runs
+      it there. The calling thread blocks on
+      :meth:`concurrent.futures.Future.result`, which is safe because
+      the calling coroutine is the only consumer of the outer loop at
+      this point.
+
+    The thread-offload path is only reached for ``async def`` commands.
+    Every ``def`` command takes the fast path and pays only for a
+    couple of loop constructions.
 
     Args:
-        coro: The awaitable to run.
+        coro: The coroutine to run.
+
+    Returns:
+        The coroutine's return value.
 
     Raises:
-        Exception: Whatever the coroutine raised — propagated unchanged.
+        Exception: Whatever the coroutine raised — propagated unchanged,
+            with the traceback preserved (the worker-thread path
+            re-raises from the future, which carries the original
+            exception object).
     """
-    loop = asyncio.new_event_loop()
     try:
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(coro)  # type: ignore[arg-type]
-    finally:
-        asyncio.set_event_loop(None)
-        loop.close()
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop running — fast path.
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    # A loop is running — we cannot create a nested one in this thread.
+    # Offload to a worker thread that owns its own loop.
+    def _runner() -> _T:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_runner)
+        return future.result()
 
 
 def _read_env() -> dict[str, str]:
@@ -653,6 +726,56 @@ def _raise_bootstrap_error(exc: Exception) -> None:
         err=True,
     )
     raise typer.Exit(code=_EXIT_CONFIG_ERROR)
+
+
+async def _close_services(wired: WiredServices) -> None:
+    """Close every service, logging each failure independently.
+
+    Called from the ``finally`` block of the ``tui`` and ``web``
+    commands. Each cleanup step is wrapped individually so that:
+
+    * a failure in one service does not prevent the others from being
+      closed;
+    * a cleanup failure does not **mask** the exception that brought
+      the interface down.
+
+    A ``raise`` inside a ``finally`` replaces the in-flight exception.
+    If ``run_app`` raised ``ValueError: TUI crashed`` and the
+    subsequent ``manager.stop()`` raised ``RuntimeError: stop failed``,
+    the user would see the ``RuntimeError`` traceback and assume the
+    TUI crashed for the wrong reason. The pattern here is: try, log,
+    continue.
+
+    Args:
+        wired: The wired services to close.
+    """
+    try:
+        await wired.manager.stop()
+    except Exception as exc:  # noqa: BLE001 — cleanup, log and continue
+        _log.warning(
+            "Failed to stop the download manager during shutdown: "
+            "{}: {}",
+            type(exc).__name__,
+            exc,
+        )
+    try:
+        await wired.session.close()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "Failed to close the HTTP session during shutdown: "
+            "{}: {}",
+            type(exc).__name__,
+            exc,
+        )
+    try:
+        await wired.database.close()
+    except Exception as exc:  # noqa: BLE001
+        _log.warning(
+            "Failed to close the library database during shutdown: "
+            "{}: {}",
+            type(exc).__name__,
+            exc,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -809,9 +932,10 @@ async def _run_tui_async(state: CLIState) -> None:
 
     Every service's cleanup is on the ``finally`` path, so a TUI that
     crashes mid-session still leaves the database and the HTTP session
-    cleanly closed. This is the only place in the CLI that owns the
-    full lifetime of every service — the other commands use them
-    transiently and can afford to leak (the process exits).
+    cleanly closed. The cleanup itself is delegated to
+    :func:`_close_services`, which logs each failure independently so
+    that a cleanup exception cannot mask the one that brought the TUI
+    down.
 
     Args:
         state: The CLI state. Its :meth:`CLIState.ensure` call may
@@ -827,9 +951,7 @@ async def _run_tui_async(state: CLIState) -> None:
 
         await run_app(wired)
     finally:
-        await wired.manager.stop()
-        await wired.session.close()
-        await wired.database.close()
+        await _close_services(wired)
 
 
 @app.command()
@@ -898,9 +1020,7 @@ async def _run_web_async(
         server = uvicorn.Server(config)
         await server.serve()
     finally:
-        await wired.manager.stop()
-        await wired.session.close()
-        await wired.database.close()
+        await _close_services(wired)
 
 
 # --------------------------------------------------------------------------- #

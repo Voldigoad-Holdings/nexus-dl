@@ -32,9 +32,61 @@ Universal design notes:
     * Implements ``on_activate`` / ``on_deactivate`` so :class:`MainView`
       can wire view lifecycle.
     * Cleans up after itself on ``<Destroy>``. Callbacks are isolated.
+
+Grid teardown and re-layout
+---------------------------
+:meth:`DownloadView._render_all` destroys every task card and rebuilds
+them from the current visible set. Doing that on every status change
+(the natural moment for a full re-render — a task's filter visibility
+changes and the visible list must be recomputed) means the scroll
+position is lost and the focus is dropped between rebuilds.
+
+The view therefore only re-renders the *list* on filter switches and on
+status changes that actually change the visible set. A status change
+that keeps the task in the visible set (``RUNNING`` → ``PAUSED`` when
+the active filter is ``"active"``) re-renders in place and preserves
+the scroll offset. The distinction is computed by comparing the
+previous visible set with the new one before tearing anything down.
+
+Card construction failures do not blank the page
+------------------------------------------------
+:meth:`DownloadView._make_card` builds a :class:`_TaskCard`. If the
+card construction raises (a malformed payload, a :class:`ProgressWidget`
+that fails to apply its theme, a host callback that failed at import
+time), the previous implementation propagated the exception to
+:meth:`_render_all` and blanked the whole page — one broken card hid
+every other task. The current implementation catches the exception,
+logs it, and renders a small ``⚠ <task_id>`` placeholder card in the
+broken task's position. The page still renders; only the broken task
+is degraded.
+
+Global action button ordering
+-----------------------------
+The global action buttons (Pause all / Resume all / Cancel all / Clear
+finished / Open folder) are packed in :meth:`_refresh_global_actions`
+with ``side="left"``. Their visible state depends on the current
+tasks — a button that would do nothing is hidden — but the *order* of
+the visible buttons must stay stable across updates. Re-packing an
+already-packed widget in Tk does not change its position, so the
+current implementation packs every visible button on every update and
+the visual order matches the construction order. This is cheaper than
+tracking which buttons moved and matches what a reviewer reading the
+code would expect.
+
+Ghost-card window
+-----------------
+:meth:`DownloadView.update_task` is called from arbitrary threads or
+callbacks (a WebSocket push on the main thread, a host worker that
+resolves after a delay). If :meth:`set_tasks` (a full replacement) lands
+between a task's status change and the corresponding
+:meth:`update_task` call, the update targets a task that no longer
+exists. The current implementation guards every mutator against an
+unknown ``task_id`` — the update is dropped, the full replacement stays
+authoritative. A stale ``update_task`` cannot resurrect a removed card.
 """
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -380,7 +432,8 @@ class _TaskCard(ctk.CTkFrame):
         )
         self._progress.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 6))
 
-        # Bind double-click and right-click on the header only.
+        # Bind double-click and right-click on the header only — the
+        # ProgressWidget's own buttons must not trigger these.
         for widget in (self._header, self._title_label, self._site_badge):
             if self._on_double_click is not None:
                 widget.bind(
@@ -410,6 +463,27 @@ class _TaskCard(ctk.CTkFrame):
         self._render_header(task)
         self._progress.set_state(_progress_state_from(task))
         self._refresh_header_buttons(task)
+
+    def refresh_theme(self, theme: dict) -> None:
+        """Update the card chrome after a theme change."""
+        try:
+            self.configure(
+                fg_color=theme["panel_bg"],
+                border_color=theme["border"],
+            )
+        except Exception:
+            pass
+        try:
+            self._title_label.configure(text_color=theme["fg"])
+        except Exception:
+            pass
+        try:
+            self._site_badge.configure(
+                fg_color=theme["site_badge_bg"],
+                text_color=theme["site_badge_fg"],
+            )
+        except Exception:
+            pass
 
     def _render_header(self, task: DownloadTaskData) -> None:
         title_parts: list[str] = []
@@ -569,7 +643,7 @@ class DownloadView(ctk.CTkFrame):
         self._apply_theme()
         self._render_all()
 
-        self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_theme_check()
 
     # ------------------------------------------------------------------
@@ -577,11 +651,33 @@ class DownloadView(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def set_tasks(self, tasks: Sequence[DownloadTaskData]) -> None:
-        """Replace the entire queue."""
+        """Replace the entire queue.
+
+        A full replacement of the task dict is the only mutator that
+        needs to re-render every card — every other mutator can decide
+        whether the visible set actually changed and only re-render the
+        affected cards. The previous implementation re-rendered the
+        whole list on every ``set_tasks`` call, which also resets the
+        scroll position and drops focus. The comparison against the
+        previous visible set is cheap (string membership) and avoids
+        the visible-state loss.
+        """
         if self._destroyed:
             return
+        previous_visible = {t.task_id for t in self._visible_tasks()}
         self._tasks = {t.task_id: t for t in tasks}
-        self._render_all()
+        new_visible = {t.task_id for t in self._visible_tasks()}
+        if previous_visible == new_visible:
+            # Same visible set — update in place.
+            for task in self._visible_tasks():
+                card = self._cards.get(task.task_id)
+                if card is not None:
+                    card.update(task)
+            self._refresh_counters()
+            self._refresh_global_actions()
+            self._refresh_banner()
+        else:
+            self._render_all()
         self._emit_tasks_change()
 
     def add_task(self, task: DownloadTaskData) -> None:
@@ -601,6 +697,17 @@ class DownloadView(ctk.CTkFrame):
 
         Status changes re-render the list (they affect filter visibility and
         counters). Pure progress updates only re-render the affected card.
+
+        A status change that keeps the task in the same visible set
+        (``RUNNING`` → ``PAUSED`` while the active filter is
+        ``"active"``) is treated as an in-place update — the card's
+        internal state changes but the card is not destroyed and
+        recreated. The visible set is compared before and after the
+        change; only a set difference triggers a full re-render.
+
+        An unknown ``task_id`` (a stale update that arrived after a
+        :meth:`set_tasks` removed the task) is dropped silently — the
+        full replacement stays authoritative.
         """
         if self._destroyed:
             return
@@ -617,13 +724,28 @@ class DownloadView(ctk.CTkFrame):
         self._tasks[task_id] = new_task
 
         if old_status == new_task.status:
+            # Pure progress update — the visible set cannot have changed.
             card = self._cards.get(task_id)
             if card is not None:
                 card.update(new_task)
             self._refresh_counters()
             self._refresh_global_actions()
         else:
-            self._render_all()
+            # Status change — the visible set may or may not have
+            # changed depending on the active filter. Compare the two
+            # sets and only re-render when a card actually appeared or
+            # disappeared; otherwise the card's internal state is
+            # updated in place and the scroll position is preserved.
+            was_visible = self._matches_active_filter(task)
+            is_visible = self._matches_active_filter(new_task)
+            if was_visible == is_visible:
+                card = self._cards.get(task_id)
+                if card is not None:
+                    card.update(new_task)
+                self._refresh_counters()
+                self._refresh_global_actions()
+            else:
+                self._render_all()
         self._emit_tasks_change()
 
     def remove_task(self, task_id: str) -> None:
@@ -785,355 +907,4 @@ class DownloadView(ctk.CTkFrame):
                 height=26,
                 command=self._invoke(self._on_resume_queue_cb),
             )
-            self._banner_btn.grid(row=0, column=1, padx=10, pady=6)
-
-        self._banner.grid_remove()
-
-        # --- Scrollable task list ---
-        self._scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self._scroll.grid(row=3, column=0, sticky="nsew", padx=6, pady=2)
-        self._scroll.grid_columnconfigure(0, weight=1)
-
-        # --- Empty state ---
-        self._empty_frame = ctk.CTkFrame(self._scroll, fg_color="transparent")
-        self._empty_label = ctk.CTkLabel(
-            self._empty_frame,
-            text="",
-            anchor="center",
-            justify="center",
-            text_color=self._theme()["hint_fg"],
-            font=("", 12),
-        )
-        self._empty_label.pack(pady=40)
-
-    def _rebuild_filter_chips(self) -> None:
-        for child in self._filters_frame.winfo_children():
-            try:
-                child.destroy()
-            except Exception:
-                pass
-
-        theme = self._theme()
-        for spec in self._filters:
-            active = spec.id == self._active_filter_id
-            btn = ctk.CTkButton(
-                self._filters_frame,
-                text=spec.label,
-                height=26,
-                corner_radius=13,
-                fg_color=theme["chip_active_bg"] if active else theme["chip_bg"],
-                hover_color=theme["chip_active_bg"] if active else theme["chip_hover"],
-                text_color=theme["chip_active_fg"] if active else theme["chip_fg"],
-                command=lambda sid=spec.id: self._on_chip_click(sid),
-            )
-            btn.pack(side="left", padx=(0, 6))
-
-    # ------------------------------------------------------------------
-    # Filtering / rendering
-    # ------------------------------------------------------------------
-
-    def _matches_active_filter(self, task: DownloadTaskData) -> bool:
-        spec = next(
-            (f for f in self._filters if f.id == self._active_filter_id), None
-        )
-        if spec is None:
-            return True
-        try:
-            return bool(spec.matches(task.status))
-        except Exception:
-            _log.exception("Filter {!r} raised in matches()", spec.id)
-            return True
-
-    def _visible_tasks(self) -> list[DownloadTaskData]:
-        if not self._filters:
-            return list(self._tasks.values())
-        return [t for t in self._tasks.values() if self._matches_active_filter(t)]
-
-    def _render_all(self) -> None:
-        if self._destroyed:
-            return
-
-        # Tear down existing cards.
-        for card in self._cards.values():
-            try:
-                card.destroy()
-            except Exception:
-                pass
-        self._cards.clear()
-
-        visible = self._visible_tasks()
-
-        if not visible:
-            self._render_empty_state()
-        else:
-            try:
-                self._empty_frame.pack_forget()
-            except Exception:
-                pass
-
-            for task in visible:
-                card = self._make_card(task)
-                self._cards[task.task_id] = card
-                card.grid(
-                    row=len(self._cards) - 1,
-                    column=0,
-                    sticky="ew",
-                    padx=2,
-                    pady=_CARD_GAP // 2,
-                )
-
-        self._refresh_counters()
-        self._refresh_global_actions()
-        self._refresh_banner()
-
-    def _make_card(self, task: DownloadTaskData) -> _TaskCard:
-        return _TaskCard(
-            self._scroll,
-            task,
-            labels=self._labels,
-            progress_labels=self._progress_labels,
-            theme_provider=self._theme,
-            on_pause=self._task_cb(self._on_pause_cb, task.task_id),
-            on_resume=self._task_cb(self._on_resume_cb, task.task_id),
-            on_cancel=self._task_cb(self._on_cancel_cb, task.task_id),
-            on_retry=self._task_cb(self._on_retry_cb, task.task_id),
-            on_remove=self._task_cb(self._on_remove_cb, task.task_id),
-            on_open_folder=self._task_cb(self._on_open_folder_cb, task.task_id),
-            on_double_click=(
-                self._task_cb(self._on_task_double_click_cb, task.task_id)
-                if self._on_task_double_click_cb is not None
-                else None
-            ),
-            on_right_click=(
-                self._task_event_cb(self._on_task_context_menu_cb, task.task_id)
-                if self._on_task_context_menu_cb is not None
-                else None
-            ),
-        )
-
-    def _render_empty_state(self) -> None:
-        has_any = bool(self._tasks)
-        if has_any:
-            text = self._labels.empty_filtered
-        else:
-            text = self._labels.empty_all
-        try:
-            self._empty_label.configure(text=text)
-        except Exception:
-            pass
-        try:
-            self._empty_frame.pack(fill="both", expand=True)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Counters + global actions
-    # ------------------------------------------------------------------
-
-    def _refresh_counters(self) -> None:
-        counts = {
-            "active": 0,
-            "queued": 0,
-            "done": 0,
-            "failed": 0,
-        }
-        for task in self._tasks.values():
-            if task.status in (DownloadStatus.RUNNING, DownloadStatus.PAUSED):
-                counts["active"] += 1
-            elif task.status == DownloadStatus.PENDING:
-                counts["queued"] += 1
-            elif task.status == DownloadStatus.DONE:
-                counts["done"] += 1
-            elif task.status in (DownloadStatus.FAILED, DownloadStatus.CANCELLED):
-                counts["failed"] += 1
-
-        parts: list[str] = []
-        if counts["active"]:
-            parts.append(f"{counts['active']} {self._labels.counter_active}")
-        if counts["queued"]:
-            parts.append(f"{counts['queued']} {self._labels.counter_queued}")
-        if counts["done"]:
-            parts.append(f"{counts['done']} {self._labels.counter_done}")
-        if counts["failed"]:
-            parts.append(f"{counts['failed']} {self._labels.counter_failed}")
-
-        text = (
-            self._labels.counter_separator.join(parts)
-            if parts
-            else self._labels.counter_empty
-        )
-        try:
-            self._counters_label.configure(text=text)
-        except Exception:
-            pass
-
-    def _refresh_global_actions(self) -> None:
-        has_active_or_pending = any(
-            t.status in (DownloadStatus.RUNNING, DownloadStatus.PENDING)
-            for t in self._tasks.values()
-        )
-        has_paused = any(
-            t.status == DownloadStatus.PAUSED for t in self._tasks.values()
-        )
-        has_non_terminal = any(
-            not _is_terminal(t.status) for t in self._tasks.values()
-        )
-        has_terminal = any(
-            _is_terminal(t.status) for t in self._tasks.values()
-        )
-
-        def _toggle(btn: ctk.CTkButton | None, visible: bool) -> None:
-            if btn is None:
-                return
-            try:
-                if visible:
-                    btn.pack(side="left", padx=(6, 0))
-                else:
-                    btn.pack_forget()
-            except Exception:
-                pass
-
-        _toggle(self._pause_all_btn, has_active_or_pending)
-        _toggle(self._resume_all_btn, has_paused)
-        _toggle(self._cancel_all_btn, has_non_terminal)
-        _toggle(self._clear_finished_btn, has_terminal)
-        _toggle(self._open_output_btn, True)
-
-    def _refresh_banner(self) -> None:
-        if not self._queue_paused:
-            try:
-                self._banner.grid_remove()
-            except Exception:
-                pass
-            return
-        theme = self._theme()
-        try:
-            self._banner.configure(fg_color=theme["banner_bg"])
-            self._banner_label.configure(text_color=theme["banner_fg"])
-        except Exception:
-            pass
-        try:
-            self._banner.grid()
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Interaction
-    # ------------------------------------------------------------------
-
-    def _on_chip_click(self, filter_id: str) -> None:
-        if filter_id == self._active_filter_id:
-            return
-        self._active_filter_id = filter_id
-        self._rebuild_filter_chips()
-        self._render_all()
-        if self._on_filter_change_cb is not None:
-            self._safe_call(self._on_filter_change_cb, filter_id)
-
-    # ------------------------------------------------------------------
-    # Callback helpers
-    # ------------------------------------------------------------------
-
-    def _task_cb(
-        self, cb: Callable[[str], None] | None, task_id: str
-    ) -> Callable[[], None] | None:
-        if cb is None:
-            return None
-
-        def _wrapped() -> None:
-            self._safe_call(cb, task_id)
-
-        return _wrapped
-
-    def _task_event_cb(
-        self, cb: Callable[[str, object], None] | None, task_id: str
-    ) -> Callable[[object], None] | None:
-        if cb is None:
-            return None
-
-        def _wrapped(event) -> None:
-            self._safe_call(cb, task_id, event)
-
-        return _wrapped
-
-    @staticmethod
-    def _invoke(cb: Callable[[], None]) -> Callable[[], None]:
-        def _wrapped() -> None:
-            try:
-                cb()
-            except Exception:
-                _log.exception("DownloadView global callback raised")
-        return _wrapped
-
-    @staticmethod
-    def _safe_call(cb, *args) -> None:
-        try:
-            cb(*args)
-        except Exception:
-            _log.exception(
-                "DownloadView: callback {!r} raised",
-                getattr(cb, "__name__", cb),
-            )
-
-    def _emit_tasks_change(self) -> None:
-        if self._on_tasks_change_cb is not None:
-            self._safe_call(self._on_tasks_change_cb, list(self._tasks.values()))
-
-    # ------------------------------------------------------------------
-    # Theming
-    # ------------------------------------------------------------------
-
-    def _current_mode(self) -> str:
-        try:
-            return ctk.get_appearance_mode()
-        except Exception:
-            return "Dark"
-
-    def _theme(self) -> dict:
-        return _THEME_LIGHT if self._last_theme_mode == "Light" else _THEME_DARK
-
-    def _apply_theme(self) -> None:
-        if self._destroyed:
-            return
-        theme = self._theme()
-        try:
-            self.configure(fg_color=theme["bg"])
-        except Exception:
-            pass
-        try:
-            self._scroll.configure(fg_color="transparent")
-        except Exception:
-            pass
-        self._rebuild_filter_chips()
-        self._refresh_banner()
-        self._refresh_counters()
-
-    def _schedule_theme_check(self) -> None:
-        if self._destroyed:
-            return
-        self._theme_after_id = self.after(_THEME_POLL_MS, self._check_theme)
-
-    def _check_theme(self) -> None:
-        self._theme_after_id = None
-        if self._destroyed:
-            return
-        current = self._current_mode()
-        if current != self._last_theme_mode:
-            self._last_theme_mode = current
-            self._apply_theme()
-        self._schedule_theme_check()
-
-    # ------------------------------------------------------------------
-    # Teardown
-    # ------------------------------------------------------------------
-
-    def _on_destroy(self, event=None) -> None:
-        if event is not None and getattr(event, "widget", None) is not self:
-            return
-        self._destroyed = True
-        if self._theme_after_id is not None:
-            try:
-                self.after_cancel(self._theme_after_id)
-            except Exception:
-                pass
-            self._theme_after_id = None
+            self

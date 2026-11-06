@@ -37,9 +37,75 @@ Universal design notes:
     * ``on_activate`` / ``on_deactivate`` are implemented so
       :class:`MainView` can wire view lifecycle (optional reload).
     * Cleans up after itself on ``<Destroy>``.
+
+Pagination races and load serialisation
+---------------------------------------
+The host runs its library query asynchronously; the response arrives
+some time after :meth:`LibraryView._load` fires :attr:`LibraryQuery`.
+While a query is in flight, the user can:
+    * click "Next" on the pagination controls,
+    * change the sort,
+    * click a filter chip,
+    * change the search text.
+Each of those actions calls :meth:`LibraryView._load` again and overwrites
+:attr:`current_query`, leaving the previous query "orphaned" — its response,
+when it arrives, refers to a page index that no longer matches the visible
+state.
+
+The view therefore ignores every load-triggering action while
+``self._loading`` is ``True``. The alternative — queueing the actions and
+replaying them once the response arrives — is more complex than the
+benefit warrants: the user who clicks "Next" twice in 200 ms expects to
+end on page 2, not page 3, and the "ignore while loading" behaviour
+produces exactly that outcome.
+
+The loading flag is cleared in :meth:`set_page` and :meth:`set_error`;
+both are host callbacks that mark the response as received.
+
+Reflow column bookkeeping
+-------------------------
+:meth:`LibraryView._reflow` recomputes the number of visible columns on
+every resize, and configures the grid accordingly. The previous
+implementation updated ``self._current_cols`` *before* iterating the
+grid configuration, so the iteration range was the **new** column count
+— meaning columns from a wider layout (``weight=1``) were never reset to
+``weight=0`` when the window shrank. The grid then kept reserving space
+for invisible columns, and the visible cells clustered to the left.
+
+The current implementation tracks the *actually configured* columns in a
+set (``self._configured_cols``), and iterates over the union of the old
+and new sets so a shrinking window resets the now-unused columns to
+``weight=0``.
+
+Card build failures do not blank the page
+-----------------------------------------
+:meth:`LibraryView._make_cell` builds a :class:`MangaCard` inside a
+:class:`_LibraryCell`. If the card construction raises (a malformed
+``MangaCardData``, a bad cover size, a host callback that failed at
+import time), the previous implementation propagated the exception to
+:meth:`_render_cells` and blanked the whole page — one broken card hid
+the other 39. The current implementation catches the exception, logs
+it, and renders a small ``⚠ <title>`` placeholder inside the cell. The
+page still renders; only the broken card is degraded.
+
+Runtime sort-option changes
+---------------------------
+:meth:`LibraryView.set_sort_options` replaces the sort dropdown's
+values. The sort UI is built once in :meth:`_build`; the previous
+implementation destroyed the dropdown and the direction button on a
+runtime change but never recreated them, so the sort controls simply
+disappeared from the layout.
+
+The current implementation updates the existing dropdown in place
+(when it was built at construction time). A ``set_sort_options`` on a
+view that was constructed **without** any sort options is a no-op
+(logged at DEBUG): adding a sort dropdown that did not exist at
+construction would require rebuilding the entire top bar, which is out
+of scope for a runtime change.
 """
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -285,6 +351,18 @@ class _LibraryCell(ctk.CTkFrame):
         """The frame the :class:`MangaCard` should be placed in."""
         return self._card_holder
 
+    def refresh_theme(self, theme: dict) -> None:
+        """Update the progress bar's colors after a theme change."""
+        if self._progress_bar is None:
+            return
+        try:
+            self._progress_bar.configure(
+                fg_color=theme.get("chip_bg"),
+                progress_color=theme.get("chip_active_bg"),
+            )
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # The view
@@ -433,6 +511,10 @@ class LibraryView(ctk.CTkFrame):
         self._loading: bool = False
         self._error: str | None = None
         self._current_cols: int = 0
+        #: Columns whose ``weight`` has been set to 1 by a previous
+        #: reflow. Tracked explicitly so that a *shrinking* window can
+        #: reset the now-unused columns to ``weight=0``.
+        self._configured_cols: set[int] = set()
 
         # Deferred work.
         self._search_after_id: str | None = None
@@ -445,7 +527,7 @@ class LibraryView(ctk.CTkFrame):
         self._apply_theme()
         self._render_empty_state()
 
-        self.bind("<Destroy>", self._on_destroy)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self._schedule_theme_check()
 
     # ------------------------------------------------------------------
@@ -492,16 +574,27 @@ class LibraryView(ctk.CTkFrame):
         self._render_status_bar()
 
     def set_page(self, page: LibraryPage) -> None:
-        """Replace the current page with ``page``."""
+        """Replace the current page with ``page``.
+
+        The selection is dropped on every page change — it refers to the
+        previous page's items, which are about to be destroyed. The host
+        is notified via :attr:`on_selection_change` only when the
+        selection was actually non-empty (a spurious event on every page
+        change would make the host's "Delete selected" button flicker
+        between enabled and disabled states).
+        """
         if self._destroyed:
             return
         self._error = None
         self._loading = False
         self._current_page = page
 
-        # New page = new items → drop selection.
+        # New page = new items → drop selection and notify the host.
+        had_selection = bool(self._selected_ids)
         self._selected_ids.clear()
         self._refresh_batch_bar()
+        if had_selection:
+            self._emit_selection_change()
 
         self._render_cells(page.items)
         self._render_status_bar()
@@ -528,10 +621,27 @@ class LibraryView(ctk.CTkFrame):
         self._rebuild_filter_chips()
 
     def set_sort_options(self, options: Sequence[LibrarySortOption]) -> None:
+        """Replace the sort options at runtime.
+
+        The sort UI is built once in :meth:`_build`. A runtime change
+        updates the existing dropdown in place (values and selection).
+        A view constructed **without** sort options has no dropdown to
+        update; in that case the call is a no-op (logged at DEBUG) —
+        adding a sort UI to an existing view would require rebuilding
+        the entire top bar, which is out of scope for a runtime change.
+        """
         if self._destroyed:
             return
         self._sort_options = list(options)
         self._show_sort = bool(self._sort_options)
+        if self._sort_menu is None:
+            if self._sort_options:
+                _log.debug(
+                    "set_sort_options called but sort UI was not built "
+                    "(no sort_options at __init__ time); rebuild the "
+                    "view to add sort options"
+                )
+            return
         self._rebuild_sort_controls()
 
     def set_batch_actions(self, actions: Sequence[BatchAction]) -> None:
@@ -548,7 +658,7 @@ class LibraryView(ctk.CTkFrame):
         self._load(page=page)
 
     def focus_search(self) -> None:
-        if not self._destroyed and self._searchable:
+        if not self._destroyed and self._searchable and self._search_entry is not None:
             try:
                 self._search_entry.focus_set()
             except Exception:
@@ -557,7 +667,7 @@ class LibraryView(ctk.CTkFrame):
     def select_all(self) -> None:
         if not self._selectable or self._destroyed:
             return
-        for manga_id, card in self._cards.items():
+        for card in self._cards.values():
             card.set_selected(True)
         self._selected_ids = set(self._cards.keys())
         self._refresh_batch_bar()
@@ -613,6 +723,7 @@ class LibraryView(ctk.CTkFrame):
         top = ctk.CTkFrame(self, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 6))
         top.grid_columnconfigure(0, weight=1)
+        self._top_bar = top
 
         self._search_var = ctk.StringVar(master=self, value="")
         if self._searchable:
@@ -821,23 +932,38 @@ class LibraryView(ctk.CTkFrame):
             self._filters_frame.grid_remove()
 
     def _rebuild_sort_controls(self) -> None:
-        if not hasattr(self, "top") and self._sort_menu is None:
+        """Update the sort dropdown's values without destroying the widget.
+
+        The previous implementation destroyed the sort menu and the sort
+        direction button but never recreated them, so a runtime
+        ``set_sort_options`` call made the sort UI disappear from the
+        layout entirely. The current implementation updates the existing
+        widgets in place — which is what the caller expects from a
+        "replace the options" API.
+        """
+        if self._sort_menu is None:
             return
-        if self._sort_menu is not None:
-            try:
-                self._sort_menu.destroy()
-            except Exception:
-                pass
-        if self._sort_dir_btn is not None:
-            try:
-                self._sort_dir_btn.destroy()
-            except Exception:
-                pass
-        self._sort_menu = None
-        self._sort_dir_btn = None
-        # The sort UI is created in _build(); rebuilding it in place is
-        # overkill for a rare runtime change — the host should rebuild the
-        # whole LibraryView if it wants new sort options mid-flight.
+        try:
+            self._sort_menu.configure(values=self._sort_labels())
+        except Exception:
+            _log.exception("Failed to update sort menu values")
+            return
+
+        # If the currently selected id is not in the new options, fall
+        # back to the first option (or empty).
+        valid_ids = {o.id for o in self._sort_options}
+        if self._current_sort_id not in valid_ids:
+            self._current_sort_id = (
+                self._sort_options[0].id if self._sort_options else ""
+            )
+            self._current_sort_descending = self._resolve_initial_sort_desc(
+                None
+            )
+        try:
+            self._sort_menu.set(self._current_sort_label())
+        except Exception:
+            pass
+        self._refresh_sort_direction_button()
 
     def _rebuild_batch_custom_buttons(self) -> None:
         for btn in self._batch_custom_buttons:
@@ -971,7 +1097,12 @@ class LibraryView(ctk.CTkFrame):
             pass
 
     def _render_cells(self, items: list[LibraryCardData]) -> None:
-        # Tear down.
+        # Tear down the previous cells. ``destroy()`` releases the Tk
+        # widget but the ``CTkImage`` held by each card is only
+        # reclaimed by the Python GC — a paginated browse of 10 pages ×
+        # 40 cards can retain 400 covers (~400 MB) until a collection
+        # cycle. ``gc.collect()`` is cheap and forces the release
+        # immediately.
         for cell in self._cells.values():
             try:
                 cell.destroy()
@@ -980,6 +1111,7 @@ class LibraryView(ctk.CTkFrame):
         self._cells.clear()
         self._cards.clear()
         self._library_data.clear()
+        gc.collect()
 
         if not items:
             return
@@ -990,65 +1122,88 @@ class LibraryView(ctk.CTkFrame):
             self._library_data[data.manga_id] = data
             cell = self._make_cell(data)
             self._cells[data.manga_id] = cell
-            self._cards[data.manga_id] = cell_card(cell)  # type: ignore[arg-type]
 
-            # Ask the host for the cover exactly once.
-            if self._on_cover_needed_cb is not None and data.card.cover_url:
-                self._cards[data.manga_id].set_cover_loading(True)
-                self._safe_call(self._on_cover_needed_cb, data)
+            card = cell_card(cell)
+            if card is not None:
+                self._cards[data.manga_id] = card
+                # Ask the host for the cover exactly once.
+                if self._on_cover_needed_cb is not None and data.card.cover_url:
+                    card.set_cover_loading(True)
+                    self._safe_call(self._on_cover_needed_cb, data)
 
         self._request_reflow(force=True)
 
     def _make_cell(self, data: LibraryCardData) -> _LibraryCell:
+        """Build the cell and its :class:`MangaCard`.
+
+        A card that raises during construction (a malformed
+        :class:`MangaCardData`, a bad cover size, a host callback that
+        failed at import time) does not blank the whole page: the cell
+        is populated with a small ``⚠ <title>`` placeholder instead.
+        The other cards on the page render normally.
+        """
         cell = _LibraryCell(
             self._results_scroll,
             data.manga_id,
             progress=data.reading_progress,
         )
-        card = MangaCard(
-            cell.card_holder,
-            data.card,
-            labels=self._manga_card_labels,
-            on_download=(
-                self._translate_card_cb(self._on_download_cb)
-                if self._on_download_cb is not None
-                else None
-            ),
-            on_view=(
-                self._translate_card_cb(self._on_open_cb)
-                if self._on_open_cb is not None
-                else None
-            ),
-            on_double_click=(
-                self._translate_card_cb(self._on_continue_cb)
-                if self._on_continue_cb is not None
-                else None
-            ),
-            on_right_click=(
-                self._translate_card_right_click_cb(self._on_right_click_cb)
-                if self._on_right_click_cb is not None
-                else None
-            ),
-            on_select=(
-                self._handle_card_select if self._selectable else None
-            ),
-            selectable=self._selectable,
-            selected=data.manga_id in self._selected_ids,
-            orientation=(
-                CardOrientation.HORIZONTAL
-                if self._layout == LibraryLayout.LIST
-                else CardOrientation.VERTICAL
-            ),
-            cover_size=self._cover_size,
-            show_author=True,
-            show_status=True,
-            show_site=True,
-            show_chapter_count=True,
-            show_actions=True,
-        )
-        card.grid(row=0, column=0, sticky="nsew")
-        # Attach for later retrieval (used by _render_cells).
-        cell._card = card  # type: ignore[attr-defined]
+        try:
+            card = MangaCard(
+                cell.card_holder,
+                data.card,
+                labels=self._manga_card_labels,
+                on_download=(
+                    self._translate_card_cb(self._on_download_cb)
+                    if self._on_download_cb is not None
+                    else None
+                ),
+                on_view=(
+                    self._translate_card_cb(self._on_open_cb)
+                    if self._on_open_cb is not None
+                    else None
+                ),
+                on_double_click=(
+                    self._translate_card_cb(self._on_continue_cb)
+                    if self._on_continue_cb is not None
+                    else None
+                ),
+                on_right_click=(
+                    self._translate_card_right_click_cb(self._on_right_click_cb)
+                    if self._on_right_click_cb is not None
+                    else None
+                ),
+                on_select=(
+                    self._handle_card_select if self._selectable else None
+                ),
+                selectable=self._selectable,
+                selected=data.manga_id in self._selected_ids,
+                orientation=(
+                    CardOrientation.HORIZONTAL
+                    if self._layout == LibraryLayout.LIST
+                    else CardOrientation.VERTICAL
+                ),
+                cover_size=self._cover_size,
+                show_author=True,
+                show_status=True,
+                show_site=True,
+                show_chapter_count=True,
+                show_actions=True,
+            )
+            card.grid(row=0, column=0, sticky="nsew")
+            cell._card = card  # type: ignore[attr-defined]
+        except Exception:
+            _log.exception(
+                "LibraryView: failed to build card for {!r}",
+                data.manga_id,
+            )
+            placeholder = ctk.CTkLabel(
+                cell.card_holder,
+                text=f"⚠ {data.card.title}",
+                anchor="center",
+                text_color="#E74C3C",
+            )
+            placeholder.grid(row=0, column=0, sticky="nsew")
+            cell._card = None  # type: ignore[attr-defined]
         return cell
 
     def _translate_card_cb(
@@ -1120,6 +1275,10 @@ class LibraryView(ctk.CTkFrame):
         return self._sort_options[0].label if self._sort_options else ""
 
     def _on_sort_select(self, label: str) -> None:
+        if self._destroyed or self._loading:
+            # A load is already in flight — ignore the action to avoid
+            # racing a stale page index against a pending fetch.
+            return
         for opt in self._sort_options:
             if opt.label == label:
                 self._current_sort_id = opt.id
@@ -1135,6 +1294,8 @@ class LibraryView(ctk.CTkFrame):
         self._load(page=1)
 
     def _on_sort_direction_click(self) -> None:
+        if self._destroyed or self._loading:
+            return
         self._current_sort_descending = not self._current_sort_descending
         self._refresh_sort_direction_button()
         if self._on_sort_change_cb is not None:
@@ -1162,6 +1323,8 @@ class LibraryView(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _on_chip_click(self, filter_id: str) -> None:
+        if self._destroyed or self._loading:
+            return
         if filter_id in self._active_filter_ids:
             self._active_filter_ids.discard(filter_id)
         else:
@@ -1178,6 +1341,8 @@ class LibraryView(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _on_search_key(self, _event=None) -> None:
+        if self._destroyed:
+            return
         if self._search_after_id is not None:
             try:
                 self.after_cancel(self._search_after_id)
@@ -1199,7 +1364,7 @@ class LibraryView(ctk.CTkFrame):
 
     def _commit_search(self) -> None:
         self._search_after_id = None
-        if self._destroyed:
+        if self._destroyed or self._loading:
             return
         query = self.get_search_query()
         if self._on_search_change_cb is not None:
@@ -1237,7 +1402,13 @@ class LibraryView(ctk.CTkFrame):
         self._safe_call(self._on_load_cb, query)
 
     def _on_page_nav(self, delta: int) -> None:
+        if self._destroyed:
+            return
         if self._current_page is None or self._current_query is None:
+            return
+        if self._loading:
+            # A load is already in flight — ignore the click to avoid
+            # racing a stale page index against a pending fetch.
             return
         new_page = self._current_page.page + delta
         if new_page < 1:
@@ -1292,6 +1463,7 @@ class LibraryView(ctk.CTkFrame):
         self._cards.clear()
 
         self._current_cols = 0
+        self._configured_cols.clear()
         self._render_cells(items)
 
     def _on_results_configure(self, _event=None) -> None:
@@ -1326,7 +1498,13 @@ class LibraryView(ctk.CTkFrame):
             return
         self._current_cols = new_cols
 
-        for col in range(max(self._current_cols, new_cols, 1)):
+        # Configure the columns that are now visible (weight=1) and the
+        # ones that were visible before but are not anymore (weight=0).
+        # The union is what makes a shrinking window reset the stale
+        # columns — a plain ``range(new_cols)`` would leave them at
+        # ``weight=1`` and the grid would keep reserving space for them.
+        columns_to_update = set(range(new_cols)) | self._configured_cols
+        for col in columns_to_update:
             try:
                 self._results_scroll.grid_columnconfigure(
                     col,
@@ -1335,6 +1513,8 @@ class LibraryView(ctk.CTkFrame):
                 )
             except Exception:
                 pass
+
+        self._configured_cols = set(range(new_cols))
 
         for cell in self._cells.values():
             try:
@@ -1383,6 +1563,14 @@ class LibraryView(ctk.CTkFrame):
         self._render_pagination()
         self._refresh_batch_bar()
 
+        # Update the reading-progress bars on the cells, since CTk does
+        # not auto-theme them.
+        for cell in self._cells.values():
+            try:
+                cell.refresh_theme(theme)
+            except Exception:
+                pass
+
     def _schedule_theme_check(self) -> None:
         if self._destroyed:
             return
@@ -1392,11 +1580,15 @@ class LibraryView(ctk.CTkFrame):
         self._theme_after_id = None
         if self._destroyed:
             return
-        current = self._current_mode()
-        if current != self._last_theme_mode:
-            self._last_theme_mode = current
-            self._apply_theme()
-        self._schedule_theme_check()
+        try:
+            current = self._current_mode()
+            if current != self._last_theme_mode:
+                self._last_theme_mode = current
+                self._apply_theme()
+        finally:
+            # Always reschedule — a single failure in ``_apply_theme``
+            # must not stop the polling loop for the widget's lifetime.
+            self._schedule_theme_check()
 
     # ------------------------------------------------------------------
     # Batch actions
@@ -1427,6 +1619,8 @@ class LibraryView(ctk.CTkFrame):
     def _on_destroy(self, event=None) -> None:
         if event is not None and getattr(event, "widget", None) is not self:
             return
+        if self._destroyed:
+            return
         self._destroyed = True
         for attr in (
             "_search_after_id",
@@ -1446,6 +1640,10 @@ class LibraryView(ctk.CTkFrame):
 # Private helper (kept at module scope for clarity)
 # ---------------------------------------------------------------------------
 
-def cell_card(cell: _LibraryCell) -> MangaCard:
-    """Return the :class:`MangaCard` stored on a :class:`_LibraryCell`."""
-    return cell._card  # type: ignore[attr-defined]
+def cell_card(cell: _LibraryCell) -> MangaCard | None:
+    """Return the :class:`MangaCard` stored on a :class:`_LibraryCell`.
+
+    Returns ``None`` when the card failed to build and the cell holds a
+    placeholder instead. Callers must guard against ``None``.
+    """
+    return getattr(cell, "_card", None)

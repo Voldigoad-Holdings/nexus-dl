@@ -22,6 +22,20 @@
  * callers — the public API is just ``<ThemeToggle />`` with an optional
  * ``className``.
  *
+ * Icon and label semantics
+ * ------------------------
+ * The button shows the icon and label of the **next** theme — the one a
+ * click will switch to — not the current one.  This matches the ARIA
+ * ``aria-label`` convention ("Switch to dark mode" describes the action,
+ * not the state) and gives the sighted user the same information as the
+ * screen-reader user: the icon and the label point at the same thing.
+ *
+ * The alternative — showing the current theme's icon alongside the next
+ * theme's label — is a common mistake but produces an incoherent button:
+ * the user sees a sun and a tooltip that says "Switch to dark mode", and
+ * has to reason about whether the sun or the tooltip is authoritative.
+ * Aligning both on the action eliminates the ambiguity.
+ *
  * Hydration
  * ---------
  * ``next-themes`` populates ``theme`` on the client, after ``<ThemeProvider>``
@@ -38,7 +52,8 @@
  * -------------
  * * The button's ``aria-label`` describes the **action**, not the current
  *   state (``"Switch to dark mode"`` rather than ``"Light theme"``), which
- *   is what a screen reader user needs when activating it.
+ *   is what a screen reader user needs when activating it.  The icon is
+ *   the action's icon, matching the label.
  * * The icon is ``aria-hidden`` — it is decorative.
  * * ``title`` duplicates the ``aria-label`` so a hovering sighted user
  *   gets the same guidance.
@@ -67,10 +82,13 @@ import { cn } from "../lib/utils";
 /**
  * The three theme choices, in cycle order.
  *
- * Order matters: clicking from ``light`` goes to ``dark``, from ``dark``
- * to ``system``, from ``system`` back to ``light``.  ``light`` is the
- * first option so that the initial appearance (before ``next-themes``
- * resolves a stored preference) reads naturally as "start at light".
+ * The order is ``light → dark → system``, which is the order most users
+ * expect from a light-centric starting point.  Note that the **default**
+ * theme configured in ``providers.tsx`` is ``"system"``, not ``"light"``
+ * — so a first-time visitor sees the ``Monitor`` icon (the action leading
+ * to ``light``), not the ``Sun`` icon.  That is the correct behaviour: the
+ * cycle is a state machine, and the button always shows the next
+ * transition, regardless of where the machine starts.
  */
 const THEME_CYCLE = ["light", "dark", "system"] as const;
 
@@ -78,11 +96,14 @@ const THEME_CYCLE = ["light", "dark", "system"] as const;
 type ThemeChoice = (typeof THEME_CYCLE)[number];
 
 /**
- * Per-theme presentation metadata.
+ * Per-theme presentation metadata, keyed by the **current** theme.
  *
- * ``icon`` is the icon shown **for the current theme**; ``nextLabel`` is
- * the accessible label describing **what clicking will do** — i.e. the
- * theme that follows the current one in the cycle.
+ * Both ``icon`` and ``nextLabel`` describe the **action** of the button:
+ *
+ * * ``icon`` is the icon of the theme that a click will switch **to** —
+ *   matching the label, which is also about the action.
+ * * ``nextLabel`` is the accessible label describing what clicking will
+ *   do — i.e. the theme that follows the current one in the cycle.
  *
  * Written as a static table rather than an inline ``switch`` so that
  * adding a fourth theme is a two-line change (one entry here, one entry
@@ -92,9 +113,12 @@ const THEME_META: Record<
   ThemeChoice,
   { icon: LucideIcon; nextLabel: string }
 > = {
-  light: { icon: Sun, nextLabel: "Switch to dark mode" },
-  dark: { icon: Moon, nextLabel: "Switch to system mode" },
-  system: { icon: Monitor, nextLabel: "Switch to light mode" },
+  // Currently light → clicking goes to dark.  Show the moon.
+  light: { icon: Moon, nextLabel: "Switch to dark mode" },
+  // Currently dark → clicking goes to system.  Show the monitor.
+  dark: { icon: Monitor, nextLabel: "Switch to system mode" },
+  // Currently system → clicking goes to light.  Show the sun.
+  system: { icon: Sun, nextLabel: "Switch to light mode" },
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -181,6 +205,10 @@ export function ThemeToggle({ className }: ThemeToggleProps) {
   const currentIndex = THEME_CYCLE.indexOf(current);
   const next = THEME_CYCLE[(currentIndex + 1) % THEME_CYCLE.length];
 
+  // Both ``icon`` and ``nextLabel`` describe the **action** of the
+  // button.  Showing the current theme's icon next to the next theme's
+  // label (the pre-fix behaviour) is confusing: the user has to reason
+  // about whether the icon or the tooltip is authoritative.
   const { icon: Icon, nextLabel } = THEME_META[current];
 
   return (

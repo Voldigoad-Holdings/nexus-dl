@@ -53,9 +53,10 @@ What this module provides
   output and log lines; the "1.50 MiB" that a user actually reads.
 * **Filename validation** — :func:`validate_filename` /
   :func:`is_safe_filename`. Rejects traversal, reserved characters,
-  and leading/trailing whitespace before a filename reaches the
-  filesystem. The canonical implementation of the check that
-  ``page.py::_validate_filename`` currently performs inline.
+  Windows reserved names, and leading/trailing whitespace before a
+  filename reaches the filesystem. The canonical implementation of
+  the check that ``page.py::_validate_filename`` currently performs
+  inline.
 
 What this module deliberately does **not** do
 ---------------------------------------------
@@ -80,8 +81,9 @@ What this module deliberately does **not** do
   goes through :func:`tempfile.mkstemp` (which is portable) and
   :meth:`pathlib.Path.replace` (which is atomic on every filesystem
   that supports POSIX rename semantics — ext4, APFS, NTFS, everything
-  modern). The only OS branch in this module is in
-  :func:`chmod_owner_only`, where it is unavoidable.
+  modern). The only OS branches in this module are in
+  :func:`chmod_owner_only` (documented) and
+  :func:`_WINDOWS_RESERVED_NAMES` (documented).
 * **No async wrappers.** Atomic writes are fast (milliseconds for
   everything the pipeline writes) and the async call sites already run
   them in a worker thread via ``asyncio.to_thread`` when the payload
@@ -201,6 +203,27 @@ _INVALID_FILENAME_CHARS: Final[re.Pattern[str]] = re.compile(
     r'[<>:"/\\|?*\x00-\x1f]'
 )
 
+#: Windows reserved device names. Any filename whose *stem* (name before
+#: the first ``.``) matches one of these — case-insensitively — is
+#: rejected by :func:`validate_filename`. Windows interprets these as
+#: device names and refuses to create a regular file with one, even
+#: with an extension (``CON.txt`` is still the console device). Rejecting
+#: them on POSIX too keeps a file created on Linux readable after a copy
+#: to Windows, which is the pipeline's portability invariant.
+#:
+#: Reference: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+_WINDOWS_RESERVED_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        "clock$",
+        *(f"com{i}" for i in range(1, 10)),
+        *(f"lpt{i}" for i in range(1, 10)),
+    }
+)
+
 #: Temp-file prefix used by the write helpers. Matches the convention used
 #: by the packagers and the cache so a stray temp file is recognisable by
 #: name alone.
@@ -255,16 +278,38 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
     temp_path = Path(raw_temp)
 
     try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
+        # ``os.fdopen`` can raise ``MemoryError`` or similar before the
+        # ``with`` block establishes the buffered stream. If that
+        # happens, the raw ``fd`` from ``mkstemp`` would leak until the
+        # GC finalises it. ``try/except BaseException`` with an
+        # explicit ``os.close`` in the failure branch closes the fd
+        # unconditionally; the normal path lets the ``with`` block
+        # close it.
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            # Only close the raw fd if ``fdopen`` never took ownership.
+            # If ``fdopen`` succeeded, the ``with`` block already
+            # closed it and a second ``os.close`` would raise.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         temp_path.replace(path)
     except BaseException:
         # ``BaseException`` (not just ``Exception``) so the temp file is
         # removed even on ``CancelledError`` / ``KeyboardInterrupt``.
-        # The exception is re-raised unchanged.
-        temp_path.unlink(missing_ok=True)
+        # The cleanup itself is best-effort: a failure to remove the
+        # temp file (permissions, FS went read-only) must not replace
+        # the exception that caused us to be here.
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 
@@ -301,7 +346,10 @@ def atomic_replace_directory(tmpdir: Path, target: Path) -> Path | None:
     Two cases:
 
     * ``target`` does not exist — a single ``rename`` puts *tmpdir* in
-      place. Genuinely atomic.
+      place. Genuinely atomic in the absence of concurrent writers;
+      the check-then-rename window is a known TOCTOU that no caller in
+      the pipeline exercises (packaging directories are built in a
+      per-task temp directory and moved into place exactly once).
     * ``target`` exists — the existing directory is renamed to a unique
       backup name, *tmpdir* is renamed to *target*, and the backup is
       deleted. The window where *target* does not exist is bounded by
@@ -310,14 +358,16 @@ def atomic_replace_directory(tmpdir: Path, target: Path) -> Path | None:
       or the new content or ``ENOENT`` — never a partially-replaced
       directory.
 
-    Unlike :func:`atomic_write_bytes`, this helper **cannot** roll back
-    if the second rename fails and the restore also fails: the caller is
-    left in a state where *target* does not exist and a backup does.
-    That state is reported via the return value so the caller can log
-    it and instruct the operator. In practice this only happens on a
-    filesystem that has become read-only between the two renames —
-    exceptional enough that surviving it correctly is more valuable than
-    pretending it cannot occur.
+    **Rollback:** if the second rename fails, the helper attempts to
+    rename the backup back onto ``target`` (restoring the previous
+    state) and then re-raises the original error. If the restore itself
+    fails — the filesystem became read-only between the two renames,
+    an external process removed the backup, … — the helper raises a
+    combined ``OSError`` whose message names both the original rename
+    failure and the surviving backup path. The target is genuinely
+    gone in that case; the operator must recover from the backup.
+    This is the only state the helper cannot repair, and it is reported
+    loudly rather than being masked.
 
     Args:
         tmpdir: The freshly-built directory. Must exist and be complete
@@ -415,7 +465,14 @@ def fsync_directory(directory: Path) -> None:
         # Best-effort. See docstring.
         pass
     finally:
-        os.close(fd)
+        # ``os.close`` can raise ``EBADF`` / ``EIO`` on a filesystem
+        # that failed mid-operation. The close is cleanup, not part of
+        # the caller's contract — surfacing its failure would violate
+        # the "silently ignored" promise of this helper.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def chmod_owner_only(path: Path) -> bool:
@@ -618,15 +675,20 @@ def validate_filename(name: str) -> None:
 
     * is not ``"."`` or ``".."`` (reserved);
     * contains none of ``< > : " / \\ | ? *`` or a C0 control character;
+    * is not a Windows reserved device name (``CON``, ``PRN``, ``AUX``,
+      ``NUL``, ``COM1``-``COM9``, ``LPT1``-``LPT9``, ``CLOCK$``) — this
+      check is case-insensitive and applies to the *stem* of the name,
+      so ``"CON.txt"`` is rejected as well;
     * has no leading or trailing whitespace.
 
     The rejected character set is the union of the Windows-reserved set,
     the POSIX path separator, and C0 control characters. Rejecting the
     union on every platform (not just Windows) guarantees that a file
     written on one platform can be read on another without surprising
-    the user. This is the canonical implementation of the check that
-    :meth:`nexusdl.core.models.page.Page._validate_filename` currently
-    performs inline.
+    the user. The Windows reserved-name check goes further: a file
+    created on Linux with the name ``"con.txt"`` is readable there but
+    not on Windows, which is exactly the portability failure this
+    validation exists to prevent.
 
     The check is a **validation**, not a sanitization. Callers that
     need to transform arbitrary text into a safe filename use
@@ -650,6 +712,15 @@ def validate_filename(name: str) -> None:
     if _INVALID_FILENAME_CHARS.search(name):
         raise ValueError(
             f"filename contains invalid characters: {name!r}"
+        )
+    # Windows reserved names are checked on the *stem* — the part
+    # before the first dot — because Windows interprets ``CON.txt`` as
+    # the console device just like bare ``CON``. The check is
+    # case-insensitive because NTFS is case-insensitive.
+    stem = name.split(".", 1)[0].casefold()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        raise ValueError(
+            f"filename uses a Windows-reserved device name: {name!r}"
         )
     if name != name.strip():
         raise ValueError(

@@ -4,12 +4,11 @@ The factory is the single entry point every caller uses to obtain a
 packager. It hides three concerns behind one method:
 
 * **Which concrete class** implements a given format.
-* **Whether that implementation ships** in this release (:attr:`CBT` is
-  declared in the enum but has no packager yet).
+* **Whether that implementation ships** in this release.
 * **When to import it** — the packagers are imported **lazily**, on first
   use, so importing :mod:`nexusdl.core.packaging.factory` succeeds even in
-  a partial source tree (a contributor adding ``cbz_packager.py`` can run
-  the ``ZIP`` and ``FOLDER`` tests before the ``CBZ`` file exists).
+  a partial source tree (a contributor adding ``cbt_packager.py`` can run
+  the ``ZIP`` and ``FOLDER`` tests before the ``CBT`` file exists).
 
 Lazy imports also remove any risk of a circular import through the
 packagers' own ``from nexusdl.core.packaging.base import BasePackager``
@@ -18,7 +17,9 @@ packager module at :meth:`PackagerFactory.create` time.
 
 Registration model
 ------------------
-The default registry maps five formats to their concrete classes:
+The default registry maps every :class:`PackagingFormat` member to its
+concrete class — including ``CBT``, which ships as
+:mod:`nexusdl.core.packaging.cbt_packager`:
 
 ============== =============================== ===============================
 Format         Module                          Class
@@ -28,19 +29,21 @@ Format         Module                          Class
 ``CBZ``        ``cbz_packager``                ``CbzPackager``
 ``CB7``        ``cb7_packager``                ``Cb7Packager``
 ``PDF``        ``pdf_packager``                ``PdfPackager``
+``CBT``        ``cbt_packager``                ``CbtPackager``
 ============== =============================== ===============================
 
-:attr:`~nexusdl.core.models.enums.PackagingFormat.CBT` is deliberately
-**absent**: the ``cbt_packager`` module does not ship today. Calling
-:meth:`PackagerFactory.create` with ``CBT`` raises
-:class:`~nexusdl.core.exceptions.PackagingError` naming the format and the
-supported ones, rather than silently falling back to ``ZIP`` (wrong
-extension) or crashing on a ``KeyError``.
+The PROMPT MASTER's ``PackagingFormat`` enum is the source of truth for
+which formats exist; every member of that enum has a packager in this
+release. If a future format is added to the enum **before** its packager
+module ships, :meth:`PackagerFactory.create` will raise
+:class:`~nexusdl.core.exceptions.PackagingError` naming the format and
+the supported ones rather than falling back to ``ZIP`` (wrong extension)
+or crashing on a ``KeyError``.
 
 :meth:`PackagerFactory.register` lets a plugin, a test, or a future
-release add a packager for any format — including ``CBT`` — without
-modifying this file. The registered callable may be a class
-(``PackagerFactory.register(PackagingFormat.CBT, CbtPackager)``) or a
+release add or override a packager for any format without modifying this
+file. The registered callable may be a class
+(``PackagerFactory.register(PackagingFormat.CBZ, CbzPackager)``) or a
 zero-argument factory (``register(fmt, lambda: MyPackager(config))``); the
 factory only cares that calling it returns a
 :class:`~nexusdl.core.packaging.base.BasePackager`.
@@ -73,6 +76,7 @@ Dependency graph (no cycles)::
 from __future__ import annotations
 
 import importlib
+import inspect
 from collections.abc import Callable, Mapping
 from typing import Final
 
@@ -89,10 +93,10 @@ __all__ = ["PackagerFactory"]
 # --------------------------------------------------------------------------- #
 # Default registry                                                            #
 # --------------------------------------------------------------------------- #
-# Format → (submodule name, class name). Deliberately does not include CBT —
-# see the module docstring. Extending the shipped set means adding a line
-# here and a sibling module; changing a class name means editing here and
-# nowhere else.
+# Format → (submodule name, class name). Every member of the
+# ``PackagingFormat`` enum ships a packager in this release. Extending the
+# enum means adding a line here and a sibling module; changing a class name
+# means editing here and nowhere else.
 # --------------------------------------------------------------------------- #
 
 _DEFAULT_REGISTRY: Final[Mapping[PackagingFormat, tuple[str, str]]] = {
@@ -101,18 +105,12 @@ _DEFAULT_REGISTRY: Final[Mapping[PackagingFormat, tuple[str, str]]] = {
     PackagingFormat.CBZ: ("cbz_packager", "CbzPackager"),
     PackagingFormat.CB7: ("cb7_packager", "Cb7Packager"),
     PackagingFormat.PDF: ("pdf_packager", "PdfPackager"),
+    PackagingFormat.CBT: ("cbt_packager", "CbtPackager"),
 }
 
 #: Fully-qualified package prefix for lazy imports. Kept as a constant so a
 #: future move to a differently named package only changes one line.
 _PACKAGE_ROOT: Final[str] = "nexusdl.core.packaging"
-
-#: Formats declared in :class:`~nexusdl.core.models.enums.PackagingFormat`
-#: that have **no** shipped packager. Used to produce an accurate error
-#: message rather than a misleading "unknown format" one.
-_DECLARED_BUT_UNSHIPPED: Final[frozenset[PackagingFormat]] = frozenset(
-    {PackagingFormat.CBT}
-)
 
 
 _log = logger.bind(component="packaging.factory")
@@ -137,9 +135,9 @@ class PackagerFactory:
     def __init__(self) -> None:
         """Initialise a factory with the default registry.
 
-        The default registry covers every format that ships a packager in
-        this release (see :data:`_DEFAULT_REGISTRY`). Additional formats
-        can be added with :meth:`register`.
+        The default registry covers every :class:`PackagingFormat`
+        member (see :data:`_DEFAULT_REGISTRY`). Additional formats can
+        be added with :meth:`register`.
         """
         self._registry: dict[
             PackagingFormat, Callable[[], BasePackager]
@@ -199,6 +197,20 @@ class PackagerFactory:
         (or a cached singleton if the packager is genuinely stateful and
         safe to share — but the packagers that ship with NexusDL are not).
 
+        **Eager validation strategy.** A `factory` that is a
+        :class:`BasePackager` *subclass* is validated via
+        :func:`issubclass` — no instance is created, so a plugin whose
+        ``__init__`` acquires resources (opens a DB, launches a browser)
+        does not get its side effects triggered by registration alone.
+        A `factory` that is a plain callable is **not** invoked at
+        registration time — the validation defers to the first
+        :meth:`create`, where a failure is still surfaced as a
+        :class:`PackagingError` with the underlying exception chained.
+        This is the correct trade-off: the common case (a class) is
+        validated eagerly, while a plugin that genuinely needs its
+        ``__init__`` side effects is never invoked twice by an accidental
+        double registration.
+
         Args:
             fmt: The format the callable handles.
             factory: Zero-argument callable returning a
@@ -210,11 +222,8 @@ class PackagerFactory:
         Raises:
             PackagingError: If *fmt* is not a
                 :class:`PackagingFormat`, if *factory* is not callable, or
-                if calling *factory* once to validate it returns something
-                that is not a :class:`BasePackager`. The validation
-                instance is discarded — the callable is invoked again by
-                each :meth:`create`, so registration does not consume a
-                usable instance.
+                if *factory* is a class that does not subclass
+                :class:`BasePackager`.
         """
         if not isinstance(fmt, PackagingFormat):
             raise PackagingError(
@@ -227,21 +236,22 @@ class PackagerFactory:
                 f"second argument, got {type(factory).__name__}"
             )
 
-        # Validate eagerly so a broken registration fails at the call site,
-        # not at the first create(). The validation instance is discarded:
-        # ``create`` always calls ``factory`` fresh.
-        try:
-            probe = factory()
-        except Exception as exc:  # noqa: BLE001 — surface the real cause
+        # Eager validation for the common case: a class. ``issubclass``
+        # is cheap, side-effect-free, and catches a mistyped packager
+        # name at the call site rather than at the first ``create``.
+        if inspect.isclass(factory) and not issubclass(
+            factory, BasePackager
+        ):
             raise PackagingError(
-                f"registered factory for format {fmt.value!r} raised on "
-                f"validation: {type(exc).__name__}: {exc}"
-            ) from exc
-        if not isinstance(probe, BasePackager):
-            raise PackagingError(
-                f"registered factory for format {fmt.value!r} returned "
-                f"{type(probe).__name__}, not a BasePackager"
+                f"registered class for format {fmt.value!r} "
+                f"({factory.__name__}) does not subclass BasePackager"
             )
+        # A non-class callable (a `lambda`, a `functools.partial`, a
+        # custom factory) is accepted as-is. Its contract is enforced at
+        # ``create`` time (any exception from `factory()` is wrapped in
+        # `PackagingError`, and the returned object is type-checked).
+        # Invoking it here just to "validate" would trigger `__init__`
+        # side effects for no benefit — see the method docstring.
 
         self._registry[fmt] = factory
         _log.debug("Registered packager for format {!r}", fmt.value)
@@ -300,14 +310,11 @@ class PackagerFactory:
     def _missing_format_message(self, fmt: PackagingFormat) -> str:
         """Build the error message for a format with no registered packager.
 
-        Distinguishes three cases so the caller can tell what to do:
-
-        * Format declared in the enum but not shipped (``CBT``) — the fix
-          is a newer release or a plugin.
-        * Format the factory simply does not know about — likely a typo in
-          a caller's enum member, or a new member added upstream without a
-          matching packager.
-        * Anything else — falls through to the generic message.
+        The default registry ships every :class:`PackagingFormat`
+        member, so this path is only reached when a caller has
+        explicitly :meth:`unregister`-ed the format, or when a plugin
+        has introduced a new format elsewhere without registering a
+        packager here.
 
         Args:
             fmt: The format whose packager is missing.
@@ -316,16 +323,11 @@ class PackagerFactory:
             A human-readable error message.
         """
         supported = sorted(f.value for f in self._registry)
-        if fmt in _DECLARED_BUT_UNSHIPPED:
-            return (
-                f"format {fmt.value!r} is declared but no packager ships "
-                f"for it in this release; supported formats: {supported}. "
-                f"Register a custom packager with PackagerFactory.register "
-                f"if you need {fmt.value!r}."
-            )
         return (
             f"no packager registered for format {fmt.value!r}; "
-            f"supported formats: {supported}"
+            f"supported formats: {supported}. "
+            f"Register a custom packager with PackagerFactory.register "
+            f"if you need {fmt.value!r}."
         )
 
 

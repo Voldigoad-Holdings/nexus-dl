@@ -163,19 +163,38 @@ Pickling
 :meth:`__getstate__` / :meth:`__setstate__` so that **every** slot
 declared on any subclass survives a pickle round-trip. Without this
 override, the base :meth:`BaseException.__reduce__` would return a
-two-tuple ``(type, args)`` — the ``__dict__`` is empty on these
-exceptions because every field is a slot — and the ``context`` mapping
-and every subclass-specific field (``url``, ``status_code``,
-``timeout_seconds``, …) would be silently dropped. Exceptions cross
-process boundaries in :class:`concurrent.futures.ProcessPoolExecutor`
-and in message brokers that pickle payloads; silent data loss on the
-error path is exactly the bug that makes a production incident
-un-diagnosable.
+two-tuple ``(type, args)`` — every declared attribute would be dropped,
+because none of them are in ``args``. Exceptions cross process
+boundaries in :class:`concurrent.futures.ProcessPoolExecutor` and in
+message brokers that pickle payloads; silent data loss on the error path
+is exactly the bug that makes a production incident un-diagnosable.
+
+**A note on ``__dict__`` and ``__slots__``.** Every class in this module
+declares ``__slots__``, which is the standard way to avoid the per-instance
+``__dict__`` overhead. **However**, ``__slots__`` only *removes* the
+``__dict__`` when **every** class in the MRO defines ``__slots__``. The
+base :class:`BaseException` defines a ``__dict__`` — so instances of
+:class:`NexusDLError` still have a (normally empty) ``__dict__`` that
+costs one pointer per instance. The ``__slots__`` declarations are still
+worth keeping:
+
+* they document the attributes the exception exposes;
+* they make ``__getstate__``'s enumeration unambiguous — the loop over
+  ``__mro__`` ``__slots__`` picks up exactly the intended fields, and
+  any attribute the caller assigned dynamically (``exc.foo = 1``) lands
+  in ``__dict__`` and is *deliberately* not pickled, since it is not
+  part of the exception's contract.
+
+For a project that raises hundreds of exceptions per session, the
+residual ``__dict__`` overhead is negligible (one pointer per instance,
+~100 KB across 1000 live exceptions). There is no way to eliminate it
+without changing the base class to ``Exception.__slots__ = ()`` in a
+subclass — which is not what ``Exception`` does.
 
 The pickle representation deliberately does **not** try to preserve the
-``MappingProxyType`` wrapper — the wrapper is not picklable in some
-Python versions, and its immutability contract is re-established by
-:meth:`__setstate__` on the receiving side.
+``MappingProxyType`` wrapper — the wrapper is not picklable, and its
+immutability contract is re-established by :meth:`__setstate__` on the
+receiving side.
 
 Chaining
 --------
@@ -325,11 +344,10 @@ class NexusDLError(Exception):
         """Pickle the exception with every slot preserved.
 
         The default :meth:`BaseException.__reduce__` returns a two-tuple
-        ``(type, args)`` when ``self.__dict__`` is empty — which it is
-        here, because every field is a slot. That would silently drop
-        the ``context`` mapping and every subclass-specific field
-        (``url``, ``status_code``, ``timeout_seconds``, …) across a
-        pickle round-trip.
+        ``(type, args)`` — which drops the ``context`` mapping and every
+        subclass-specific field (``url``, ``status_code``,
+        ``timeout_seconds``, …) across a pickle round-trip, because none
+        of them are in ``args``.
 
         Returning a three-tuple ``(type, args, state)`` with a
         pickle-friendly plain-dict ``state`` forces the receiving side
@@ -347,6 +365,10 @@ class NexusDLError(Exception):
         (because the subclass's ``__init__`` skipped them) are omitted
         rather than written as ``None``, so a partially-initialised
         exception round-trips as a partially-initialised exception.
+
+        Attributes assigned dynamically by the caller (``exc.foo = 1``)
+        land in ``__dict__`` and are deliberately **not** pickled — they
+        are not part of the exception's contract.
         """
         state: dict[str, Any] = {
             "message": self.message,

@@ -50,7 +50,9 @@
  * ``date-fns/locale/fr``, ``date-fns/locale/de``, etc.  There is **no**
  * automatic mapping from the app's ``UILocale`` to a ``date-fns`` locale
  * object here — doing so would couple this universal module to the
- * frontend's settings store, which is exactly what we avoid.
+ * frontend's settings store, which is exactly what we avoid.  A future
+ * ``lib/i18n.ts`` module is expected to own that mapping; callers that
+ * want localized dates should go through it.
  */
 import { type ClassValue, clsx } from "clsx";
 import {
@@ -98,11 +100,18 @@ export function cn(...inputs: ClassValue[]): string {
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
- * Format a number with locale-aware grouping.
+ * Format a **non-negative finite** number with locale-aware grouping.
  *
  * Uses the browser's locale by default, so ``1234567`` renders as
  * ``"1,234,567"`` in en-US and ``"1 234 567"`` in fr-FR without the caller
  * having to know which one applies.
+ *
+ * Non-finite inputs (``NaN``, ``±Infinity``) collapse to ``"0"``.  A
+ * counter that reaches this function in a non-finite state is always a
+ * bug upstream — a division by zero, a missing backend field, or a
+ * corrupted state — and rendering the literal string ``"NaN"`` in a UI
+ * badge is strictly worse than rendering a neutral zero.  The mistake is
+ * still visible in the source data; the display just does not amplify it.
  *
  * Args:
  *   value: The number to format.
@@ -112,11 +121,15 @@ export function cn(...inputs: ClassValue[]): string {
  * @example
  * formatNumber(1234567)          // → "1,234,567"  (en-US)
  * formatNumber(1234567, "fr-FR") // → "1 234 567"
+ * formatNumber(NaN)              // → "0"
  */
 export function formatNumber(
   value: number,
   locale?: string,
 ): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
   return new Intl.NumberFormat(locale, {
     maximumFractionDigits: 0,
   }).format(value);
@@ -289,6 +302,15 @@ const INVALID_DATE_PLACEHOLDER = "—";
  * ``date-fns`` throws on invalid dates, so every public formatter funnels
  * its input through this helper and short-circuits to
  * :data:`INVALID_DATE_PLACEHOLDER` when it returns ``null``.
+ *
+ * **Date-only strings.**  ``new Date("2026-11-04")`` is parsed as
+ * midnight **UTC** per the ECMAScript spec, which renders as the previous
+ * day in any timezone west of UTC.  A date-only value on the wire almost
+ * always means "a calendar date in the user's timezone", not "midnight
+ * UTC" — so date-only strings are parsed as local midnight by splitting
+ * the components explicitly.  Full ISO datetimes (``"…T10:30:00Z"``,
+ * ``"…T10:30:00+02:00"``) keep the normal ``Date`` parsing so that the
+ * timezone information is preserved.
  */
 function toDate(value: string | Date): Date | null {
   if (value instanceof Date) {
@@ -296,6 +318,13 @@ function toDate(value: string | Date): Date | null {
   }
   if (typeof value !== "string" || value.length === 0) {
     return null;
+  }
+  // Date-only fast path: ``YYYY-MM-DD``.
+  const dateOnlyMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (dateOnlyMatch !== null) {
+    const [, y, m, d] = dateOnlyMatch;
+    const date = new Date(Number(y), Number(m) - 1, Number(d));
+    return Number.isNaN(date.getTime()) ? null : date;
   }
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
@@ -514,6 +543,14 @@ export function sleep(ms: number): Promise<void> {
  * the behaviour of ``lodash.groupBy`` and is the pragmatic choice for
  * ``Object.entries(groupBy(...))`` iteration in JSX.
  *
+ * **Prototype-safety.**  The accumulator is a ``null``-prototype object,
+ * so a key of ``"__proto__"`` (or ``"constructor"``, ``"toString"``, …)
+ * writes a regular own property instead of mutating the prototype chain.
+ * Without this, ``groupBy([{k: "__proto__"}], (x) => x.k)`` would return
+ * an object whose entries are not visible to ``Object.keys`` on the
+ * ``constructor`` case, and a caller-supplied key could shadow built-in
+ * methods.
+ *
  * @example
  * groupBy([1, 2, 3, 4], (n) => (n % 2 === 0 ? "even" : "odd"))
  * // → { odd: [1, 3], even: [2, 4] }
@@ -526,10 +563,18 @@ export function groupBy<T>(
   items: ReadonlyArray<T>,
   keyFn: (item: T) => string,
 ): Record<string, T[]> {
-  const groups: Record<string, T[]> = {};
+  // ``Object.create(null)`` gives us a plain dictionary with no prototype
+  // — a hostile or accidental key such as ``"__proto__"`` therefore
+  // writes an own property instead of invoking the setter on
+  // ``Object.prototype``.  ``Object.entries``, ``Object.keys`` and
+  // ``JSON.stringify`` all work the same on a null-prototype object.
+  const groups: Record<string, T[]> = Object.create(null) as Record<
+    string,
+    T[]
+  >;
   for (const item of items) {
     const key = keyFn(item);
-    const existing = groups[key];
+    const existing = groups[key] as T[] | undefined;
     if (existing === undefined) {
       groups[key] = [item];
     } else {
@@ -630,6 +675,13 @@ export function clampNumber(value: number, min: number, max: number): number {
  * the throw makes the failure loud rather than letting the switch fall
  * through silently.
  *
+ * ``String(value)`` is used in the error message rather than
+ * ``JSON.stringify(value)`` because the value is already ``never`` at the
+ * type level — it could be anything at runtime, including a circular
+ * object, a ``BigInt`` or a ``Symbol`` — and ``JSON.stringify`` throws on
+ * several of those.  The error message must never mask the underlying
+ * "unexpected value" failure with a secondary serialisation failure.
+ *
  * @example
  * function label(status: DownloadStatus): string {
  *   switch (status) {
@@ -645,7 +697,7 @@ export function clampNumber(value: number, min: number, max: number): number {
  */
 export function assertNever(value: never): never {
   throw new Error(
-    `Unexpected value in exhaustive switch: ${JSON.stringify(value)}`,
+    `Unexpected value in exhaustive switch: ${String(value)}`,
   );
 }
 

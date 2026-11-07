@@ -10,7 +10,8 @@ management (create, lookup, uniqueness) is delegated to an injected
 * **never** logs passwords, tokens, or hashes,
 * **never** distinguishes "user does not exist" from "wrong password"
   in a login failure — a uniform 401 with ``reason: INVALID_CREDENTIALS``
-  is the only signal a client gets.
+  is the only signal a client gets (and the response time is
+  deliberately normalized — see :func:`_authenticate`).
 
 Endpoints
 =========
@@ -49,15 +50,20 @@ may be sync or async (``inspect.isawaitable`` handles both).
 
 **Authentication** (login)::
 
-    # Shape 1 — dedicated authenticate method
+    # Shape 1 — dedicated authenticate method (may not exist)
     user = await services.auth_service.authenticate(identifier, password)
     user = await services.user_service.authenticate(identifier, password)
     # Returns a user object or ``None``. May raise ``InvalidCredentialsError``.
 
-    # Shape 2 — manual composition
+    # Shape 2 — manual composition (the production path today)
     user = await services.user_service.get_by_identifier(identifier)
     # or: get_by_username / find_by_username / get_by_email / find_by_email
     ok   = services.auth_service.verify_password(password, user.password_hash)
+
+    # In shape 2, if the user is not found, the router still performs a
+    # dummy bcrypt verification so that the two branches take the same
+    # time. This is the ONLY defense against account enumeration via
+    # timing — do not remove it.
 
 **Registration**::
 
@@ -91,9 +97,12 @@ fine-grained handling:
 * ``TOKEN_INVALID``       — malformed/wrong signature → force re-login
 * ``TOKEN_TYPE_MISMATCH`` — access used as refresh (or vice versa) → bug
 * ``SESSION_STALE``       — token valid but user was deleted → force re-login
+* ``TOKEN_OWNERSHIP_MISMATCH`` — logout tried to revoke another user's
+  refresh-token family → client bug or attack
 """
 from __future__ import annotations
 
+import hmac
 import inspect
 from collections.abc import Mapping
 from typing import Annotated, Any
@@ -135,6 +144,24 @@ _log = _logger.bind(component="web.routers.auth")
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
+#: Pre-computed bcrypt hash used as a "dummy" verification target when a
+#: user is not found on the manual login path. The purpose is to spend
+#: the same wall-clock time (roughly one bcrypt cost-12 verification,
+#: ~100 ms) as a real password check, so an attacker cannot distinguish
+#: "user does not exist" from "wrong password" by timing.
+#:
+#: The value is a fixed, well-known hash — it is not a secret. It must
+#: match the hasher's configured cost so the timing is comparable. If the
+#: deployment changes ``bcrypt__rounds`` (see ``PasswordHasher`` in
+#: ``security.py``), this constant should be regenerated with the same
+#: cost. A mismatch only degrades the protection; it never breaks
+#: authentication.
+_DUMMY_PASSWORD_HASH: str = (
+    # "$2b$12$" + 22 chars of salt + 31 chars of hash.
+    "$2b$12$C6UzMDM.H6dfI/f/IKcEeO3Y7Y8B2pV/2nJ7x3I5eYtQz9Vv8p1uq"
+)
+
+
 # ===========================================================================
 # Login
 # ===========================================================================
@@ -149,8 +176,10 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
         "and a refresh token.\n\n"
         "On failure the response is **uniformly 401** — the server does "
         "not distinguish 'user does not exist' from 'wrong password' to "
-        "prevent account enumeration. Check `error.details.reason` for "
-        "`INVALID_CREDENTIALS`.\n\n"
+        "prevent account enumeration. The **response time is also "
+        "normalized** (a dummy bcrypt verification runs when the user "
+        "does not exist) so the distinction is not observable via timing "
+        "either. Check `error.details.reason` for `INVALID_CREDENTIALS`.\n\n"
         "**Rate limited**: 5 attempts/min per IP (enforced by middleware)."
     ),
     responses={
@@ -296,14 +325,18 @@ async def refresh(
     description=(
         "End the current session or every session for the caller.\n\n"
         "* `refresh_token=<token>`: revoke **that token's family** — all "
-        "sessions derived from the same original login.\n"
+        "sessions derived from the same original login. **The token must "
+        "belong to the calling user** — a token from another user returns "
+        "`error.details.reason: TOKEN_OWNERSHIP_MISMATCH` (a 403), not a "
+        "silent revocation.\n"
         "* `all_sessions=true`: revoke **every active session** for the "
         "calling user. Requires the service layer to expose "
         "`revoke_all_for_user`; otherwise the response reports "
         "`revoked_all_sessions: false` so the client can warn.\n"
         "* Neither: no-op.\n\n"
-        "**Idempotent** — always returns 200, even if the token was "
-        "already revoked or never existed. Logout must never fail."
+        "**Idempotent** — always returns 200 for the normal paths, even "
+        "if the token was already revoked or never existed. Logout must "
+        "never fail the client."
     ),
 )
 async def logout(
@@ -342,22 +375,51 @@ async def logout(
             details=details,
         )
 
-    # 2) Family revocation via refresh_token — best-effort.
+    # 2) Family revocation via refresh_token — best-effort, with
+    #    ownership enforcement.
     if body.refresh_token:
-        family = await _extract_refresh_family(
+        family, owner = await _extract_refresh_family_and_owner(
             services, body.refresh_token
         )
-        if family is not None:
-            try:
-                await _revoke_family(services, family)
-                details["revoked_family"] = True
-            except Exception:
-                _log.debug(
-                    "family revoke raised during logout for user_id={}",
-                    user_id,
-                )
-                details["revoked_family"] = False
-        else:
+        if family is None:
+            # Malformed / expired / already revoked — nothing to do.
+            details["revoked_family"] = False
+            _log.info(
+                "logout user_id={} refresh_family_revoked=False (reason=unparsable)",
+                user_id,
+            )
+            return MessageResponse(
+                message="Refresh token family revoked.",
+                details=details,
+            )
+
+        # Ownership check: the caller can only revoke their own family.
+        if owner is not None and owner != user_id:
+            _log.warning(
+                "logout: refresh_token belongs to user {!r} but caller "
+                "is {!r} (attempted cross-user family revocation)",
+                owner,
+                user_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=error_response(
+                    ErrorCode.FORBIDDEN,
+                    "This refresh token does not belong to the caller.",
+                    details={
+                        "reason": "TOKEN_OWNERSHIP_MISMATCH",
+                    },
+                ).model_dump(),
+            )
+
+        try:
+            await _revoke_family(services, family)
+            details["revoked_family"] = True
+        except Exception:
+            _log.debug(
+                "family revoke raised during logout for user_id={}",
+                user_id,
+            )
             details["revoked_family"] = False
         _log.info(
             "logout user_id={} refresh_family_revoked={}",
@@ -439,6 +501,15 @@ async def _authenticate(
       underlying service).
     * Raises on infrastructure failure (DB error, no auth service
       configured) so the caller can return 500 rather than 401.
+
+    **Timing hardening (manual path).** When the user does not exist,
+    the router still performs a **dummy bcrypt verification** against
+    :data:`_DUMMY_PASSWORD_HASH`. Without this, an attacker can
+    distinguish "user does not exist" (fast: 5ms) from "user exists but
+    wrong password" (slow: ~100ms bcrypt) purely by measuring response
+    time — defeating the whole point of the uniform 401 response. The
+    dummy check throws away the result; it only exists to burn the same
+    CPU cost as a real verification.
     """
     for svc_attr in ("auth_service", "user_service"):
         svc = getattr(services, svc_attr, None)
@@ -456,32 +527,64 @@ async def _authenticate(
             return None
         # Any other exception propagates — infrastructure error.
 
-    # Manual fallback.
+    # Manual fallback (the production path with the current AuthService).
     auth_service = getattr(services, "auth_service", None)
     if auth_service is None:
         raise RuntimeError(
             "No authentication service is configured "
             "(need `services.auth_service` or `services.user_service`)."
         )
-    user = await _find_user_for_login(services, identifier)
-    if user is None:
-        return None
     verify = getattr(auth_service, "verify_password", None)
     if not callable(verify):
         raise RuntimeError(
             "auth_service.verify_password is not available."
         )
+
+    user = await _find_user_for_login(services, identifier)
+    if user is None:
+        # Timing hardening: spend the same wall-clock time as a real
+        # verification would. Never leak the result.
+        await _dummy_verify_password(verify, password)
+        return None
+
     hashed = _password_hash(user)
     if not hashed:
+        # User exists but has no password hash — cannot authenticate.
+        # Spend the dummy cost anyway so an attacker cannot distinguish
+        # this branch from "user exists with wrong password".
+        await _dummy_verify_password(verify, password)
         return None
+
     try:
         ok = verify(password, hashed)
         if inspect.isawaitable(ok):
             ok = await ok
     except Exception:
-        _log.exception("verify_password raised")
-        raise
+        # A malformed hash (corruption) raises inside ``verify_password``.
+        # Do not surface the raw exception — log it and treat as
+        # "credentials invalid" so the client gets the uniform 401.
+        # ``_log.exception`` is used (not ``_log.info``) because the
+        # server-side operator must see the corrupted hash.
+        _log.exception("verify_password raised on user_id={}", _user_id(user))
+        return None
     return user if ok else None
+
+
+async def _dummy_verify_password(
+    verify: Any, password: str
+) -> None:
+    """Run a bcrypt verification against a fixed dummy hash.
+
+    The result is discarded. Exceptions (a broken hasher, missing
+    bcrypt) are logged at ``debug`` and swallowed — this path is a
+    pure timing mitigation, it must never fail the request.
+    """
+    try:
+        result = verify(password, _DUMMY_PASSWORD_HASH)
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        _log.debug("dummy password verification raised (ignored)")
 
 
 async def _find_user_for_login(
@@ -567,8 +670,16 @@ async def _register_user(
         if inspect.isawaitable(result):
             result = await result
         if result is None:
+            # A `None` return is a contract violation — the router
+            # cannot issue tokens for a user it does not have. This
+            # must be a 500, not a silent success: otherwise the
+            # client believes registration worked while the store
+            # has no matching user record.
             raise RuntimeError(
-                f"user_service.{name} returned None (expected a user)."
+                f"user_service.{name} returned None (expected a user). "
+                "The user store may have accepted the request but the "
+                "created user was not returned — this is a "
+                "composition-root bug."
             )
         return result
 
@@ -660,28 +771,34 @@ async def _revoke_all_for_user(
     return False
 
 
-async def _extract_refresh_family(
+async def _extract_refresh_family_and_owner(
     services: ServicesDep, refresh_token: str
-) -> str | None:
-    """Return the family id of ``refresh_token``, or ``None``.
+) -> tuple[str | None, str | None]:
+    """Return ``(family_id, owner_user_id)`` for ``refresh_token``.
 
-    Best-effort: a malformed or already-revoked token yields ``None``
-    (logout must not fail on this).
+    Best-effort: a malformed or already-revoked token yields
+    ``(None, None)`` (logout must not fail on this). The owner is
+    read from the token's ``sub`` claim — used by :func:`logout` to
+    refuse cross-user family revocation.
     """
     auth_service = getattr(services, "auth_service", None)
     if auth_service is None:
-        return None
+        return None, None
     verify = getattr(auth_service, "verify_refresh", None)
     if not callable(verify):
-        return None
+        return None, None
     try:
         payload = verify(refresh_token)
         if inspect.isawaitable(payload):
             payload = await payload
     except Exception:
-        return None
+        return None, None
     family = getattr(payload, "family", None)
-    return str(family) if family else None
+    owner = getattr(payload, "sub", None)
+    return (
+        str(family) if family else None,
+        str(owner) if owner else None,
+    )
 
 
 async def _revoke_family(services: ServicesDep, family: str) -> None:
@@ -741,27 +858,54 @@ def _to_user_info(user: Any) -> UserInfo:
 
 
 def _to_token_response(pair: Any) -> TokenResponse:
-    """Convert a :class:`TokenPair` (or equivalent) into :class:`TokenResponse`."""
-    # ``TokenResponse.from_pair`` expects ``to_dict()`` — the security
-    # module's TokenPair provides it.
+    """Convert a :class:`TokenPair` (or equivalent) into :class:`TokenResponse`.
+
+    A **successful** login/refresh must return non-empty tokens. If the
+    projection produces an empty ``access_token`` or ``refresh_token``,
+    the client cannot authenticate and will retry indefinitely — so we
+    raise a 500 instead of returning a plausible-looking but useless
+    response. A previous version returned the empty pair silently,
+    causing infinite client re-login loops with no diagnostic.
+    """
+    response: TokenResponse
     try:
-        return TokenResponse.from_pair(pair)
+        response = TokenResponse.from_pair(pair)
     except Exception:
         # Fallback for hosts that return a plain dict or an object with
         # the same fields but no ``to_dict``.
         if isinstance(pair, Mapping):
-            return TokenResponse.model_validate(dict(pair))
-        return TokenResponse(
-            access_token=str(getattr(pair, "access_token", "")),
-            refresh_token=str(getattr(pair, "refresh_token", "")),
-            access_expires_in=int(
-                getattr(pair, "access_expires_in", 0) or 0
-            ),
-            refresh_expires_in=int(
-                getattr(pair, "refresh_expires_in", 0) or 0
-            ),
-            token_type=str(getattr(pair, "token_type", "Bearer") or "Bearer"),
+            response = TokenResponse.model_validate(dict(pair))
+        else:
+            response = TokenResponse(
+                access_token=str(getattr(pair, "access_token", "") or ""),
+                refresh_token=str(getattr(pair, "refresh_token", "") or ""),
+                access_expires_in=int(
+                    getattr(pair, "access_expires_in", 0) or 0
+                ),
+                refresh_expires_in=int(
+                    getattr(pair, "refresh_expires_in", 0) or 0
+                ),
+                token_type=str(
+                    getattr(pair, "token_type", "Bearer") or "Bearer"
+                ),
+            )
+
+    if not response.access_token or not response.refresh_token:
+        _log.error(
+            "token projection produced empty token(s); "
+            "access_present={} refresh_present={} pair_type={}",
+            bool(response.access_token),
+            bool(response.refresh_token),
+            type(pair).__name__,
         )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Failed to issue a valid token pair.",
+            ).model_dump(),
+        )
+    return response
 
 
 # ===========================================================================
@@ -777,6 +921,21 @@ def _translate_auth_error(
     Handles both the typed exceptions from :mod:`..security` (via
     ``isinstance``) and unknown service exceptions (via class-name
     matching). Never leaks a secret in the returned message.
+
+    Rules:
+
+    * Typed ``PasswordPolicyError`` → 422 with violations.
+    * Typed ``Token*Error`` → 401 with the corresponding reason.
+    * Typed ``InvalidCredentialsError`` → 401.
+    * Typed ``SecurityError`` (other) → 500.
+    * Class name contains ``PasswordPolicy`` → 422.
+    * Class name contains ``AlreadyExists`` / ``Duplicate`` / ``Taken``
+      → 409.
+    * ``ValueError`` whose message contains ``taken`` / ``duplicate`` /
+      ``already exists`` / ``already registered`` → 409.
+      **The substring ``exists`` alone is NOT sufficient** — it matches
+      ``"does not exist"`` and would produce a false-positive conflict.
+    * Anything else → 500.
     """
     # Typed exceptions from the security module.
     if isinstance(exc, PasswordPolicyError):
@@ -830,7 +989,19 @@ def _translate_auth_error(
     if "AlreadyExists" in name or "Duplicate" in name or "Taken" in name:
         return _conflict(msg)
     if isinstance(exc, ValueError):
-        if any(k in msg_lower for k in ("taken", "exists", "duplicate", "already")):
+        # Only match explicit "already registered" phrasing. Substring
+        # "exists" alone matches "does not exist" — a false positive
+        # that would turn a legitimate "user not found" bug into a
+        # misleading 409 Conflict.
+        if any(
+            k in msg_lower
+            for k in (
+                "taken",
+                "already exists",
+                "already registered",
+                "duplicate",
+            )
+        ):
             return _conflict(msg)
 
     _log.exception("auth error (context={})", context)
@@ -873,7 +1044,9 @@ def _internal_error(message: str) -> HTTPException:
 
 def _require_user_id(payload: CurrentUser) -> str:
     """Return ``payload.sub``, raising 401 if somehow absent."""
-    if not payload or not payload.sub:
+    # ``TokenPayload`` (Pydantic v2) is never falsy — only ``sub``
+    # presence is meaningful.
+    if not getattr(payload, "sub", None):
         raise _unauthorized(
             "Authenticated user is missing from the token.",
             reason="TOKEN_INVALID",
@@ -938,11 +1111,23 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
 # [ ] Login failures remain **uniform 401**. Do not add an
 #     "user not found" vs "wrong password" distinction anywhere in the
 #     response or in a log line that could be surfaced to the client.
+# [ ] The manual authentication path **must** run a dummy bcrypt
+#     verification when the user is not found. Removing it enables
+#     account enumeration via timing (measured in milliseconds between
+#     the fast "user not found" branch and the ~100ms "wrong password"
+#     branch).
 # [ ] Every refresh goes through ``auth_service.refresh`` (which performs
 #     replay detection). Do not compose ``verify_refresh`` + ``issue_pair``
 #     — that path bypasses family revocation and is a security regression.
-# [ ] Logout remains **idempotent**. Any new revocation path must not
-#     raise out of the handler; catch, log at debug, and return 200.
+# [ ] Logout remains **idempotent** for the no-op / already-revoked
+#     cases. Any new revocation path must not raise out of the handler
+#     for those cases; catch, log at debug, and return 200. The **only**
+#     exception is cross-user family revocation, which returns 403 — see
+#     the checklist item below.
+# [ ] The refresh-token family owner is checked against the caller's
+#     ``payload.sub``. Removing this check enables a targeted DoS where
+#     any authenticated user can log out any other user by presenting
+#     their refresh token.
 # [ ] ``/me`` never re-verifies the JWT (the ``CurrentUser`` dependency
 #     does). It only looks up the user by ``payload.sub``.
 # [ ] New custom reasons for ``details.reason`` are documented in the
@@ -951,3 +1136,6 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
 #     middleware. Bearer-only is safe by construction; cookies are not.
 # [ ] Rate limiting for new endpoints is documented as "middleware's
 #     job" — do not implement a token bucket inside the router.
+# [ ] ``_to_token_response`` never returns empty tokens. A successful
+#     login/refresh with an empty token is a 500, not a 200 with useless
+#     data.

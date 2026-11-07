@@ -37,8 +37,13 @@ Readiness discovers probes on the injected ``ServicesDep`` in this order:
 1. ``services.health_probes`` — an iterable of ``(name, callable)`` where
    ``callable()`` returns a :class:`SiteHealth`, a
    :class:`ComponentHealth`, a ``(SiteHealth, message)`` tuple, or a
-   ``dict``-ish object with those fields. May be an attribute or a
-   zero-arg method returning the iterable.
+   ``dict``-ish object with those fields. May be:
+     * an attribute holding such an iterable, **or**
+     * a **zero-arg method returning such an iterable**.
+   The router tries the method form first if the callable is a bound
+   method without positional-only required parameters — the return
+   value is inspected; if it is a valid probe collection, it is used;
+   otherwise the callable itself is treated as a single probe.
 2. ``services.health_check_components()`` (async, returns list of names)
    **and** ``services.health_check(name)`` (async, returns a status) —
    the split form.
@@ -52,11 +57,17 @@ never touches that logic.
 Failure isolation
 =================
 
-Every probe runs inside ``asyncio.wait_for(probe, timeout=…)``:
+Every probe runs inside its own isolated awaitable:
 
-* Timeout → :attr:`SiteHealth.DOWN` with a ``"Probe timed out"`` message.
-* Exception → :attr:`SiteHealth.DOWN` with the exception class name.
-* Otherwise → the value the probe returned, normalized defensively.
+* **Sync probes** execute in a thread via ``asyncio.to_thread`` so that
+  a blocking dependency (synchronous socket, disk I/O, DNS) cannot
+  stall the event loop — the timeout is enforced by the outer
+  ``wait_for`` and the probe coroutine is cancellable.
+* **Async probes** are wrapped in ``asyncio.wait_for``. A probe that
+  ignores cancellation is still bounded by the outer ``wait_for``.
+* **Timeout** → :attr:`SiteHealth.DOWN` with a ``"Probe timed out"``
+  message and the elapsed latency.
+* **Exception** → :attr:`SiteHealth.DOWN` with the exception class name.
 
 Probes run **in parallel** via ``asyncio.gather(return_exceptions=True)``,
 so the readiness endpoint cost is ``O(max_timeout)`` and not
@@ -82,11 +93,13 @@ import asyncio
 import inspect
 import os
 import sys
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from loguru import logger as _logger
 
 from nexusdl.core.models.enums import SiteHealth
@@ -222,8 +235,8 @@ async def readiness(
             description="Per-probe timeout in seconds.",
         ),
     ] = _DEFAULT_PROBE_TIMEOUT_S,
-) -> Response:
-    probes = _discover_probes(services)
+) -> JSONResponse:
+    probes = await _discover_probes(services)
 
     if component is not None:
         probes = [p for p in probes if p[0] == component]
@@ -250,9 +263,8 @@ async def readiness(
     )
 
     if ready:
-        return Response(
-            content=body.model_dump_json(),
-            media_type="application/json",
+        return JSONResponse(
+            content=body.model_dump(mode="json"),
             status_code=status.HTTP_200_OK,
         )
 
@@ -263,9 +275,8 @@ async def readiness(
         sum(1 for c in components if c.status == SiteHealth.DEGRADED),
     )
 
-    return Response(
-        content=body.model_dump_json(),
-        media_type="application/json",
+    return JSONResponse(
+        content=body.model_dump(mode="json"),
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     )
 
@@ -305,15 +316,21 @@ async def version(services: ServicesDep) -> VersionResponse:
 Probe = tuple[str, Callable[[], Any]]
 
 
-def _discover_probes(services: ServicesDep) -> list[Probe]:
+async def _discover_probes(services: ServicesDep) -> list[Probe]:
     """Return the probes declared by the host, in order.
 
     Discovery precedence:
 
-    1. ``services.health_probes`` — attribute or zero-arg method returning
-       an iterable of ``(name, callable)``.
+    1. ``services.health_probes`` — attribute, iterable, **or** method
+       returning an iterable of ``(name, callable)``. A method is
+       invoked (awaited if async); its return value is inspected to
+       decide whether it is a probe collection (iterable of
+       ``(name, callable)``) or a single probe result. If it is the
+       former, the collection is used; if the latter, the callable
+       itself is treated as a single probe.
     2. ``services.health_check_components`` + ``services.health_check`` —
-       split form (list of names + per-name checker).
+       split form (list of names + per-name checker). Both are awaited
+       when async.
     3. Nothing → empty list, meaning "no dependencies to check".
 
     Every accessor is called defensively; a broken probe declaration
@@ -323,28 +340,38 @@ def _discover_probes(services: ServicesDep) -> list[Probe]:
 
     # 1) ``health_probes`` attribute or method.
     raw = getattr(services, "health_probes", None)
-    if callable(raw) and not _looks_like_probe(raw):
-        try:
-            raw = raw()
-        except Exception:
-            _log.exception("services.health_probes() raised")
-            raw = None
-    if raw is not None:
-        try:
-            for item in _coerce_probe_iterable(raw):
-                name = str(item[0])
-                fn = item[1]
-                if callable(fn):
-                    probes.append((name, fn))
-                else:
-                    _log.warning(
-                        "Skipping probe {!r}: not callable", name
-                    )
-        except Exception:
-            _log.exception("Failed to iterate services.health_probes")
+    if callable(raw):
+        # Try the method form. If it takes required positional args,
+        # it is not a "list my probes" method — treat it as a probe.
+        if _callable_takes_no_required_args(raw):
+            try:
+                result = raw()
+                if inspect.isawaitable(result):
+                    result = await result
+                # If the return value looks like a probe collection,
+                # use it. Otherwise treat ``raw`` as a single probe.
+                coerced = _try_coerce_probes(result)
+                if coerced is not None:
+                    probes.extend(coerced)
+                    if probes:
+                        return probes
+                # Fall through: ``raw`` is a single probe.
+                probes.append(("health_probes", raw))
+            except Exception:
+                _log.exception("services.health_probes() raised")
+        else:
+            probes.append(("health_probes", raw))
 
     if probes:
         return probes
+
+    # Also handle the attribute form (not callable).
+    if raw is not None and not callable(raw):
+        coerced = _try_coerce_probes(raw)
+        if coerced is not None:
+            probes.extend(coerced)
+            if probes:
+                return probes
 
     # 2) Split form.
     names_source = getattr(services, "health_check_components", None)
@@ -353,13 +380,7 @@ def _discover_probes(services: ServicesDep) -> list[Probe]:
         try:
             names = names_source()
             if inspect.isawaitable(names):
-                # Cannot await here (sync helper). The caller should
-                # provide ``health_probes`` if async discovery is needed.
-                _log.debug(
-                    "health_check_components returned an awaitable; "
-                    "use `health_probes` for async discovery."
-                )
-                names = None
+                names = await names
             for name in names or ():
                 probes.append(
                     (str(name), _make_probe_callable(checker, str(name)))
@@ -370,6 +391,64 @@ def _discover_probes(services: ServicesDep) -> list[Probe]:
     return probes
 
 
+def _callable_takes_no_required_args(fn: Callable[..., Any]) -> bool:
+    """Return whether ``fn`` can be called with zero positional args."""
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        # Cannot introspect — assume it can be called.
+        return True
+    for p in sig.parameters.values():
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.KEYWORD_ONLY,
+        ) and p.default is inspect.Parameter.empty:
+            return False
+    return True
+
+
+def _try_coerce_probes(raw: Any) -> list[Probe] | None:
+    """Try to interpret ``raw`` as an iterable of ``(name, callable)`` pairs.
+
+    Returns the list of probes on success, ``None`` if the shape does not
+    look like a probe collection. Never raises.
+    """
+    if raw is None:
+        return None
+    # Mapping form ``{name: callable}``.
+    if isinstance(raw, Mapping):
+        items: Iterable[tuple[Any, Any]] = list(raw.items())
+    else:
+        try:
+            items = list(raw)
+        except TypeError:
+            return None
+
+    # Empty iterable — assume it is a valid (empty) probe list.
+    if not items:
+        return []
+
+    out: list[Probe] = []
+    for item in items:
+        if isinstance(item, tuple) and len(item) == 2:
+            name, fn = item
+            if callable(fn):
+                out.append((str(name), fn))
+                continue
+            return None
+        # Object form with `.name` / `.check` or `.probe`.
+        name = getattr(item, "name", None)
+        check = getattr(item, "check", None) or getattr(item, "probe", None)
+        if name and callable(check):
+            out.append((str(name), check))
+            continue
+        # Anything else — not a probe shape.
+        return None
+    return out
+
+
 def _make_probe_callable(
     checker: Callable[..., Any], name: str
 ) -> Callable[[], Any]:
@@ -377,43 +456,6 @@ def _make_probe_callable(
     def _probe() -> Any:
         return checker(name)
     return _probe
-
-
-def _coerce_probe_iterable(raw: Any) -> Iterable[tuple[Any, Any]]:
-    """Best-effort coercion of a probe collection to ``(name, callable)`` pairs."""
-    if raw is None:
-        return []
-    # Mapping form ``{name: callable}``.
-    if isinstance(raw, Mapping):
-        return list(raw.items())
-    # Sequence of tuples / objects with `.name` / `.check`.
-    out: list[tuple[Any, Any]] = []
-    for item in raw:
-        if isinstance(item, tuple) and len(item) == 2:
-            out.append(item)
-            continue
-        name = getattr(item, "name", None)
-        check = getattr(item, "check", None) or getattr(item, "probe", None)
-        if name and callable(check):
-            out.append((name, check))
-    return out
-
-
-def _looks_like_probe(fn: Callable[..., Any]) -> bool:
-    """Return whether ``fn`` looks like an individual probe (0 params)."""
-    try:
-        sig = inspect.signature(fn)
-    except (ValueError, TypeError):
-        return False
-    return not any(
-        p.kind in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.VAR_POSITIONAL,
-        )
-        and p.default is inspect.Parameter.empty
-        for p in sig.parameters.values()
-    )
 
 
 # ===========================================================================
@@ -437,16 +479,29 @@ async def _run_probes(
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Pair results with probes by length (do not rely on ``zip(strict=)``
+    # which is 3.10+ only; the project declares 3.12 as its main target
+    # but the code should work down to 3.9 if ``requires-python`` allows).
     out: list[ComponentHealth] = []
-    for (name, _fn), result in zip(probes, results, strict=True):
+    for idx, (name, _fn) in enumerate(probes):
+        result = results[idx] if idx < len(results) else None
         if isinstance(result, ComponentHealth):
             out.append(result)
         else:
             # ``gather`` isolated the exception; surface it as DOWN.
-            _log.exception(
-                "Health probe {!r} raised outside _run_single_probe", name,
-                exc_info=result if isinstance(result, BaseException) else None,
-            )
+            # Loguru does not take ``exc_info`` as a kwarg — use
+            # ``_log.opt(exception=...)`` instead.
+            if isinstance(result, BaseException):
+                _log.opt(exception=result).error(
+                    "Health probe {!r} raised outside _run_single_probe",
+                    name,
+                )
+            else:
+                _log.error(
+                    "Health probe {!r} returned unexpected result: {!r}",
+                    name,
+                    result,
+                )
             out.append(
                 ComponentHealth(
                     name=name,
@@ -460,36 +515,69 @@ async def _run_probes(
 async def _run_single_probe(
     name: str, fn: Callable[[], Any], *, timeout: float
 ) -> ComponentHealth:
-    """Execute one probe with timeout and normalization."""
-    started = _monotonic_ms()
-    try:
+    """Execute one probe with timeout and normalization.
+
+    Sync probes are dispatched via ``asyncio.to_thread`` so a blocking
+    dependency (socket connect, disk I/O, DNS) cannot stall the event
+    loop. Async probes are awaited in place. Both are wrapped in an
+    outer ``wait_for`` so the timeout is enforced end-to-end.
+    """
+    started = time.monotonic()
+
+    async def _invoke() -> Any:
         result = fn()
         if inspect.isawaitable(result):
-            result = await asyncio.wait_for(result, timeout=timeout)
-        latency = _monotonic_ms() - started
-        status_value, message = _normalize_health(result)
-        return ComponentHealth(
-            name=name,
-            status=status_value,
-            message=message,
-            latency_ms=latency,
-        )
+            # Async probe — return the coroutine so ``wait_for`` can
+            # cancel it if needed.
+            return await result
+        # Sync probe — offload to a thread so we do not block the loop
+        # and so ``wait_for`` can actually interrupt a blocked call.
+        # ``asyncio.to_thread`` is available on 3.9+.
+        return await asyncio.to_thread(_call_probe_safely, fn, result)
+
+    try:
+        value = await asyncio.wait_for(_invoke(), timeout=timeout)
     except asyncio.TimeoutError:
+        latency = (time.monotonic() - started) * 1000.0
         return ComponentHealth(
             name=name,
             status=SiteHealth.DOWN,
             message=f"Probe timed out after {timeout:.1f}s.",
-            latency_ms=timeout * 1000.0,
+            latency_ms=latency,
         )
+    except asyncio.CancelledError:
+        # Propagate cancellation — server shutdown path.
+        raise
     except Exception as exc:
-        latency = _monotonic_ms() - started
-        _log.exception("Health probe {!r} raised", name)
+        latency = (time.monotonic() - started) * 1000.0
+        _log.opt(exception=exc).error("Health probe {!r} raised", name)
         return ComponentHealth(
             name=name,
             status=SiteHealth.DOWN,
             message=f"Probe raised {type(exc).__name__}.",
             latency_ms=latency,
         )
+
+    latency = (time.monotonic() - started) * 1000.0
+    status_value, message = _normalize_health(value)
+    return ComponentHealth(
+        name=name,
+        status=status_value,
+        message=message,
+        latency_ms=latency,
+    )
+
+
+def _call_probe_safely(fn: Callable[[], Any], _unused: Any = None) -> Any:
+    """Call ``fn()`` in a worker thread.
+
+    The ``_unused`` parameter exists so ``asyncio.to_thread`` does not
+    accidentally re-invoke ``fn`` with the result of the original call
+    (the original ``fn()`` in ``_invoke`` is executed only for the
+    sync-vs-async branch decision, not for its return value — but
+    calling it twice would be a bug for probes with side effects).
+    """
+    return fn()
 
 
 # ===========================================================================
@@ -503,7 +591,8 @@ def _normalize_health(value: Any) -> tuple[SiteHealth, str | None]:
 
     * :class:`SiteHealth` member → itself, ``None`` message.
     * :class:`ComponentHealth` → its status and message.
-    * ``str`` → matched against :data:`_HEALTH_ALIASES`.
+    * ``str`` → matched against :data:`_HEALTH_ALIASES`; unrecognized
+      strings are surfaced in the message for debugging.
     * ``tuple(status, message)`` → both used.
     * ``dict`` with ``status`` / ``message`` keys.
     * ``None`` → :attr:`SiteHealth.UNKNOWN` with an explanatory message.
@@ -516,7 +605,13 @@ def _normalize_health(value: Any) -> tuple[SiteHealth, str | None]:
         return value, None
 
     if isinstance(value, str):
-        return _status_from_string(value), None
+        status_value = _status_from_string(value)
+        if status_value is SiteHealth.UNKNOWN and value.strip():
+            # Do not lose the raw string — an operator debugging a
+            # readiness failure needs to know what the probe actually
+            # returned to understand why it was not recognized.
+            return status_value, f"Unrecognized status string: {value!r}"
+        return status_value, None
 
     if isinstance(value, tuple) and len(value) >= 1:
         status_value = _status_from_any(value[0])
@@ -683,17 +778,6 @@ def _build_date(services: ServicesDep) -> datetime | None:
 
 
 # ===========================================================================
-# Misc
-# ===========================================================================
-
-def _monotonic_ms() -> float:
-    """Monotonic milliseconds — safe against NTP adjustments."""
-    import time  # noqa: PLC0415 — lazy, tiny
-
-    return time.monotonic() * 1000.0
-
-
-# ===========================================================================
 # Self-audit checklist
 # ===========================================================================
 #
@@ -708,7 +792,10 @@ def _monotonic_ms() -> float:
 #     documented in the module docstring.
 # [ ] New discovery mechanisms go through :func:`_discover_probes` and
 #     never raise from a broken host declaration.
-# [ ] Anything that could hang is wrapped by :func:`_run_single_probe`'s
-#     ``wait_for``. Never introduce a probe that bypasses it.
+# [ ] Sync probes **must** be dispatched via ``asyncio.to_thread`` in
+#     :func:`_run_single_probe` — do not call them directly on the
+#     event loop, or a blocking probe will hang the whole pod.
+# [ ] Anything that could hang is wrapped by an outer ``wait_for``.
+#     Never introduce a probe that bypasses it.
 # [ ] New version fields are added to ``VersionResponse`` first, then
 #     populated here — not the other way around.

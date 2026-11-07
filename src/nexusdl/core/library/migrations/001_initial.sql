@@ -31,6 +31,22 @@
 --     JSON array. SQLite's JSON1 extension is used at query time by
 --     ``core.library.search``; the columns themselves are plain TEXT so
 --     they can be inspected by any client.
+--
+-- IMPORTANT — upsert semantics
+-- ----------------------------
+-- ``add_manga`` MUST use
+--
+--     INSERT INTO mangas (...) VALUES (...)
+--     ON CONFLICT(id) DO UPDATE SET ...
+--
+-- and **not** ``INSERT OR REPLACE INTO mangas``. SQLite's REPLACE conflict
+-- resolution deletes the conflicting row and inserts a new one *without*
+-- firing ``mangas_ad`` (the DELETE trigger) — only ``mangas_ai`` runs. The
+-- result is an orphaned entry in the FTS index keyed on the old ``rowid``
+-- (which no longer exists in ``mangas``), causing the FTS table to grow
+-- without bound and search to scan dead entries. ``ON CONFLICT DO UPDATE``
+-- preserves the ``rowid`` and fires ``mangas_au``, which correctly removes
+-- the old FTS entry and inserts the new one. See ``database.py::add_manga``.
 -- =============================================================================
 
 
@@ -44,11 +60,18 @@
 -- ``password_hash`` stores the full self-describing output of the hash
 -- function (bcrypt string, includes algorithm prefix and cost); the
 -- database never inspects it.
+--
+-- ``email`` uses ``COLLATE NOCASE`` so that ``Test@x.com`` and ``test@x.com``
+-- are treated as the same address. This matches RFC 5321 §2.4's practical
+-- interpretation (the local-part is *technically* case-sensitive but every
+-- real provider treats it case-insensitively). ``COLLATE NOCASE`` only folds
+-- ASCII A–Z; internationalised addresses are normalised to punycode by the
+-- application before insertion, so this is sufficient in practice.
 -- -----------------------------------------------------------------------------
 CREATE TABLE users (
     id              TEXT    PRIMARY KEY
                     CHECK (length(id) = 36),
-    email           TEXT    NOT NULL UNIQUE,
+    email           TEXT    NOT NULL UNIQUE COLLATE NOCASE,
     password_hash   TEXT    NOT NULL,
     role            TEXT    NOT NULL DEFAULT 'USER'
                     CHECK (role IN ('GUEST', 'USER', 'ADMIN')),
@@ -58,8 +81,6 @@ CREATE TABLE users (
     updated_at      TEXT    NOT NULL,
     last_login_at   TEXT
 );
-
-CREATE INDEX idx_users_email ON users(email);
 
 
 -- -----------------------------------------------------------------------------
@@ -211,6 +232,14 @@ CREATE VIRTUAL TABLE mangas_fts USING fts5(
 -- This pattern is mandatory for external-content tables; a plain DELETE
 -- on mangas_fts would fail because the table has no writable content of
 -- its own.
+--
+-- ``mangas_au`` is scoped to ``UPDATE OF title, alt_titles, author,
+-- description`` rather than every UPDATE on ``mangas``. This avoids
+-- reindexing the FTS entry on unrelated column updates (``last_read_at``,
+-- ``page_count``, ``updated_at``), which happen on every read and every
+-- download. A whole-row UPDATE trigger would turn every progress update
+-- into a full FTS reindex — measurable on libraries with thousands of
+-- mangas.
 -- -----------------------------------------------------------------------------
 
 CREATE TRIGGER mangas_ai AFTER INSERT ON mangas BEGIN
@@ -238,7 +267,9 @@ CREATE TRIGGER mangas_ad AFTER DELETE ON mangas BEGIN
     );
 END;
 
-CREATE TRIGGER mangas_au AFTER UPDATE ON mangas BEGIN
+CREATE TRIGGER mangas_au
+AFTER UPDATE OF title, alt_titles, author, description ON mangas
+BEGIN
     INSERT INTO mangas_fts(
         mangas_fts, rowid, title, alt_titles, author, description
     )

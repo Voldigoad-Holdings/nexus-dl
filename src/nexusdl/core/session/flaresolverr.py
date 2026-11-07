@@ -205,8 +205,10 @@ class FlareSolverrResult:
             exposing content, or when the caller opted out via the
             ``return_only_cookies`` flag on :meth:`FlareSolverrClient.solve`.
         response_time_ms: Wall-clock time the solve took, in milliseconds,
-            as reported by FlareSolverr (``endTimestamp - startTimestamp``).
-            ``None`` when the timestamps were not returned.
+            as reported by FlareSolverr (``endTimestamp - startTimestamp``,
+            both of which are already in milliseconds — see
+            :meth:`FlareSolverrClient._build_result`). ``None`` when
+            the timestamps were not returned.
     """
 
     url: str
@@ -287,8 +289,12 @@ class FlareSolverrClient:
             construction site regardless of the setting.
 
     Raises:
-        ValueError: If ``endpoint`` is empty, ``timeout_ms`` is out of
-            range, or ``timeout_ms`` is not an ``int``.
+        TypeError: If ``timeout_ms`` is not an ``int`` (a bool, a
+            string, a float, …). A non-integer timeout would produce a
+            nonsensical ``maxTimeout`` in the JSON payload and confuse
+            FlareSolverr's own parser.
+        ValueError: If ``endpoint`` is empty or ``timeout_ms`` is out of
+            the supported range.
     """
 
     __slots__ = (
@@ -605,11 +611,13 @@ class FlareSolverrClient:
         """
         try:
             payload = response.json()
-        except (ValueError, json.JSONDecodeError) as exc:
-            # A proxy that intercepts ``/v1`` (or a FlareSolverr that
-            # serves an HTML error page instead of the JSON API) lands
-            # here. Echo a short prefix of the body so the operator
-            # can identify what actually responded.
+        except ValueError as exc:
+            # ``json.JSONDecodeError`` is a subclass of ``ValueError`` —
+            # catching the base is equivalent and simpler. A proxy that
+            # intercepts ``/v1`` (or a FlareSolverr that serves an HTML
+            # error page instead of the JSON API) lands here. Echo a
+            # short prefix of the body so the operator can identify what
+            # actually responded.
             body_preview = response.text[:120].replace("\n", " ")
             raise SessionError(
                 f"FlareSolverr returned invalid JSON for {url!r}: "
@@ -659,6 +667,12 @@ class FlareSolverrClient:
         Every field is defensive: FlareSolverr versions differ on what
         they populate, and a caller is expected to handle missing fields
         rather than crash on a partial payload.
+
+        ``startTimestamp`` and ``endTimestamp`` are Unix epoch values in
+        **milliseconds** (this is what FlareSolverr's internal ``Date``
+        produces and what every released version exposes). The
+        difference is therefore already in milliseconds and must not be
+        scaled further.
         """
         solved_url = solution.get("url")
         if not isinstance(solved_url, str) or not solved_url:
@@ -678,7 +692,9 @@ class FlareSolverrClient:
 
         response_time_ms: int | None = None
         if start_ts is not None and end_ts is not None and end_ts >= start_ts:
-            response_time_ms = (end_ts - start_ts) * 1000
+            # Both timestamps are already milliseconds since the epoch;
+            # the difference is the solve duration in milliseconds.
+            response_time_ms = end_ts - start_ts
 
         return FlareSolverrResult(
             url=solved_url,
@@ -782,7 +798,10 @@ def _is_textual_content_type(headers: Any) -> bool:
     if not content_type:
         return False
     lowered = content_type.lower().lstrip()
-    return any(lowered.startswith(prefix) for prefix in _TEXTUAL_CONTENT_TYPE_PREFIXES)
+    return any(
+        lowered.startswith(prefix)
+        for prefix in _TEXTUAL_CONTENT_TYPE_PREFIXES
+    )
 
 
 def _find_header(headers: Any, name: str) -> str | None:
@@ -835,15 +854,21 @@ def _extract_html(raw: Any, headers: Any) -> str | None:
     FlareSolverr returns the body in ``solution.response``:
 
     * For **textual** responses (HTML, XML, JSON), ``response`` is
-      already a decoded string.
-    * For **binary** responses, ``response`` is a base64-encoded blob
-      and the decoded format is named by ``Content-Type`` in
-      ``solution.headers``.
+      already a decoded string that **starts with** an HTML prologue
+      (``<!doctype``, ``<html``, ``<!--``, ``<?xml``).
+    * For **binary** responses, ``response`` is a base64-encoded string
+      (JSON cannot carry raw bytes), and the decoded format is named by
+      ``Content-Type`` in ``solution.headers``.
+    * For responses that solve the challenge without ever exposing
+      content, ``response`` is absent.
 
-    This function returns the HTML body in the textual case, decodes
-    the base64 blob in the binary case when the ``Content-Type`` names
-    a textual format, and returns ``None`` in every other case
-    (non-HTML responses, undecodable blobs, unparseable payloads).
+    The distinction between the two string cases is made by inspection:
+    a base64 blob does **not** start with an HTML prologue, while a
+    textual HTML response does. When both a plausible-HTML string and a
+    plausible-base64 string are possible, the string is treated as HTML
+    first — that is the common case, and a base64 blob served under a
+    ``text/html`` Content-Type would be rejected by the HTML prefix
+    check anyway.
 
     Args:
         raw: The ``solution.response`` value.
@@ -853,35 +878,27 @@ def _extract_html(raw: Any, headers: Any) -> str | None:
     Returns:
         The HTML string, or ``None`` if the response was not HTML.
     """
+    if raw is None:
+        return None
+
     if isinstance(raw, str):
-        # Textual payload. Confirm it plausibly looks like HTML (or XML)
-        # before handing it to the caller — FlareSolverr occasionally
-        # returns a JSON error body here when the target redirects the
-        # solver to an API endpoint.
+        # Two possibilities for a string:
+        # 1. Textual HTML body — starts with an HTML prologue.
+        # 2. Base64-encoded blob — starts with base64 characters
+        #    (``[A-Za-z0-9+/=]``), not with ``<``.
+        #
+        # Check the textual case first: a real HTML body does not parse
+        # as base64, and a base64 blob does not look like HTML, so the
+        # two cases are mutually exclusive. Trying HTML first is the
+        # cheaper test (``startswith``) and covers the common case.
         if _looks_like_html(raw):
             return raw
-        return None
-
-    if not isinstance(raw, (bytes, bytearray)):
-        # FlareSolverr may return a base64-encoded *string* for binary
-        # responses (not bytes). Try that path.
-        if not isinstance(raw, str):
+        if not raw:
             return None
-
-    # Binary / base64-encoded string. Only decode when the reported
-    # Content-Type is textual — decoding an image as HTML would waste
-    # memory and produce garbage for the caller.
-    if not _is_textual_content_type(headers):
-        return None
-
-    if isinstance(raw, (bytes, bytearray)):
-        # FlareSolverr returned raw bytes (rare, some proxy setups).
-        try:
-            decoded = bytes(raw).decode("utf-8", errors="replace")
-        except (ValueError, TypeError):
+        # Not HTML — try base64. The Content-Type filter is essential:
+        # decoding an image as text would produce garbage.
+        if not _is_textual_content_type(headers):
             return None
-    else:
-        # Base64-encoded string (the common binary case).
         try:
             decoded_bytes = base64.b64decode(raw, validate=False)
         except (binascii.Error, ValueError):
@@ -890,7 +907,26 @@ def _extract_html(raw: Any, headers: Any) -> str | None:
             decoded = decoded_bytes.decode("utf-8", errors="replace")
         except (ValueError, TypeError):
             return None
+        if _looks_like_html(decoded):
+            return decoded
+        return None
 
-    if _looks_like_html(decoded):
-        return decoded
+    if isinstance(raw, (bytes, bytearray)):
+        # Rare: some proxies hand FlareSolverr raw bytes. Check the same
+        # Content-Type filter as the base64 case, decode as UTF-8, and
+        # sanity-check the result.
+        if not _is_textual_content_type(headers):
+            return None
+        try:
+            decoded = bytes(raw).decode("utf-8", errors="replace")
+        except (ValueError, TypeError):
+            return None
+        if _looks_like_html(decoded):
+            return decoded
+        return None
+
+    # Any other type (dict, list, int, …) is not a body FlareSolverr
+    # could have produced. Return ``None`` rather than raise — a
+    # malformed field on an otherwise-solved response should not fail
+    # the caller.
     return None

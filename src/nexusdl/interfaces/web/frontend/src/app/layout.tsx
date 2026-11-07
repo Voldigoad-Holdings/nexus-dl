@@ -69,6 +69,12 @@ const APP_DESCRIPTION =
  *    then emits the correct build-time warning telling the operator to
  *    set the variable, rather than silently producing wrong absolute
  *    URLs.
+ *
+ * Only ``http:`` and ``https:`` URLs are accepted.  Anything else (a
+ * ``javascript:`` payload, an ``ftp:`` URL from a copy-paste accident, a
+ * ``file:`` path) is treated like a missing value so that the emitted
+ * ``metadataBase`` cannot be used to construct a hostile absolute URL in
+ * the ``<meta property="og:url">`` tags.
  */
 function getMetadataBase(): URL | undefined {
   const raw = process.env.NEXUSDL_PUBLIC_URL?.trim();
@@ -78,8 +84,9 @@ function getMetadataBase(): URL | undefined {
     }
     return undefined;
   }
+  let url: URL;
   try {
-    return new URL(raw);
+    url = new URL(raw);
   } catch {
     // A malformed URL in the environment is a deployment bug — treat it
     // like a missing one.  The build-time warning is the correct signal;
@@ -87,6 +94,13 @@ function getMetadataBase(): URL | undefined {
     // the failure mode the operator deserves.
     return undefined;
   }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    // Same treatment as a missing value: the operator typo'd the
+    // protocol, and a wrong absolute URL is worse than the build-time
+    // warning Next.js emits when ``metadataBase`` is unset.
+    return undefined;
+  }
+  return url;
 }
 
 /**
@@ -309,12 +323,17 @@ export const viewport: Viewport = {
  * reads the user's preference, but until then the static default matches
  * both the manifest's ``lang`` field and the language of every shipped
  * translation string.
+ *
+ * The return type is inferred rather than annotated with ``JSX.Element``
+ * (deprecated since ``@types/react@18.3``) or ``React.JSX.Element``
+ * (requires importing ``React`` just for the type).  Next.js's own
+ * layout types accept the inferred return.
  */
 export default function RootLayout({
   children,
 }: {
   children: ReactNode;
-}): JSX.Element {
+}) {
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={inter.className}>

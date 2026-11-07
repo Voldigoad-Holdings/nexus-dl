@@ -207,7 +207,19 @@ class ProxyConfig:
         if not raw:
             raise ValueError("proxy URL must be non-empty")
 
-        parsed = urlparse(raw)
+        try:
+            parsed = urlparse(raw)
+        except ValueError as exc:
+            # ``urlparse`` raises ValueError on a malformed IPv6 bracket
+            # (``http://[::1``). We must not call ``self.redacted`` here
+            # — it also calls ``urlparse`` and would raise the same way,
+            # masking the original error. Instead, surface the message
+            # without the URL (the raw URL is not safe to log — it may
+            # embed credentials).
+            raise ValueError(
+                f"proxy URL is malformed: {type(exc).__name__}: {exc}"
+            ) from exc
+
         if parsed.scheme not in _ALLOWED_SCHEMES:
             raise ValueError(
                 f"proxy URL scheme must be one of "
@@ -260,13 +272,29 @@ class ProxyConfig:
         A ``redacted`` used inside an error message must not itself
         raise — that would mask the original validation error under a
         secondary one. If ``urlparse`` cannot extract the port, the
-        redacted form drops it rather than propagating the failure.
+        redacted form drops it rather than propagating the failure. If
+        ``urlparse`` itself raises (malformed IPv6 bracket), the raw
+        URL is truncated to a bounded length and the password portion —
+        which cannot be parsed without a valid URL — is elided.
         """
         raw = self.url.get_secret_value()
-        parsed = urlparse(raw)
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            # Cannot parse at all — return a bounded, obviously-redacted
+            # placeholder. Never echo the raw URL: it may embed
+            # credentials we cannot identify (and cannot safely remove)
+            # without a successful parse.
+            return "<unparseable proxy url>"
         if parsed.password is None:
             return raw
-        masked = f"{parsed.username}:***@{parsed.hostname}"
+        # ``parsed.username`` may be None on a malformed URL — the
+        # password check above already proved ``password`` is set, but
+        # ``username`` may still be missing if the URL is
+        # ``http://:pass@host``. Format accordingly to avoid the literal
+        # string ``"None"`` leaking into logs.
+        username = parsed.username if parsed.username is not None else ""
+        masked = f"{username}:***@{parsed.hostname}"
         try:
             port = parsed.port
         except ValueError:
@@ -587,6 +615,12 @@ class ProxyManager:
                 forms are accepted so a session that stores only the URL
                 (e.g. because it caches ``httpx.AsyncClient`` per URL)
                 can still report success.
+
+        Raises:
+            TypeError: If ``proxy`` is neither a :class:`ProxyConfig`
+                nor a string. Passing ``None``, an integer, or any
+                other type is a caller bug, not a runtime condition
+                the manager can meaningfully handle.
         """
         url_key = _extract_url(proxy)
         async with self._lock:
@@ -632,6 +666,10 @@ class ProxyManager:
             error: Optional human-readable error description. Stored in
                 the proxy's health snapshot and echoed in the ``WARNING``
                 log line when the proxy is benched.
+
+        Raises:
+            TypeError: If ``proxy`` is neither a :class:`ProxyConfig`
+                nor a string. Same rationale as :meth:`mark_success`.
         """
         url_key = _extract_url(proxy)
         now = self._clock()
@@ -828,8 +866,8 @@ def load_proxy_configs(
     Raises:
         ValueError: If any configured URL is invalid — unsupported
             scheme, missing host, malformed port, half-configured
-            credentials. A broken proxy URL is a configuration error
-            worth surfacing at startup rather than at the first request.
+            credentials, or if ``urls`` is a bare string (which would
+            otherwise iterate character-by-character).
     """
     if config is None:
         return ()
@@ -841,6 +879,14 @@ def load_proxy_configs(
     if single is not None:
         raw_entries.append(single)
     multi = getattr(config, "urls", None) or ()
+    if isinstance(multi, str):
+        # A bare string in ``urls`` would be iterated character by
+        # character by ``raw_entries.extend`` — a silent and confusing
+        # bug. Reject it with a clear message instead.
+        raise ValueError(
+            "settings.proxy.urls must be a sequence of URLs, not a "
+            "bare string; use `url` for a single proxy"
+        )
     raw_entries.extend(multi)
 
     result: list[ProxyConfig] = []
@@ -867,10 +913,21 @@ def _extract_url(proxy: ProxyConfig | str) -> str:
 
     Returns:
         The plaintext proxy URL.
+
+    Raises:
+        TypeError: If *proxy* is neither a :class:`ProxyConfig` nor a
+            string. ``None``, an integer, or any other type is a caller
+            bug — the manager's keying scheme is defined over strings,
+            and a coerced ``str(x)`` could silently alias an unrelated
+            proxy URL.
     """
     if isinstance(proxy, ProxyConfig):
         return proxy.url.get_secret_value()
-    return proxy
+    if isinstance(proxy, str):
+        return proxy
+    raise TypeError(
+        f"proxy must be a ProxyConfig or a str, got {type(proxy).__name__}"
+    )
 
 
 def _redact_url(url: str) -> str:
@@ -885,11 +942,16 @@ def _redact_url(url: str) -> str:
     """
     try:
         parsed = urlparse(url)
-    except (ValueError, AttributeError):
-        return url[:64]
+    except (ValueError, AttributeError, TypeError):
+        # ``urlparse`` is lenient in practice, but ``None`` / non-str
+        # inputs reach the ``.hostname`` property below with an
+        # ``AttributeError``. Catch defensively so a bad log call
+        # cannot mask the real failure.
+        return str(url)[:64]
     if parsed.password is None:
-        return url
-    masked = f"{parsed.username}:***@{parsed.hostname}"
+        return str(url)
+    username = parsed.username if parsed.username is not None else ""
+    masked = f"{username}:***@{parsed.hostname}"
     try:
         port = parsed.port
     except ValueError:

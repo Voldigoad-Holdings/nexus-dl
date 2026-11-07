@@ -30,11 +30,18 @@ Design notes
   envelope. Use :func:`parse_client_message` to narrow, then
   ``isinstance(msg, ClientSubscribeMessage)`` etc.
 * **Wire shape is stable.** ``ServerMessage.model_validate(ws_msg.to_dict())``
-  round-trips losslessly; ``datetime`` serializes to ISO 8601 with ``Z``,
-  matching :meth:`WSMessage.to_dict`.
+  round-trips losslessly; ``datetime`` serializes to ISO 8601 with ``Z``
+  (when serialized via ``model_dump(mode="json")``), matching
+  :meth:`WSMessage.to_dict`. Typed subclasses like
+  :class:`ServerHelloMessage` are **optional narrowing**: the base
+  :class:`ServerMessage` accepts any dict-shaped ``data``, so a
+  ``ServerHelloMessage`` deserialized as ``ServerMessage`` keeps the
+  raw dict — clients that need the typed shape should re-validate
+  against the typed subclass.
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Union
 
@@ -43,7 +50,6 @@ from pydantic import (
     ConfigDict,
     Field,
     TypeAdapter,
-    field_validator,
 )
 
 # Reuse the exact enums / dataclasses defined by the framework-agnostic
@@ -101,6 +107,9 @@ __all__ = [
     "server_message_to_ws",
     "ws_to_server_error",
     "server_error_to_ws",
+    # Re-exports (eager — this module already imports Pydantic)
+    "WSCloseCode",
+    "WSEventType",
 ]
 
 
@@ -108,9 +117,11 @@ __all__ = [
 # Constants
 # ===========================================================================
 
-#: Hard cap on incoming WS message size, in bytes (defence in depth — the
-#: transport also enforces one, but we validate here so the error envelope
-#: is standardised).
+#: Hard cap on incoming WS message size, in bytes. Enforced by the
+#: receive loop in :mod:`..routers.ws` — this constant is the **authoritative
+#: limit** that the router reads, so that client and server agree on the
+#: cap. It is declared here because the schema module is the natural
+#: home for the protocol's wire-level constants.
 MAX_MESSAGE_SIZE: int = 64 * 1024  # 64 KiB
 
 #: Protocol message types handled natively by
@@ -152,8 +163,13 @@ class _EventEnvelope(_StrictEnvelope):
     clarity, but always accept extra keys inside ``data``.
     """
 
+    # ``default_factory`` (not a ``Field(default=...)`` plus a
+    # ``field_validator``) — Pydantic v2 only runs ``field_validator``
+    # on **provided** values, not on defaults. Using ``default=""`` with
+    # a validator that fills the gap would leave ``id=""`` on every
+    # instance constructed without an explicit id.
     id: str = Field(
-        default="",
+        default_factory=lambda: str(uuid.uuid4()),
         description="Unique message id (UUID4 as string). Generated on the "
                     "server; echoed for trace correlation.",
     )
@@ -161,14 +177,6 @@ class _EventEnvelope(_StrictEnvelope):
         default_factory=lambda: datetime.now(timezone.utc),
         description="Server-side emission timestamp (ISO 8601, UTC).",
     )
-
-    @field_validator("id")
-    @classmethod
-    def _default_id(cls, v: str) -> str:
-        if v:
-            return v
-        import uuid  # noqa: PLC0415
-        return str(uuid.uuid4())
 
 
 class _DomainData(_StrictEnvelope):
@@ -219,7 +227,7 @@ class ConnectionInfo(_DomainData):
 # Server → client envelopes
 # ===========================================================================
 
-class ServerMessage(_StrictEnvelope):
+class ServerMessage(_EventEnvelope):
     """Universal outbound envelope.
 
     Matches :meth:`WSMessage.to_dict` exactly. Used for events, ``hello``,
@@ -246,9 +254,7 @@ class ServerMessage(_StrictEnvelope):
         },
     )
 
-    id: str
     type: str = Field(description="Event type. Open vocabulary — plugins may extend.")
-    ts: datetime
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -290,9 +296,11 @@ class ServerErrorMessage(_StrictEnvelope):
         },
     )
 
-    id: str
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     type: Literal["error"] = "error"
-    ts: datetime
+    ts: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
     error: ServerErrorBody
 
 
@@ -523,17 +531,30 @@ class ClientUnsubscribeData(_DomainData):
 
 
 class ClientSubscribeMessage(ClientMessage):
-    """Client requests additional event subscriptions."""
+    """Client requests additional event subscriptions.
+
+    ``data`` is optional on the wire (an empty ``subscribe`` is valid —
+    it means "no change"), so a ``default_factory`` is provided to make
+    ``{"type": "subscribe"}`` (without ``data``) validate as
+    :class:`ClientSubscribeMessage` rather than falling back to the
+    universal :class:`ClientMessage`. Without the default, the fallback
+    would always win for the "no data" case, and the handler would
+    never see a typed message.
+    """
 
     type: Literal["subscribe"] = "subscribe"
-    data: ClientSubscribeData  # type: ignore[assignment]
+    data: ClientSubscribeData = Field(  # type: ignore[assignment]
+        default_factory=ClientSubscribeData
+    )
 
 
 class ClientUnsubscribeMessage(ClientMessage):
     """Client drops event subscriptions."""
 
     type: Literal["unsubscribe"] = "unsubscribe"
-    data: ClientUnsubscribeData  # type: ignore[assignment]
+    data: ClientUnsubscribeData = Field(  # type: ignore[assignment]
+        default_factory=ClientUnsubscribeData
+    )
 
 
 class ClientPingMessage(ClientMessage):
@@ -580,6 +601,11 @@ def parse_client_message(raw: Any) -> ClientMessageTyped:
     / :class:`ClientPingMessage` / :class:`ClientPongMessage` for known
     protocol types, or a plain :class:`ClientMessage` for anything else
     (including custom plugin message types).
+
+    Note: the transport-level size cap (:data:`MAX_MESSAGE_SIZE`) is
+    enforced by the WebSocket receive loop in :mod:`..routers.ws`
+    **before** this function is called. This function only validates the
+    message **shape**, not its size.
 
     Raises:
         pydantic.ValidationError: If ``raw`` is not a valid client message
@@ -630,24 +656,4 @@ def server_error_to_ws(schema: ServerErrorMessage) -> WSErrorPayload:
         request_id=body.request_id,
         id=schema.id,
         ts=schema.ts,
-    )
-
-
-# ===========================================================================
-# Re-exports for routers that want the enum/close-code symbols from one place
-# ===========================================================================
-
-def __getattr__(name: str) -> Any:
-    """Lazily expose WSCloseCode / WSEventType via this module too.
-
-    Convenience so routers can ``from ..schemas.ws import WSCloseCode``
-    without also importing ``..websocket``. Both names route to the same
-    objects — no duplication, no drift.
-    """
-    if name == "WSCloseCode":
-        return WSCloseCode
-    if name == "WSEventType":
-        return WSEventType
-    raise AttributeError(
-        f"module {__name__!r} has no attribute {name!r}"
     )

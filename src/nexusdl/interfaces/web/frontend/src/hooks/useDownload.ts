@@ -72,7 +72,7 @@
  * to bound the worst case if a runaway process floods the queue.  A real
  * session will almost always fetch a single page.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 
 import { api, NexusApiError } from "../lib/api";
@@ -108,6 +108,39 @@ const LIST_PAGE_SIZE = 100;
  * forever.
  */
 const LIST_MAX_PAGES = 20;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Module-level locks
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Synchronous lock for the list fetch.
+ *
+ * ``store.loading`` in the Zustand store is fine for *observing* fetch
+ * state in components, but it is not a reliable mutex: two concurrent
+ * ``fetchAll`` calls can read the same ``loading: false`` value before
+ * either of them sets it to ``true`` (Zustand's ``set`` notifies
+ * subscribers, but the read-then-write sequence is not atomic across
+ * async boundaries).  A module-level boolean closes that race: the check
+ * and the write happen in the same synchronous turn, so exactly one
+ * caller wins.
+ */
+let _fetchInFlight = false;
+
+/**
+ * Synchronous lock for :meth:`create`.
+ *
+ * ``isCreating`` state is set asynchronously by React, so a fast
+ * double-click on a "Download" button can fire two ``POST /download``
+ * requests before React re-renders the disabled state.  A ref-based
+ * boolean rejects the second click synchronously.
+ */
+// (Declared inside ``useDownload`` — see the ``createInFlightRef``
+// variable below.  A module-level lock would be shared across every
+// component that ever calls ``create``, which is not what we want: two
+// distinct users downloading two distinct series must not block each
+// other.  The bug being fixed here is per-component double-click, so the
+// lock belongs in the hook instance.)
 
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -203,10 +236,10 @@ export interface UseDownloadReturn {
   /**
    * Re-fetch the full task list.
    *
-   * Safe to call at any time: deduped against concurrent calls via the
-   * store's ``loading`` flag, and idempotent once the list is up to date.
-   * Resolves when the fetch completes (success or failure); the resulting
-   * error, if any, is set on :attr:`error`.
+   * Safe to call at any time: deduped against concurrent calls via a
+   * module-level synchronous lock, and idempotent once the list is up to
+   * date.  Resolves when the fetch completes (success or failure); the
+   * resulting error, if any, is set on :attr:`error`.
    */
   refetch: () => Promise<void>;
 
@@ -225,6 +258,10 @@ export interface UseDownloadReturn {
    * Errors are set on :attr:`createError` **and** re-thrown, so callers
    * can either react to the state or ``try``/``catch`` locally — both
    * patterns work without interfering.
+   *
+   * Concurrent invocations are rejected: a second call made while the
+   * first is still in flight returns the same promise as the first, so a
+   * fast double-click on a "Download" button does not create two tasks.
    */
   create: (request: CreateDownloadRequest) => Promise<string>;
 
@@ -321,6 +358,13 @@ export function useDownload(): UseDownloadReturn {
   const [isCreating, setIsCreating] = useState(false);
   const [createError, setCreateError] = useState<NexusApiError | null>(null);
 
+  // ``createInFlightRef`` is the synchronous double-click lock for
+  // ``create``.  It is per-hook-instance (unlike the module-level
+  // ``_fetchInFlight``) because two distinct users downloading two
+  // distinct series must not block each other — the lock only prevents
+  // *this* component from firing two POSTs.
+  const createInFlightRef = useRef(false);
+
   // -------------------------------------------------------------------
   // Store subscriptions — one per slice, each wrapped in useShallow
   // so that a change to one slice does not re-render subscribers of
@@ -343,15 +387,24 @@ export function useDownload(): UseDownloadReturn {
   // -------------------------------------------------------------------
   //
   // ``fetchAll`` is the single fetcher.  It dedupes against concurrent
-  // calls through the store's ``loading`` flag: if another component (or
-  // another instance of this hook) is already fetching, the second call
-  // returns immediately.  This is what makes ``useDownload`` safe to call
-  // from many components simultaneously.
+  // calls through the **module-level** ``_fetchInFlight`` flag, not the
+  // store's ``loading`` field.  The store field is not a reliable mutex:
+  // two concurrent calls can read ``loading: false`` before either writes
+  // ``true``, and both would fire.  The module-level boolean closes that
+  // race because it is read and written in the same synchronous turn.
   const fetchAll = useCallback(async (): Promise<void> => {
-    const store = useDownloadsStore.getState();
-    if (store.loading) {
+    if (_fetchInFlight) {
       return;
     }
+    _fetchInFlight = true;
+
+    const store = useDownloadsStore.getState();
+    // Reset the visible error immediately, before the network call.
+    // Without this, a stale error from a previous failed fetch would
+    // remain visible for the entire duration of the retry, which reads
+    // as "the retry did nothing".  ``setLoading`` also clears ``error``
+    // in the store, but the local ``fetchError`` state has to be reset
+    // separately.
     store.setLoading(true);
     store.setError(null);
     setFetchError(null);
@@ -366,6 +419,7 @@ export function useDownload(): UseDownloadReturn {
       throw apiError;
     } finally {
       useDownloadsStore.getState().setLoading(false);
+      _fetchInFlight = false;
     }
   }, []);
 
@@ -394,8 +448,24 @@ export function useDownload(): UseDownloadReturn {
   // -------------------------------------------------------------------
   const create = useCallback(
     async (request: CreateDownloadRequest): Promise<string> => {
+      // Per-instance synchronous lock.  A second call while the first is
+      // still in flight is rejected by re-throwing the same error the
+      // first call would produce — the caller's catch block runs, and no
+      // second POST is issued.  We do **not** silently return the first
+      // promise, because the second caller's ``request`` would be
+      // silently discarded, which is a worse surprise than an error.
+      if (createInFlightRef.current) {
+        const error = new NexusApiError(
+          "A download is already being created.",
+          { code: "INTERNAL_ERROR", status: 0 },
+        );
+        setCreateError(error);
+        throw error;
+      }
+      createInFlightRef.current = true;
       setIsCreating(true);
       setCreateError(null);
+
       try {
         const response = await api.createDownload(request);
 
@@ -418,6 +488,7 @@ export function useDownload(): UseDownloadReturn {
         setCreateError(apiError);
         throw apiError;
       } finally {
+        createInFlightRef.current = false;
         setIsCreating(false);
       }
     },

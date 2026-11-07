@@ -28,7 +28,9 @@ compresses — it is meaningfully faster than preset 9 and meaningfully
 smaller than STORED on mixed content, but it is not zero. This is
 documented explicitly because a user migrating from ``zip_packager``'s
 ``compression_level=0 → ZIP_STORED`` semantic might expect the same
-here. They should not.
+here. They should not. The packager emits a ``DEBUG`` log line when
+``compression_level=0`` is requested, so a caller that expected the ZIP
+semantic sees the difference in the logs.
 
 ``ComicInfo.xml`` placement
 ---------------------------
@@ -46,10 +48,11 @@ basename, preserving the worker's zero-padded convention.
 
 Filesystem safety and cancellation
 ----------------------------------
-The archive is built in a sibling temp file, ``fsync``'d, and
-:meth:`Path.replace`'d onto the final path. A crash, an exception, or an
-``asyncio.CancelledError`` leaves the previous ``output`` untouched and
-the temp file cleaned up.
+The archive is built in a sibling temp file, ``fsync``'d,
+:meth:`Path.replace`'d onto the final path, and the parent directory is
+``fsync``'d so the rename itself is durable. A crash, an exception, or
+an ``asyncio.CancelledError`` leaves the previous ``output`` untouched
+and the temp file cleaned up.
 
 **Memory use.** Unlike ZIP, ``py7zr`` writes each file to disk as it is
 added (it does not buffer the whole archive in memory), so peak memory
@@ -70,6 +73,7 @@ Dependency graph (no cycles)::
     core.models.enums       ├──► core.packaging.cb7_packager
     core.models.page        │
     core.packaging.base    ─┘
+    core.utils.filesystem  ─┘  (fsync_directory only)
     (ComicInfo lazily imported at package() call time via TYPE_CHECKING)
 """
 
@@ -91,6 +95,7 @@ from nexusdl.core.exceptions import PackagingError
 from nexusdl.core.models.enums import PackagingFormat
 from nexusdl.core.models.page import Page
 from nexusdl.core.packaging.base import BasePackager
+from nexusdl.core.utils.filesystem import fsync_directory
 
 if TYPE_CHECKING:
     from nexusdl.core.packaging.comic_info import ComicInfo
@@ -124,6 +129,20 @@ _TEMP_PREFIX_FMT: Final[str] = ".{name}.cb7-"
 
 
 _log = logger.bind(component="packaging.cb7")
+
+
+#: Exception types that ``py7zr`` may raise during an archive write. The
+#: concrete classes are stable across ``py7zr``'s recent versions, but the
+#: tuple keeps ``Bad7zFile`` and ``PasswordRequired`` explicit for the
+#: common cases and adds the base ``ArchiveError`` for the rest. If a
+#: future version drops ``ArchiveError``, the ``except OSError, ValueError,
+#: Exception`` branch will catch the remaining cases as a fallback
+#: (converted to ``PackagingError``) via the cleanup path.
+_PY7ZR_ERRORS: Final[tuple[type[BaseException], ...]] = (
+    py7zr.Bad7zFile,
+    py7zr.PasswordRequired,
+    py7zr.exceptions.ArchiveError,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +244,17 @@ class Cb7Packager(BasePackager):
 
         preset = _resolve_preset(compression_level)
 
+        # A caller migrating from ``zip_packager`` may expect
+        # ``compression_level=0`` to mean "no compression". It does not
+        # here — 7-Zip has no STORE-equivalent preset. Emit a DEBUG log
+        # so the fact is visible without breaking the call.
+        if compression_level == 0:
+            _log.debug(
+                "Cb7Packager: compression_level=0 selects LZMA2 preset 0 "
+                "(minimum effort), not STORED — 7-Zip has no "
+                "STORE-equivalent"
+            )
+
         sorted_pages = sorted(pages, key=lambda pair: pair[0].index)
         seen_names: set[str] = set()
         for page, src in sorted_pages:
@@ -254,13 +284,18 @@ class Cb7Packager(BasePackager):
             prefix=_TEMP_PREFIX_FMT.format(name=output.name),
             suffix=".tmp",
         )
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         temp_path = Path(raw_temp)
 
         filters = [{"id": lzma.FILTER_LZMA2, "preset": preset}]
 
         try:
-            with py7zr.SevenZipFile(temp_path, mode="w", filters=filters) as archive:
+            with py7zr.SevenZipFile(
+                temp_path, mode="w", filters=filters
+            ) as archive:
                 if comic_info_bytes is not None:
                     archive.writef(
                         io.BytesIO(comic_info_bytes),
@@ -269,19 +304,22 @@ class Cb7Packager(BasePackager):
                 for _page, src in sorted_pages:
                     archive.write(src, arcname=src.name)
             _fsync_and_replace(temp_path, output)
-        except (OSError, ValueError, py7zr.Bad7zFile, py7zr.PasswordRequired) as exc:
-            temp_path.unlink(missing_ok=True)
+        except (OSError, ValueError, *_PY7ZR_ERRORS) as exc:
+            # ``py7zr``'s own errors (``Bad7zFile``, ``PasswordRequired``,
+            # and the base ``ArchiveError`` that covers everything else)
+            # plus ``OSError`` from the filesystem and ``ValueError`` from
+            # path/encoding validation.
+            _safe_unlink(temp_path)
             raise PackagingError(
                 f"failed to create CB7 archive {output}: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
         except BaseException:
             # ``CancelledError`` and any other BaseException must clean up
-            # the temp file before propagating. ``py7zr``'s own exceptions
-            # (``Bad7zFile``, ``PasswordRequired``) are ``Exception``
-            # subclasses and are handled by the branch above; this branch
-            # exists for the general cleanup obligation.
-            temp_path.unlink(missing_ok=True)
+            # the temp file before propagating. Every ``py7zr`` exception
+            # is an ``Exception`` subclass and is handled by the branch
+            # above; this branch exists for the general cleanup obligation.
+            _safe_unlink(temp_path)
             raise
 
         _log.info(
@@ -301,9 +339,11 @@ class Cb7Packager(BasePackager):
 # implementations in ``cbz_packager.py`` (and, for fsync+replace,
 # ``zip_packager.py`` and ``pdf_packager.py``). The duplication is
 # deliberate and reviewed: the helpers are ~10 lines each, stable, and
-# extracting them now would mean reopening already-delivered files. When
-# ``core/utils/filesystem.py`` is written, all four packagers will import
-# from there and this duplication disappears in a single edit.
+# extracting them now would mean reopening already-delivered files. The
+# ``fsync_directory`` step is already imported from
+# ``core/utils/filesystem.fsync_directory``; the remaining local helper
+# will be replaced by ``core.utils.filesystem.atomic_write_bytes`` once
+# ``zip_packager.py`` / ``pdf_packager.py`` are next opened.
 # --------------------------------------------------------------------------- #
 
 
@@ -364,8 +404,39 @@ def _serialize_metadata(metadata: ComicInfo | None) -> bytes | None:
         ) from exc
 
 
+def _safe_unlink(path: Path) -> None:
+    """Best-effort removal of *path*, never raising.
+
+    Used in the exception-handling paths of :meth:`_package_sync` so that
+    a failure to clean up a temp file (permissions, FS read-only) does
+    not replace the exception the caller actually needs to see.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _fsync_and_replace(temp_path: Path, target: Path) -> None:
-    """``fsync`` *temp_path* then atomically replace *target*.
+    """``fsync`` *temp_path*, rename it onto *target*, fsync the parent.
+
+    Three steps, each of which is required for the atomic-write contract
+    documented in the module docstring:
+
+    1. **fsync the temp file's content.** Opens the file read-only —
+       ``fsync(2)`` accepts an fd in ``O_RDONLY`` and flushes all dirty
+       pages of the inode regardless of the open mode, so a write-capable
+       fd is not required (and would fail on some filesystems where the
+       file is read-only by design).
+    2. **Atomically rename the temp file onto the target.**
+       ``Path.replace`` is atomic on every filesystem that supports POSIX
+       rename semantics.
+    3. **fsync the parent directory.** Without this step a crash between
+       the rename and the next directory flush can revert the rename —
+       the target file disappears, the temp file reappears under its old
+       name. This is the "durability of the rename itself" guarantee
+       that :func:`nexusdl.core.utils.filesystem.fsync_directory` exists
+       to provide.
 
     Args:
         temp_path: The just-written temporary file.
@@ -374,6 +445,7 @@ def _fsync_and_replace(temp_path: Path, target: Path) -> None:
     Raises:
         OSError: If the fsync or the rename fails.
     """
-    with temp_path.open("rb+") as fh:
+    with temp_path.open("rb") as fh:
         os.fsync(fh.fileno())
     temp_path.replace(target)
+    fsync_directory(target.parent)

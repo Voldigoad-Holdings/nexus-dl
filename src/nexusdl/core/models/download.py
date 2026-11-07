@@ -50,6 +50,12 @@ site — a bug in orchestrating code that tries to reassign ``task.manga``
 after the task has been dispatched surfaces immediately, not via a
 subtle mismatch later.
 
+Note: because the dataclass is declared with ``slots=True``, the generated
+``__init__`` uses ``object.__setattr__`` for field assignment, so
+``DownloadTask.__setattr__`` is **not** invoked during construction. The
+``hasattr`` guard therefore only fires on post-construction assignments —
+which is exactly the behaviour we want.
+
 :class:`DownloadResult` is fully frozen. It has no mutable phase: it is
 created once, when a task terminates.
 
@@ -167,9 +173,9 @@ class DownloadTask:
     """
 
     id: UUID = field(default_factory=uuid4)
-    manga: Manga = field(default=None)  # type: ignore[assignment]
-    chapter: Chapter = field(default=None)  # type: ignore[assignment]
-    format: PackagingFormat = field(default=None)  # type: ignore[assignment]
+    manga: Manga = field()
+    chapter: Chapter = field()
+    format: PackagingFormat = field()
     priority: Priority = Priority.NORMAL
     status: DownloadStatus = DownloadStatus.PENDING
     created_at: datetime = field(
@@ -184,16 +190,16 @@ class DownloadTask:
         """Validate all required fields and the manga↔chapter invariant.
 
         Raises:
-            TypeError: If any required field is missing (dataclass ``field``
-                defaulted to ``None`` but never supplied by the caller), or
-                has the wrong Python type.
+            TypeError: If any required field is missing (``manga``,
+                ``chapter``, ``format`` are declared with ``field()``, so
+                Python itself raises ``TypeError: missing required
+                positional argument`` for a plain omission — the explicit
+                ``None`` check below catches the case where the caller
+                passes ``None`` on purpose), or has the wrong Python
+                type.
             ValueError: If :attr:`chapter` does not belong to
                 :attr:`manga`, or :attr:`created_at` is naive.
         """
-        # ``field(default=None)`` is used above so that ``manga`` /
-        # ``chapter`` / ``format`` remain required from the caller's point
-        # of view — passing ``None`` explicitly is caught here rather than
-        # silently accepted.
         if self.manga is None:
             raise TypeError("DownloadTask.manga is required")
         if self.chapter is None:
@@ -258,14 +264,11 @@ class DownloadTask:
     def __setattr__(self, name: str, value: Any) -> None:
         """Allow only :attr:`status` to be reassigned after construction.
 
-        During :meth:`__init__`, every slot is still unset when its value
-        is first assigned — ``hasattr`` returns ``False`` — so the
-        ``object.__setattr__`` fallback runs normally and the dataclass
-        constructor works untouched.
-
-        After :meth:`__post_init__` has run, every field is populated, so
-        ``hasattr`` returns ``True`` for anything other than :attr:`status`
-        and the guard raises :class:`AttributeError`.
+        Because the dataclass is declared with ``slots=True``, the
+        generated ``__init__`` uses ``object.__setattr__`` for field
+        assignment and therefore **does not** invoke this method during
+        construction. The guard only fires on post-construction
+        assignments, which is exactly what we want.
 
         :attr:`status` is special-cased **before** the ``hasattr`` check,
         so the queue can transition tasks in place. The value is
@@ -363,9 +366,9 @@ class DownloadResult:
     time — a ``DownloadResult`` that says ``DONE`` but has no output path
     cannot be built.
 
-    Both the worker (which produces ``DONE`` / ``FAILED``) and the
-    manager (which synthesises ``CANCELLED`` results during shutdown or
-    generator abort) create instances of this class. They pass through
+    Both the worker (which produces ``DONE`` / ``FAILED``) and the manager
+    (which synthesises ``CANCELLED`` results during shutdown or generator
+    abort) create instances of this class. They pass through
     :meth:`~nexusdl.plugins.loader.PluginLoader.dispatch_on_after_download`
     unchanged (a plugin that wants to transform the result returns a new
     :class:`DownloadResult`, not a mutated one).
@@ -386,7 +389,9 @@ class DownloadResult:
         bytes_downloaded: Total bytes downloaded across all pages, or
             ``0`` when no pages were fetched. Always ``>= 0``.
         duration_seconds: Wall-clock duration of the task, in seconds.
-            Always ``>= 0``.
+            Always ``>= 0``. Coerced to :class:`float` at construction
+            so the public attribute type matches the declared
+            ``float``.
         error: The exception that caused the failure. Required for
             :attr:`FAILED`; may be set or ``None`` for
             :attr:`CANCELLED`; must be ``None`` for :attr:`DONE`.
@@ -456,6 +461,15 @@ class DownloadResult:
             raise ValueError(
                 f"DownloadResult.duration_seconds must be >= 0, "
                 f"got {self.duration_seconds}"
+            )
+        # Coerce int → float so the attribute always matches the
+        # declared ``float`` type. A worker that computes
+        # ``elapsed = time.monotonic() - started_at`` already gets a
+        # float, but a test that passes ``duration_seconds=1`` gets an
+        # int; normalising here prevents the union from leaking.
+        if not isinstance(self.duration_seconds, float):
+            object.__setattr__(
+                self, "duration_seconds", float(self.duration_seconds)
             )
 
         if not isinstance(self.completed_at, datetime):
@@ -562,6 +576,16 @@ class DownloadResult:
         ``{"type": ..., "message": ...}`` object rather than an exception
         instance, so the output is directly consumable by a FastAPI handler
         and renders readably in a UI.
+
+        .. warning::
+
+           ``str(self.error)`` may contain internal details — absolute
+           paths, full URLs (including query-string tokens), server
+           versions, or database identifiers. Before returning this dict
+           to an unauthenticated client, sanitise or redact the
+           ``error.message`` field at the API layer. The model does not
+           sanitise it, because doing so would lose diagnostic
+           information that operators rely on in logs.
 
         Returns:
             A dict with ``task_id`` (string), ``status``, ``output_path``

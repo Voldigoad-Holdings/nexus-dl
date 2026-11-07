@@ -33,7 +33,10 @@
  *   the cover when ``content_rating`` is ``erotica`` or ``pornographic``.
  *   It uses :func:`isAdultRating` from ``types/manga.ts`` so the mapping
  *   from rating → badge is the single source of truth, shared with every
- *   other adult-content decision in the app.
+ *   other adult-content decision in the app.  The pill uses the
+ *   ``destructive`` design token — the same one used by ``AdultChip`` in
+ *   ``app/manga/[id]/page.tsx`` — so the "18+" badge has a single visual
+ *   identity across the app.
  * * **Title** — truncated to two lines with ``line-clamp-2``; a native
  *   ``title`` tooltip reveals the full title on hover, so a long series
  *   name is never lost.
@@ -51,6 +54,11 @@
  * * The title is rendered in an ``<h3>`` so that a screen reader's heading
  *   navigation sees the card list as a set of headings, matching the
  *   visual hierarchy of a card grid.
+ * * The adult "18+" badge is a ``role="img"`` with an ``aria-label`` so
+ *   that assistive technology announces "Adult content" rather than the
+ *   raw "18+" glyph.  Sighted users see "18+"; screen-reader users hear
+ *   the semantic label.  The ``title`` attribute duplicates the
+ *   ``aria-label`` so a hovering sighted user gets the same tooltip.
  * * The ``<Link>`` has a focus ring via ``focus-visible:ring-*``, driven by
  *   the project's ``--ring`` token so it works in both light and dark
  *   themes.
@@ -121,12 +129,21 @@ const COVER_SIZES =
  * Return ``true`` when *data* is a :type:`SearchResult`.
  *
  * ``SearchResult`` is the only one of the two input types that exposes a
- * ``manga_id`` field.  The guard is the single place the id normalisation
- * happens, so adding a third input type in the future touches only this
- * function.
+ * ``manga_id`` field.  The guard additionally checks that the field is a
+ * non-empty string, so a corrupted object that happens to carry an
+ * unrelated ``manga_id`` key with a wrong shape cannot be misclassified as
+ * a valid ``SearchResult`` — the fallback branch treats it as a ``Manga``,
+ * which is the more useful behaviour when ``id`` is also present.
+ *
+ * The guard is the single place the id normalisation happens, so adding a
+ * third input type in the future touches only this function.
  */
 function isSearchResult(data: Manga | SearchResult): data is SearchResult {
-  return "manga_id" in data;
+  return (
+    "manga_id" in data &&
+    typeof data.manga_id === "string" &&
+    data.manga_id.length > 0
+  );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -240,13 +257,20 @@ export function MangaCard({ data, className }: MangaCardProps) {
 
         {showAdultBadge && (
           <span
+            role="img"
+            aria-label="Adult content"
+            title="Adult content"
             className={cn(
               "absolute right-1.5 top-1.5 inline-flex items-center",
-              "rounded bg-red-600 px-1.5 py-0.5",
-              "text-[10px] font-bold uppercase leading-none text-white",
+              // ``destructive`` design token — the same one used by the
+              // standalone ``AdultChip`` in ``app/manga/[id]/page.tsx``,
+              // so the "18+" pill has a single visual identity across
+              // the app.
+              "rounded bg-destructive px-1.5 py-0.5",
+              "text-[10px] font-bold uppercase leading-none",
+              "text-destructive-foreground",
               "shadow",
             )}
-            title="Adult content"
           >
             18+
           </span>

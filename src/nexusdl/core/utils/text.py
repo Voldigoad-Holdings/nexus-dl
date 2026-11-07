@@ -90,7 +90,7 @@ import csv
 import html
 import io
 import re
-from typing import Any, Final, TypeVar
+from typing import Any, Final
 
 from slugify import slugify as _slugify
 
@@ -172,9 +172,12 @@ _HTML_TAG: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 
 #: Any run of Unicode whitespace. Used by :func:`normalize_whitespace`.
 #: ``\s`` in Python's ``re`` matches ``[ \t\n\r\f\v]`` plus any character
-#: whose Unicode category is ``Zs`` (space separator) — so a non-breaking
-#: space, an ideographic space, and a zero-width space (``\u200b`` — not
-#: whitespace in Unicode, so NOT matched) are all handled consistently.
+#: whose Unicode category is ``Zs`` (space separator), ``Zl`` (line
+#: separator), or ``Zp`` (paragraph separator) — so a non-breaking space,
+#: an ideographic space, a line separator, and a paragraph separator are
+#: all handled consistently. A zero-width space (``\u200b``) is *not*
+#: matched — it is category ``Cf`` (format), not whitespace, and removing
+#: it silently would change text where the character was meaningful.
 _WHITESPACE_RUN: Final[re.Pattern[str]] = re.compile(r"\s+")
 
 #: The first integer or decimal number in a string. Handles an optional
@@ -189,12 +192,6 @@ _NUMBER: Final[re.Pattern[str]] = re.compile(r"-?\d+(?:\.\d+)?")
 # --------------------------------------------------------------------------- #
 # Coercion                                                                    #
 # --------------------------------------------------------------------------- #
-
-#: Type variable used by :func:`coerce_str` so that the caller's intent
-#: (a specific string type, in principle) is preserved when no coercion
-#: is needed. Kept generic for future extension; today ``coerce_str``
-#: always returns a plain ``str``.
-_T = TypeVar("_T", bound=str)
 
 
 def coerce_str(value: Any, *, default: str = "") -> str:
@@ -640,11 +637,20 @@ def split_csv(text: str | None) -> tuple[str, ...]:
     matches the pipeline's expectation that a metadata list contains no
     empty elements.
 
-    The parser is intentionally single-line: the pipeline's inputs are
-    one-line CSV values, not multi-line documents. A trailing newline
-    in *text* is stripped; embedded newlines inside quoted values are
-    preserved as part of the value (which is correct CSV behaviour and
-    the only way to represent a multi-line value in the format).
+    **Single-line contract.** The parser is designed for single-line
+    CSV values (the ComicInfo use case). A quoted value spanning
+    multiple physical lines (``'"line1\\nline2", tail'``) is
+    **not** assembled into a single field: ``csv.reader`` would
+    iterate it line-by-line and the function only reads the first row.
+    The ``,`` inside the quoted multi-line value stays part of the
+    first physical line's content. If a caller has true multi-line CSV,
+    they must parse it themselves — the pipeline never produces it.
+
+    This is an explicit departure from a general-purpose
+    ``csv.reader(list(stream))`` call: that variant would assemble
+    multi-line quoted values but would also silently consume every
+    row of an accidentally-multi-line input, which is a much worse
+    failure mode for the actual use case.
 
     Args:
         text: The CSV string. ``None`` and the empty string both yield
@@ -656,8 +662,14 @@ def split_csv(text: str | None) -> tuple[str, ...]:
     """
     if not text:
         return ()
+    # Take only the first physical line — see the docstring's
+    # "Single-line contract" section for the rationale. ``splitlines``
+    # handles all Unicode line terminators (``\n``, ``\r\n``, ``\r``,
+    # ``\v``, ``\f``, and the Unicode separators ``\x1c``-``\x1e``,
+    # ``\x85``, ``\u2028``, ``\u2029``).
+    first_line = text.splitlines()[0] if text else ""
     try:
-        reader = csv.reader(io.StringIO(text.strip()))
+        reader = csv.reader(io.StringIO(first_line))
         row = next(reader, None)
     except csv.Error:
         # A malformed CSV fragment (unbalanced quotes) is more usefully

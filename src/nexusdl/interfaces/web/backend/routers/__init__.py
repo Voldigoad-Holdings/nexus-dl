@@ -61,10 +61,24 @@ point::
 the order they were mounted. That makes it trivially testable:
 
     assert "auth" in mount_all(fake_app)
+
+Mount order
+===========
+
+:data:`ROUTER_ORDER` is deterministic — it defines both the mount order
+in :func:`mount_all` and the ordering used by :func:`list_routers`.
+``health`` first (so the readiness probe is always registered even when
+other imports fail loudly in development) and ``ws`` last (so the
+WebSocket upgrade does not race with the ``/api/v1/*`` REST paths).
+
+**Do not reorder** without auditing route collisions. FastAPI matches
+in registration order; a router with a `/{id}` dynamic path placed
+before a router with a fixed path will shadow it.
 """
 from __future__ import annotations
 
 import importlib
+import sys
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -202,8 +216,15 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Expose the full public API to ``dir()``, IDEs and tab-completion."""
-    return sorted(list(globals().keys()) + list(__all__))
+    """Expose the full public API to ``dir()``, IDEs and tab-completion.
+
+    Merges the module's actual namespace with ``__all__`` so that
+    lazy-loaded routers appear even before their first access
+    (``dir()`` does **not** trigger ``__getattr__`` — PEP 562 — so
+    listing them here is the only way to make them discoverable
+    without eagerly importing them).
+    """
+    return sorted(set(globals()) | set(__all__))
 
 
 # ===========================================================================
@@ -227,8 +248,15 @@ def get_router(name: str) -> Any:
     Accepts both the canonical form (``"auth"``) and the suffixed form
     (``"auth_router"``) — autocompletion tends to suggest the latter.
 
+    The router is loaded through :func:`__getattr__` so that missing
+    optional dependencies produce the same ``ImportError`` with the
+    ``pip install 'nexusdl[web]'`` hint — not a raw
+    ``ModuleNotFoundError``.
+
     Raises:
         KeyError: If ``name`` is not a known router.
+        ImportError: If the router's module cannot be imported because
+            an optional dependency is missing.
     """
     canonical = name.removesuffix("_router")
     if canonical not in ROUTER_ORDER:
@@ -237,7 +265,11 @@ def get_router(name: str) -> Any:
             f"Unknown router {name!r}. Available routers: {available}"
         )
     attribute_name = f"{canonical}_router"
-    return getattr(__import__(__name__, fromlist=[attribute_name]), attribute_name)
+    # Route through ``__getattr__`` (via module-level ``getattr``) so
+    # that the ``ModuleNotFoundError`` → ``ImportError`` mapping is
+    # applied consistently and the router is cached in ``globals()``
+    # exactly like a normal attribute access would do.
+    return __getattr__(attribute_name)
 
 
 # ===========================================================================
@@ -273,10 +305,13 @@ def mount_all(
             be combined with ``skip``.
         skip: If provided, mount every router **except** these canonical
             names. Cannot be combined with ``only``.
-        skip_errors: When ``True``, a router that fails to import or
-            mount is logged and skipped instead of raised. Use only for
-            partial deployments (health-only images, etc.); the default
-            ``False`` surfaces composition-root bugs loudly.
+        skip_errors: When ``True``, a router whose **module fails to
+            import** (missing optional dependency) is logged and
+            skipped. Errors raised by :meth:`include_router` itself
+            (route collisions, invalid APIRouter shapes, dependency
+            misconfigurations) are **always** raised, regardless of this
+            flag — they are composition-root bugs that must not be
+            silently swallowed by a "best-effort" import fallback.
 
     Returns:
         The list of canonical names actually mounted, in mount order.
@@ -286,6 +321,8 @@ def mount_all(
         KeyError: If ``only`` or ``skip`` contains an unknown name.
         ImportError: If a router module fails to import and
             ``skip_errors`` is ``False``.
+        Exception: Any exception from ``include_router`` itself —
+            see the ``skip_errors`` note above.
     """
     if only is not None and skip is not None:
         raise ValueError("mount_all: 'only' and 'skip' are mutually exclusive")
@@ -296,18 +333,23 @@ def mount_all(
     for canonical in selected:
         attribute_name = f"{canonical}_router"
         try:
-            router_instance = getattr(
-                __import__(__name__, fromlist=[attribute_name]),
-                attribute_name,
-            )
-            app.include_router(router_instance)
-        except Exception:
+            router_instance = __getattr__(attribute_name)
+        except ImportError:
+            # Import failure = missing optional dep for THIS router's
+            # module. The only class of error that ``skip_errors`` is
+            # meant to swallow: a deployment that does not install
+            # ``python-jose`` should still be able to run the health
+            # router.
             if skip_errors:
-                # Lazy import failed (missing optional dep) or the router's
-                # module raised at import time. Log and continue.
                 _log_skip(canonical)
                 continue
             raise
+        # ``include_router`` runs outside the try — a route collision,
+        # a malformed APIRouter, or a dependency misconfiguration must
+        # surface even when ``skip_errors=True``. Swallowing it would
+        # produce an app that boots with a missing route and no
+        # diagnostic.
+        app.include_router(router_instance)
         mounted.append(canonical)
 
     return mounted
@@ -351,14 +393,29 @@ def _select_routers(
 
 
 def _log_skip(canonical: str) -> None:
-    """Log a skipped router at debug without importing ``loguru`` eagerly."""
-    # Import inline: this helper is only called on the ``skip_errors=True``
-    # path (partial deployments), so the import cost is not on the hot
-    # path of a normal ``mount_all``.
+    """Log a skipped router at warning without importing ``loguru`` eagerly.
+
+    If ``loguru`` is not available (should not happen in the web extra,
+    but a stripped-down deployment might omit it), fall back to
+    ``sys.stderr`` so the skip is **never** silent. A silent skip is a
+    debugging trap: the operator wonders why a route 404s with no trace
+    anywhere in the logs.
+    """
+    message = (
+        f"mount_all: skipped router {canonical!r} "
+        f"(its module could not be imported; skip_errors=True)"
+    )
     try:
         from loguru import logger as _logger  # noqa: PLC0415
-        _logger.bind(component="web.routers").warning(
-            "mount_all: skipped router {!r} (skip_errors=True)", canonical
-        )
+        _logger.bind(component="web.routers").warning(message)
+        return
     except Exception:
+        pass
+    # Fallback — never silently drop the diagnostic.
+    try:
+        sys.stderr.write(message + "\n")
+    except Exception:
+        # If even stderr is broken, there is nothing else we can do.
+        # The caller already chose ``skip_errors=True``, so swallowing
+        # here matches their intent — but only as a last resort.
         pass

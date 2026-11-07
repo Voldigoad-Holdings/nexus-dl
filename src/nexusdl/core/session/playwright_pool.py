@@ -51,6 +51,14 @@ nested ``try/finally`` structure inside :meth:`PlaywrightPool.acquire`:
    This runs even if the inner close raised ``CancelledError``, so a
    cancelled caller never permanently consumes a pool slot.
 
+**Ordering matters.** The context's ``close()`` runs **before** the
+context is removed from the tracked dict. If a caller's ``stop()`` runs
+concurrently, it can see the context still tracked and force-close it —
+even if the in-flight ``close()`` is blocked, hung, or cancelled. If the
+order were reversed (pop-then-close), a concurrent ``stop()`` would
+observe an untracked context that is not yet closed and leave it
+leaked until the whole browser is closed.
+
 The pool additionally tracks active contexts in a dict so that
 :meth:`stop` can force-close any contexts a caller forgot to release —
 this is defense-in-depth, not a normal path: the ``acquire()`` contract
@@ -619,6 +627,12 @@ class PlaywrightPool:
         # Wait for a semaphore slot. ``asyncio.wait_for`` is used instead
         # of ``asyncio.timeout`` so the timeout is unambiguously scoped
         # to the acquire, not to the caller's block.
+        #
+        # ``asyncio.TimeoutError`` is the canonical exception name across
+        # every supported Python version — ``except TimeoutError`` works
+        # on 3.11+ (they are the same class) but is clearer when spelled
+        # explicitly, and it removes any doubt about which builtin is
+        # being caught.
         if effective_timeout <= 0:
             if self._semaphore.locked():
                 async with self._lock:
@@ -635,7 +649,7 @@ class PlaywrightPool:
                 await asyncio.wait_for(
                     self._semaphore.acquire(), timeout=effective_timeout
                 )
-            except TimeoutError as exc:
+            except asyncio.TimeoutError as exc:
                 async with self._lock:
                     self._total_timeouts += 1
                     active_snapshot = len(self._active_contexts)
@@ -664,8 +678,14 @@ class PlaywrightPool:
             try:
                 yield context
             finally:
-                async with self._lock:
-                    self._active_contexts.pop(context_id, None)
+                # Close the context **before** removing it from the
+                # tracked dict. This ordering is what makes a concurrent
+                # ``stop()`` safe: while the close is in flight (or
+                # blocked, or cancelled), the context is still visible
+                # to ``stop()``'s force-close path. If we popped first,
+                # a ``stop()`` that ran between the pop and the close
+                # would see an untracked-but-not-yet-closed context and
+                # would leave it leaked until the whole browser closed.
                 try:
                     await context.close()
                 except asyncio.CancelledError:
@@ -676,6 +696,9 @@ class PlaywrightPool:
                         type(exc).__name__,
                         exc,
                     )
+                finally:
+                    async with self._lock:
+                        self._active_contexts.pop(context_id, None)
         finally:
             # Always release the semaphore — even if ``new_context`` or
             # ``context.close`` raised, a slot must return to the pool.

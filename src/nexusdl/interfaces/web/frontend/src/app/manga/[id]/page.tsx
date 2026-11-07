@@ -69,6 +69,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { memo, useCallback, useMemo, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 
 import {
   ChapterList,
@@ -232,6 +233,12 @@ export default function MangaDetailPage() {
 
   const handleDownload = useCallback(
     async (chapterIds: string[]): Promise<void> => {
+      // Guard: submitting an empty selection would create a task that
+      // downloads nothing.  The UI is supposed to prevent this, but a
+      // programming error would otherwise produce a silent no-op task.
+      if (chapterIds.length === 0) {
+        return;
+      }
       try {
         await createDownload({
           manga_id: mangaId,
@@ -241,10 +248,12 @@ export default function MangaDetailPage() {
           skip_existing: defaultSkipExisting,
         });
         setSelectedChapterIds([]);
-      } catch {
-        // The error is already exposed through ``createError`` — the page
-        // renders it inline.  Swallowing the rejection here prevents an
-        // unhandled promise rejection in the console.
+      } catch (err) {
+        // The user-facing error is exposed through ``createError`` and
+        // rendered inline.  Log at developer level so a swallowed
+        // rejection is still traceable in the console.
+        // eslint-disable-next-line no-console
+        console.error("Failed to create download task:", err);
       }
     },
     [
@@ -289,14 +298,31 @@ export default function MangaDetailPage() {
     [chaptersQuery.data],
   );
 
-  const chapterStatuses = useMemo<Map<string, ChapterStatus>>(() => {
-    // Read the full task state inside the memo.  We only get here when the
-    // signature has changed, so the derived statuses are guaranteed to
-    // reflect the tasks that produced the new signature.
-    const allTasks = Object.values(useDownloadsStore.getState().tasks);
-    const relevant = allTasks.filter((t) => t.manga_id === mangaId);
-    return deriveChapterStatuses(relevant, visibleChapterIds);
-  }, [statusSignature, mangaId, visibleChapterIds]);
+  // Subscribe to the relevant task objects *reactively* rather than
+  // reading via ``getState()``.  ``getState()`` bypasses Zustand's
+  // batching guarantees and could — in theory — observe a state that is
+  // newer than the ``statusSignature`` value captured in this render.
+  // Driving the memo off the same reactive slice eliminates that risk.
+  const relevantTasks = useDownloadsStore(
+    useShallow((s) => {
+      const result: DownloadTask[] = [];
+      for (const task of Object.values(s.tasks)) {
+        if (task.manga_id === mangaId) {
+          result.push(task);
+        }
+      }
+      return result;
+    }),
+  );
+
+  const chapterStatuses = useMemo<Map<string, ChapterStatus>>(
+    () => deriveChapterStatuses(relevantTasks, visibleChapterIds),
+    // ``statusSignature`` is listed **first** so it is visually obvious
+    // that it is the driver; ``relevantTasks`` and ``visibleChapterIds``
+    // are the actual inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [statusSignature, relevantTasks, visibleChapterIds],
+  );
 
   // -------------------------------------------------------------------
   // Render states
@@ -378,7 +404,7 @@ export default function MangaDetailPage() {
 
         {chaptersQuery.isLoading && <ChaptersSkeleton />}
 
-        {chaptersQuery.error !== null && chaptersQuery.isError && (
+        {chaptersQuery.isError && (
           <div
             role="alert"
             className={cn(
@@ -393,7 +419,7 @@ export default function MangaDetailPage() {
             <div className="flex-1">
               <p className="font-medium">Could not load chapters</p>
               <p className="mt-0.5 text-xs opacity-80">
-                {chaptersQuery.error.message}
+                {chaptersQuery.error?.message ?? "Unknown error"}
               </p>
             </div>
             <button
@@ -513,10 +539,17 @@ const MemoizedChapterList = memo(ChapterList);
  * first successful fetch).
  */
 function MangaHero({ manga }: { manga: Manga }) {
-  const metaParts: string[] = [];
-  if (manga.year !== null) metaParts.push(String(manga.year));
-  if (manga.language) metaParts.push(manga.language.toUpperCase());
-  metaParts.push(manga.site_name);
+  // Build the meta chips as an ordered list of (id, text) pairs so the
+  // React key is guaranteed unique even if two chips happen to share a
+  // display value (e.g. a series whose ``site_name`` is ``"EN"``).
+  const metaParts: { id: string; text: string }[] = [];
+  if (manga.year !== null) {
+    metaParts.push({ id: "year", text: String(manga.year) });
+  }
+  if (manga.language) {
+    metaParts.push({ id: "language", text: manga.language.toUpperCase() });
+  }
+  metaParts.push({ id: "site", text: manga.site_name });
 
   return (
     <section className="flex flex-col gap-6 md:flex-row md:items-start">
@@ -562,13 +595,13 @@ function MangaHero({ manga }: { manga: Manga }) {
           {manga.adult && <AdultChip />}
           {metaParts.map((part) => (
             <span
-              key={part}
+              key={part.id}
               className={cn(
                 "inline-flex items-center rounded-full px-2 py-0.5",
                 "bg-muted text-xs font-medium text-muted-foreground",
               )}
             >
-              {part}
+              {part.text}
             </span>
           ))}
         </div>
@@ -634,10 +667,14 @@ function MangaHero({ manga }: { manga: Manga }) {
 function MangaActiveDownloads({ mangaId }: { mangaId: string }) {
   const { pause, resume, cancel, remove } = useDownload();
 
+  // ``useShallow`` skips re-renders when the resulting array has the same
+  // elements in the same order — i.e. when a task for *another* manga
+  // changes progress, this section stays still.  Within this manga, every
+  // task object reference changes on a progress tick (Zustand replaces
+  // the map), so the section still re-renders — which is exactly what we
+  // want for live progress.
   const mangaTasks = useDownloadsStore(
-    // A plain selector — this section intentionally re-renders on every
-    // task update, because it displays live progress.
-    (s) => {
+    useShallow((s) => {
       const result: DownloadTask[] = [];
       for (const task of Object.values(s.tasks)) {
         if (task.manga_id === mangaId) {
@@ -651,11 +688,7 @@ function MangaActiveDownloads({ mangaId }: { mangaId: string }) {
         return a.created_at < b.created_at ? 1 : -1;
       });
       return result;
-    },
-    // Default equality is ``Object.is`` — the array is always new, so
-    // this would always re-render.  ``useShallow`` is intentionally not
-    // used here: the section genuinely needs to re-render on every task
-    // change (that is what makes progress animate).
+    }),
   );
 
   if (mangaTasks.length === 0) {
@@ -699,29 +732,42 @@ function MangaActiveDownloads({ mangaId }: { mangaId: string }) {
  * Small status chip shown in the hero.
  *
  * Neutral labels — "Ongoing", "Completed", etc. — styled to match the
- * palette used elsewhere (downloads page stat cards, chapter list).  An
- * unknown status renders as a muted chip with no icon.
+ * palette used elsewhere (downloads page stat cards, chapter list).  A
+ * value not covered by the union (e.g. a newer backend status string)
+ * falls back to an "Unknown" chip instead of silently rendering
+ * ``undefined``.
  */
 function StatusChip({ status }: { status: Manga["status"] }) {
-  const label = {
-    ongoing: "Ongoing",
-    completed: "Completed",
-    hiatus: "Hiatus",
-    cancelled: "Cancelled",
-    unknown: "Unknown",
-  }[status];
+  let label: string;
+  let classes: string;
 
-  const classes = {
-    ongoing:
-      "bg-blue-500/10 text-blue-700 ring-blue-600/20 dark:text-blue-400",
-    completed:
-      "bg-emerald-500/10 text-emerald-700 ring-emerald-600/20 dark:text-emerald-400",
-    hiatus:
-      "bg-amber-500/10 text-amber-700 ring-amber-600/20 dark:text-amber-400",
-    cancelled:
-      "bg-red-500/10 text-red-700 ring-red-600/20 dark:text-red-400",
-    unknown: "bg-muted text-muted-foreground ring-border",
-  }[status];
+  switch (status) {
+    case "ongoing":
+      label = "Ongoing";
+      classes =
+        "bg-blue-500/10 text-blue-700 ring-blue-600/20 dark:text-blue-400";
+      break;
+    case "completed":
+      label = "Completed";
+      classes =
+        "bg-emerald-500/10 text-emerald-700 ring-emerald-600/20 dark:text-emerald-400";
+      break;
+    case "hiatus":
+      label = "Hiatus";
+      classes =
+        "bg-amber-500/10 text-amber-700 ring-amber-600/20 dark:text-amber-400";
+      break;
+    case "cancelled":
+      label = "Cancelled";
+      classes =
+        "bg-red-500/10 text-red-700 ring-red-600/20 dark:text-red-400";
+      break;
+    case "unknown":
+    default:
+      label = "Unknown";
+      classes = "bg-muted text-muted-foreground ring-border";
+      break;
+  }
 
   return (
     <span
@@ -736,13 +782,19 @@ function StatusChip({ status }: { status: Manga["status"] }) {
   );
 }
 
-/** Adult-content chip.  Mirrors the badge on :class:`MangaCard`. */
+/**
+ * Adult-content chip.  Mirrors the badge on :class:`MangaCard`.
+ *
+ * Uses the ``destructive`` design token pair so the colours stay in sync
+ * with the theme (the previous ``bg-red-600 text-white`` bypassed the
+ * design system).
+ */
 function AdultChip() {
   return (
     <span
       className={cn(
         "inline-flex items-center rounded-full px-2 py-0.5",
-        "bg-red-600 text-xs font-bold uppercase text-white",
+        "bg-destructive text-xs font-bold uppercase text-destructive-foreground",
       )}
       title="Adult content"
     >
@@ -760,13 +812,17 @@ function AdultChip() {
  *
  * The footprint matches the hero + chapter list layout so the real content
  * replaces it without a layout shift.
+ *
+ * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
+ * is static, so an ``aria-live`` region would never announce anything
+ * (screen readers only announce *changes*).  ``aria-busy`` is the correct
+ * signal for "content is loading".
  */
 function PageSkeleton() {
   return (
     <div
       className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-4 sm:p-6 lg:p-8"
       aria-busy="true"
-      aria-live="polite"
     >
       <span className="sr-only">Loading manga…</span>
       <div className="h-5 w-32 animate-pulse rounded bg-muted" />
@@ -791,7 +847,6 @@ function ChaptersSkeleton() {
     <div
       className="flex flex-col gap-2 rounded-lg border bg-card p-3"
       aria-busy="true"
-      aria-live="polite"
     >
       <span className="sr-only">Loading chapters…</span>
       <div className="h-9 animate-pulse rounded bg-muted" />

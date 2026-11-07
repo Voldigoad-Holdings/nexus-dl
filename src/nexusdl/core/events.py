@@ -26,7 +26,11 @@ Semantics at a glance
   *event_type*. The wildcard ``"*"`` receives every event.
 * ``bus.unsubscribe(event_type, handler)`` removes **every** occurrence
   of *handler* from that list. Returns ``True`` if at least one was
-  removed.
+  removed. Occurrences are matched by **identity** (``is``), not by
+  equality — two distinct ``Mock`` objects that compare equal are
+  treated as distinct handlers. This is the safe default: a caller who
+  unsubscribes one specific handler must not accidentally remove
+  another that happens to compare equal.
 * A handler subscribed to both a specific event type and ``"*"`` is
   called **twice** per matching event: once from the exact list, once
   from the wildcard list. Subscribing to both is the caller's choice;
@@ -50,6 +54,11 @@ Semantics at a glance
   :class:`~nexusdl.plugins.loader.PluginLoader`.
 * ``asyncio.CancelledError`` is **never** caught — it propagates
   through :meth:`EventBus.publish` and cancels the caller as expected.
+  Every other ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``,
+  ``GeneratorExit``) also propagates; the isolation only covers
+  ``Exception`` subclasses, which is the right boundary — a
+  ``KeyboardInterrupt`` from a handler must stop the pipeline, not be
+  swallowed.
 
 **Concurrency**
 
@@ -429,6 +438,16 @@ class EventBus:
         multiple times (see :meth:`subscribe`), every occurrence is
         removed.
 
+        Occurrences are matched by **identity** (``is``), not equality
+        (``==``). This matters for test doubles (``unittest.mock.Mock``,
+        ``AsyncMock``) and for callables with a custom ``__eq__``: a
+        caller that wants to remove *this* handler must not accidentally
+        remove another handler that merely compares equal to it. Regular
+        functions and bound methods — the shapes the pipeline actually
+        uses — compare identically under ``is`` and ``==``, so this
+        stricter matching is invisible in practice and safer in the edge
+        cases.
+
         Note that a handler subscribed to **both** a specific event type
         and :data:`WILDCARD` must be unsubscribed from each separately
         — unsubscribing from one does not affect the other.
@@ -468,7 +487,10 @@ class EventBus:
             if not listeners:
                 return False
             before = len(listeners)
-            remaining = [h for h in listeners if h != handler]
+            # Identity-based removal: ``is not`` instead of ``!=`` so
+            # a mock or a custom ``__eq__`` cannot cause an unrelated
+            # handler to be removed.
+            remaining = [h for h in listeners if h is not handler]
             if len(remaining) == before:
                 return False
             if remaining:
@@ -494,7 +516,10 @@ class EventBus:
         Each handler runs inside its own try/except. An exception raised
         by a handler is logged at ``WARNING`` and swallowed; the next
         handler still runs. ``asyncio.CancelledError`` is never caught —
-        it propagates and cancels the caller.
+        it propagates and cancels the caller. Every other
+        ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``,
+        ``GeneratorExit``) also propagates, because the isolation only
+        covers ``Exception`` subclasses.
 
         The handler lists are snapshotted under the lock **before**
         delivery begins, so a handler subscribed during this call does
@@ -521,6 +546,11 @@ class EventBus:
             asyncio.CancelledError: Propagated from any handler (or from
                 the caller itself, in which case delivery stops at the
                 point of cancellation).
+            BaseException: Any non-``Exception`` raised by a handler
+                (``KeyboardInterrupt``, ``SystemExit``,
+                ``GeneratorExit``) propagates. This is intentional: a
+                Ctrl+C from a handler must stop the pipeline, not be
+                swallowed.
         """
         if not isinstance(event, Event):
             raise TypeError(
@@ -593,7 +623,9 @@ class EventBus:
         ``except Exception`` clause deliberately excludes
         :class:`asyncio.CancelledError` (which is a
         :class:`BaseException` subclass, not an :class:`Exception`) so
-        cancellation propagates untouched.
+        cancellation propagates untouched. Every other ``BaseException``
+        (``KeyboardInterrupt``, ``SystemExit``) also propagates for the
+        same reason — a Ctrl+C must not be swallowed.
 
         Args:
             handler: The handler to invoke.

@@ -49,6 +49,19 @@ the previous ``output`` untouched and cleans up the temp file. When
 cancellation arrives after the rename completes, the output file is
 already complete and valid; the caller only loses the return value.
 
+**Why this packager does not use ``utils.filesystem.atomic_write_bytes``.**
+The shared atomic-write helper in
+:mod:`nexusdl.core.utils.filesystem` serialises a ``bytes`` payload to
+disk; it cannot express "write a ZIP archive entry by entry with the
+``zipfile`` module". The pattern (temp file in the same directory,
+fsync, ``Path.replace``, fsync the parent directory) is the same, but
+the writing step is streaming and has to be done inline. The
+duplication is therefore **intentional** and small — one helper
+(:func:`_fsync_and_replace`) that does the fsync-plus-rename contract.
+The rest of the atomic-write surface is provided by ``utils.filesystem``
+and used by the other packagers where a ``bytes`` payload is the
+natural shape.
+
 Async model
 -----------
 :meth:`ZipPackager.package` is a coroutine; the actual zipping runs in a
@@ -62,6 +75,8 @@ Dependency graph (no cycles)::
     core.models.enums       ├──► core.packaging.zip_packager
     core.models.page        │
     core.packaging.base    ─┘
+    core.utils.filesystem  ─┘  (fsync_directory only)
+
 """
 
 from __future__ import annotations
@@ -80,6 +95,7 @@ from nexusdl.core.exceptions import PackagingError
 from nexusdl.core.models.enums import PackagingFormat
 from nexusdl.core.models.page import Page
 from nexusdl.core.packaging.base import BasePackager
+from nexusdl.core.utils.filesystem import fsync_directory
 
 if TYPE_CHECKING:
     from nexusdl.core.packaging.comic_info import ComicInfo
@@ -242,7 +258,14 @@ class ZipPackager(BasePackager):
             prefix=_TEMP_PREFIX_FMT.format(name=output.name),
             suffix=".tmp",
         )
-        os.close(fd)
+        # ``os.close`` can fail on a corrupted fd but there is nothing
+        # useful we can do — the temp file exists and its path is what
+        # matters. Guard the close so a pathological fd state does not
+        # prevent cleanup of the (already-created) temp file.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         temp_path = Path(raw_temp)
 
         try:
@@ -255,15 +278,26 @@ class ZipPackager(BasePackager):
                 for page, src in sorted_pages:
                     archive.write(src, arcname=src.name)
             _fsync_and_replace(temp_path, output)
-        except (OSError, ValueError) as exc:
-            temp_path.unlink(missing_ok=True)
+        except (
+            OSError,
+            ValueError,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+        ) as exc:
+            # ``BadZipFile`` and ``LargeZipFile`` are not subclasses of
+            # ``OSError`` or ``ValueError`` — they derive from
+            # ``Exception`` directly. Without them in this tuple, a
+            # corrupted write would fall through to the ``BaseException``
+            # branch below and propagate raw, hiding the ``PackagingError``
+            # contract from the caller.
+            _safe_unlink(temp_path)
             raise PackagingError(
                 f"failed to create ZIP archive {output}: {exc}"
             ) from exc
         except BaseException:
             # ``CancelledError`` and any other BaseException must clean up
             # the temp file before propagating.
-            temp_path.unlink(missing_ok=True)
+            _safe_unlink(temp_path)
             raise
 
         _log.info(
@@ -312,8 +346,40 @@ def _resolve_compression(
     return zipfile.ZIP_DEFLATED, level
 
 
+def _safe_unlink(path: Path) -> None:
+    """Best-effort removal of *path*, never raising.
+
+    Used in the exception-handling paths of :meth:`_package_sync` so that
+    a failure to clean up a temp file (permissions, FS read-only) does
+    not replace the exception the caller actually needs to see.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _fsync_and_replace(temp_path: Path, target: Path) -> None:
-    """``fsync`` *temp_path* then atomically replace *target*.
+    """``fsync`` *temp_path*, rename it onto *target*, fsync the parent.
+
+    Three steps, each of which is required for the atomic-write contract
+    documented in the module docstring:
+
+    1. **fsync the temp file's content.** Opens the file read-only —
+       ``fsync(2)`` accepts an fd in ``O_RDONLY`` and flushes all dirty
+       pages of the inode regardless of the open mode, so a write-capable
+       fd is not required (and would fail on some filesystems where the
+       file is read-only by design).
+    2. **Atomically rename the temp file onto the target.** ``Path.replace``
+       is atomic on every filesystem that supports POSIX rename
+       semantics — the check-then-rename window is a no-op for a
+       single writer (the packager).
+    3. **fsync the parent directory.** Without this step a crash between
+       the rename and the next directory flush can revert the rename —
+       the target file disappears, the temp file reappears under its
+       old name. This is the "durability of the rename itself"
+       guarantee that :func:`nexusdl.core.utils.filesystem.fsync_directory`
+       exists to provide.
 
     Args:
         temp_path: The just-written temporary file.
@@ -322,6 +388,7 @@ def _fsync_and_replace(temp_path: Path, target: Path) -> None:
     Raises:
         OSError: If the fsync or the rename fails.
     """
-    with temp_path.open("rb+") as fh:
+    with temp_path.open("rb") as fh:
         os.fsync(fh.fileno())
     temp_path.replace(target)
+    fsync_directory(target.parent)

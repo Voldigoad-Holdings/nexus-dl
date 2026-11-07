@@ -52,7 +52,7 @@ Lazy loading
 Importing ``nexusdl.plugins`` **does not** import any submodule. The four
 submodules are resolved on first attribute access, exactly like the rest
 of the project (see :mod:`nexusdl.interfaces`, :mod:`nexusdl.interfaces.web`,
-:mod:`nexusdl.interfaces.gui`, …). Concretely:
+…). Concretely:
 
 .. code-block:: python
 
@@ -76,7 +76,11 @@ The error handling follows the same pattern as the rest of the project:
 missing optional dependencies (``pyyaml``, ``jsonschema``) are converted
 from :class:`ImportError` to :class:`AttributeError` (as PEP 562 requires)
 with the underlying error chained as ``__cause__`` and a hint pointing at
-the ``[plugins]`` extra.
+the ``[plugins]`` extra. **Every** exception raised during submodule import
+— including a genuine ``ModuleNotFoundError`` for a core dependency such
+as ``loguru`` or ``pydantic`` — is converted the same way: PEP 562 forbids
+``__getattr__`` from raising anything other than ``AttributeError``, so a
+``hasattr`` probe must never crash.
 
 Stability
 ---------
@@ -103,7 +107,7 @@ tooling, not part of the stable public API.
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 
 # ===========================================================================
@@ -151,8 +155,13 @@ __all__ = [
 # Maps exported name -> submodule basename. Every listed symbol is defined
 # at module level in the given submodule. Adding a new top-level export is
 # a one-line change here plus a matching TYPE_CHECKING re-export below.
+#
+# The dict is annotated ``Final`` but Python's type system does not make
+# the *contents* immutable. That is acceptable here because nothing in the
+# codebase mutates it after module import — the annotation communicates
+# intent, not enforcement.
 
-_LAZY: dict[str, str] = {
+_LAZY: Final[dict[str, str]] = {
     # --- plugins.api — the contract ---------------------------------------
     "NexusPlugin": "api",
     "PluginContext": "api",
@@ -241,11 +250,15 @@ def __getattr__(name: str) -> Any:
     Raises:
         AttributeError: When ``name`` is not a public export, when the
             submodule cannot be imported (a missing optional dependency
-            such as ``pyyaml`` or ``jsonschema``, a syntax error deeper
-            in the module, or a broken installation), or when the
-            submodule does not define the requested name. ``AttributeError``
-            - rather than ``ImportError`` - is required by PEP 562 so that
-            ``hasattr`` works.
+            such as ``pyyaml`` or ``jsonschema``, a missing core dependency
+            such as ``loguru``, a syntax error deeper in the module, or a
+            broken installation), or when the submodule does not define
+            the requested name. ``AttributeError`` - rather than
+            ``ImportError`` or ``ModuleNotFoundError`` - is **required by
+            PEP 562**: any other exception type would make ``hasattr``
+            raise instead of returning ``False``, and would break the
+            ``getattr(obj, name, default)`` idiom used by the CLI, the TUI
+            and the web bootstrap.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -266,12 +279,33 @@ def __getattr__(name: str) -> Any:
     except ModuleNotFoundError as exc:
         # Optional dependency missing from the plugin extras.
         if exc.name in {"yaml", "jsonschema"}:
-            raise ImportError(
-                f"{name!r} requires the plugins extra. "
-                f"Install it with: pip install 'nexusdl[plugins]' "
-                f"(or 'nexusdl[all]' for the full set)."
+            raise AttributeError(
+                f"Cannot import {name!r}: the plugins extra is not "
+                f"installed.  Run 'pip install \"nexusdl[plugins]\"' "
+                f"(or \"nexusdl[all]\" for the full set) and try again.  "
+                f"Underlying error: {exc}"
             ) from exc
-        raise
+        # Missing core dependency (loguru, pydantic, packaging, …) or a
+        # typo in a submodule import.  Still an AttributeError per PEP 562,
+        # because `hasattr` must never propagate a ModuleNotFoundError.
+        raise AttributeError(
+            f"Cannot import {name!r}: the plugin submodule "
+            f"{submodule!r} could not be loaded. "
+            f"Underlying error: {exc}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 — PEP 562 requires AttributeError
+        # Broad catch — not just ModuleNotFoundError.  A submodule import
+        # can fail for reasons that are not import-related: a SyntaxError,
+        # a RuntimeError from a module-level initialiser, a
+        # pydantic.ValidationError from a Settings default, a ValueError
+        # from an environment probe, …  In every case the caller-visible
+        # exception must be AttributeError so that `hasattr` and
+        # `getattr(x, name, default)` behave as users expect.
+        raise AttributeError(
+            f"Cannot import {name!r}: the plugin submodule "
+            f"{submodule!r} raised {type(exc).__name__} during import. "
+            f"Underlying error: {exc}"
+        ) from exc
 
     try:
         value = getattr(module, name)

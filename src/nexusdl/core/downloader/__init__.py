@@ -66,9 +66,12 @@ annotation requires them, import from the specific submodule.
 
 Lazy loading
 ------------
-All twenty-three exports are resolved through PEP 562's ``__getattr__``
-mechanism. Importing ``nexusdl.core.downloader`` **does not import any
-submodule**. This matters more here than anywhere else in the project:
+Twenty-eight of the thirty exports are resolved through PEP 562's
+``__getattr__`` mechanism. The two remaining exports are the introspection
+helpers (:func:`list_symbols`, :func:`get_symbol`) which are defined
+directly in this module. Importing ``nexusdl.core.downloader`` **does not
+import any submodule**. This matters more here than anywhere else in the
+project:
 
 * **The ``manager`` and ``worker`` modules are heavy.** Importing
   ``worker.py`` transitively imports ``packaging/{cbz,cb7,pdf}.py`` (which
@@ -173,6 +176,59 @@ __all__ = [
 
 
 # ===========================================================================
+# Introspection helpers
+# ===========================================================================
+#
+# Defined before ``__getattr__`` so that they are always bound in
+# ``globals()`` — ``__getattr__`` is only invoked for names that are *not*
+# already present, so these bypass the lazy registry entirely.
+
+def list_symbols() -> list[str]:
+    """Return the sorted list of top-level lazy exports.
+
+    Useful for parametrized tests (``@pytest.mark.parametrize("name",
+    list_symbols())``), schema registries, and tooling that needs to
+    enumerate the downloader's public surface without importing every
+    submodule.
+
+    The two introspection helpers (:func:`list_symbols`, :func:`get_symbol`)
+    are part of ``__all__`` but are **not** included in the returned list:
+    they are defined directly in this module and do not live in any
+    submodule. Including them would make the function self-referential
+    and add no information — callers who already have
+    :func:`list_symbols` do not need it in its own output.
+    """
+    return sorted(_LAZY.keys())
+
+
+def get_symbol(name: str) -> Any:
+    """Return the downloader symbol registered under ``name``.
+
+    Equivalent to ``getattr(package, name)`` but with a clearer error
+    message when the name is unknown. Convenient for dynamic lookups
+    (parametrized tests, composition-root builders that resolve a symbol
+    from a config string, download-pipeline inspectors).
+
+    Both the submodule exports (resolved lazily through :func:`__getattr__`)
+    and the two introspection helpers (defined in this module) are
+    accepted.
+
+    Raises:
+        KeyError: If ``name`` is not a public downloader export.
+    """
+    if name in ("list_symbols", "get_symbol"):
+        return globals()[name]
+    if name not in _LAZY:
+        available = ", ".join(sorted(_LAZY.keys()))
+        raise KeyError(
+            f"Unknown downloader symbol {name!r}. Available: {available}. "
+            f"Every other symbol lives in its specific submodule - import "
+            f"from 'nexusdl.core.downloader.<submodule>' directly."
+        )
+    return __getattr__(name)
+
+
+# ===========================================================================
 # Lazy import registry
 # ===========================================================================
 #
@@ -218,6 +274,19 @@ _LAZY: dict[str, tuple[str, str]] = {
     "make_manga_key": ("deduplication", "make_manga_key"),
     "make_page_key": ("deduplication", "make_page_key"),
 }
+
+
+# Sanity check: ``__all__`` must be exactly the union of the lazy registry
+# and the two helpers defined in this module. A mismatch means someone
+# added a symbol to one place and forgot the other — silent divergence that
+# only surfaces at runtime as ``AttributeError`` or ``ImportError`` in a
+# specific import path.
+_INTROSPECTION_HELPERS = frozenset({"list_symbols", "get_symbol"})
+assert set(__all__) == set(_LAZY) | _INTROSPECTION_HELPERS, (
+    f"__all__ / _LAZY mismatch: "
+    f"extra in __all__={set(__all__) - set(_LAZY) - _INTROSPECTION_HELPERS}, "
+    f"extra in _LAZY={set(_LAZY) - set(__all__)}"
+)
 
 
 # ===========================================================================
@@ -271,6 +340,22 @@ if TYPE_CHECKING:
 # Lazy loader
 # ===========================================================================
 
+#: Names of optional dependencies that a missing import might refer to.
+#: Comparing on the **root** package name (``exc.name.split(".")[0]``)
+#: handles the case where the missing module is a submodule
+#: (``httpx._client``, ``PIL.Image``) rather than the top-level package.
+_CORE_EXTRA_DEPENDENCIES: frozenset[str] = frozenset(
+    {
+        "httpx",
+        "hishel",
+        "img2pdf",
+        "py7zr",
+        "aiofiles",
+        "PIL",
+    }
+)
+
+
 def __getattr__(name: str) -> Any:
     """Resolve a public downloader symbol on first access (PEP 562).
 
@@ -297,6 +382,9 @@ def __getattr__(name: str) -> Any:
             or when the submodule does not define the requested name.
             ``AttributeError`` - rather than ``ImportError`` - is required
             by PEP 562 so that ``hasattr`` works.
+        ImportError: When the import failure is specifically a missing
+            dependency from the ``[core]`` extra. The original
+            :class:`ModuleNotFoundError` is chained as ``__cause__``.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -320,17 +408,12 @@ def __getattr__(name: str) -> Any:
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
     except ModuleNotFoundError as exc:
-        # Optional dependency missing from the downloader pipeline.
-        if exc.name in {
-            "httpx",
-            "hishel",
-            "img2pdf",
-            "py7zr",
-            "aiofiles",
-            "PIL",
-            "yaml",
-            "jsonschema",
-        }:
+        # Optional dependency missing from the downloader pipeline. The
+        # comparison is on the **root** module name so that a missing
+        # submodule (``httpx._client``, ``PIL.Image``) is attributed to the
+        # correct top-level package.
+        missing_root = exc.name.split(".")[0] if exc.name else None
+        if missing_root in _CORE_EXTRA_DEPENDENCIES:
             raise ImportError(
                 f"{name!r} requires the core extra (downloader pipeline "
                 f"dependencies: httpx, hishel, img2pdf, py7zr, aiofiles, "
@@ -345,7 +428,7 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(
             f"The downloader submodule {submodule_basename!r} does not "
             f"define {attr_name!r}. This is a package-internal "
-            f"inconsistency - nexusdl.core.downloader.__all__ and the "
+            f"inconsistency - nexusdl.core.downloader._LAZY and the "
             f"submodules are out of sync."
         ) from None
 
@@ -361,51 +444,18 @@ def __dir__() -> list[str]:
     Python's default :func:`dir` implementation collects a module's
     ``__dict__`` and, when the module defines ``__getattr__``, calls it
     with each candidate name to decide what to display. Because none of
-    the twenty-three exports are present in ``__dict__`` at import time,
-    an unmodified :func:`dir` would not list them - the package would
-    appear empty in a REPL.
+    the lazy exports are present in ``__dict__`` at import time, an
+    unmodified :func:`dir` would not list them - the package would appear
+    empty in a REPL.
 
-    The returned list is :data:`__all__` plus the standard module dunders
-    a user typically expects to see.
+    The returned list is :data:`__all__`, the module dunders, and any
+    attribute already bound in ``globals()`` (whether via a resolved lazy
+    import or via external assignment — e.g. a test fixture that injects
+    a symbol). This matches Python's contract that ``__dir__`` should
+    report everything accessible through ``getattr``.
     """
     return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+        set(globals().keys())
+        | set(__all__)
+        | {"__all__", "__doc__", "__name__", "__package__"}
     )
-
-
-# ===========================================================================
-# Introspection helpers
-# ===========================================================================
-
-def list_symbols() -> list[str]:
-    """Return the sorted list of top-level lazy exports.
-
-    Useful for parametrized tests (``@pytest.mark.parametrize("name",
-    list_symbols())``), schema registries, and tooling that needs to
-    enumerate the downloader's public surface without importing every
-    submodule.
-    """
-    # Only the twenty-three public exports, not the introspection helpers
-    # themselves - otherwise ``list_symbols`` would include itself.
-    return sorted(_LAZY.keys())
-
-
-def get_symbol(name: str) -> Any:
-    """Return the downloader symbol registered under ``name``.
-
-    Equivalent to ``getattr(package, name)`` but with a clearer error
-    message when the name is unknown. Convenient for dynamic lookups
-    (parametrized tests, composition-root builders that resolve a symbol
-    from a config string, download-pipeline inspectors).
-
-    Raises:
-        KeyError: If ``name`` is not a public downloader export.
-    """
-    if name not in _LAZY:
-        available = ", ".join(sorted(_LAZY.keys()))
-        raise KeyError(
-            f"Unknown downloader symbol {name!r}. Available: {available}. "
-            f"Every other symbol lives in its specific submodule - import "
-            f"from 'nexusdl.core.downloader.<submodule>' directly."
-        )
-    return getattr(__import__(__name__, fromlist=[name]), name)

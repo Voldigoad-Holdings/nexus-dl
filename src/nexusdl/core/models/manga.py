@@ -60,10 +60,22 @@ URL scheme
 :attr:`Manga.url` accepts both ``https://`` (for network mangas) and
 ``file://`` (for locally-scanned mangas, which the scanner produces via
 :meth:`pathlib.Path.as_uri`). The model only enforces a non-empty string.
+
 :attr:`Manga.cover_url`, in contrast, is **HTTPS-only**: it always names a
 remote image, and a plaintext cover URL is a MITM surface with no upside.
 A parser that gets an HTTP cover URL from a site should upgrade it to
-HTTPS before assigning it, or leave ``cover_url=None``.
+HTTPS before assigning it, or leave ``cover_url=None``. The URL is parsed
+with :func:`urllib.parse.urlparse` rather than a bare string-prefix check,
+so malformed inputs (``"https://"`` with no host) are rejected.
+
+Timestamp ordering
+------------------
+``created_at``, ``updated_at``, and ``last_read_at`` are checked for
+chronological consistency (``created_at <= updated_at`` and
+``last_read_at >= created_at``) with a small tolerance
+(:data:`_MAX_CLOCK_SKEW_SECONDS`) for clock skew during multi-system
+imports and NTP drift. Beyond that tolerance, an inverted ordering is a
+real data-integrity bug and is rejected.
 
 Dependency graph (no cycles)::
 
@@ -79,9 +91,10 @@ import hashlib
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
+from urllib.parse import urlparse
 
 from nexusdl.core.models.enums import (
     ContentRating,
@@ -111,11 +124,38 @@ _MANGA_ID_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^[0-9a-f]{16}$"
 )
 
-#: Cover URLs must be HTTPS. See the module docstring for the rationale.
-_HTTPS_PREFIX: Final[str] = "https://"
+#: Expected scheme for :attr:`Manga.cover_url`. Compared case-insensitively
+#: via :func:`urllib.parse.urlparse` (RFC 3986 §3.1).
+_HTTPS_SCHEME: Final[str] = "https"
 
 #: Length of the canonical truncated-sha256 manga id.
 _MANGA_ID_LENGTH: Final[int] = 16
+
+#: Tolerance applied to timestamp-ordering checks. Imports of manga rows
+#: from other systems occasionally suffer a few seconds of NTP drift; a
+#: small skew is not a data-integrity bug.
+_MAX_CLOCK_SKEW_SECONDS: Final[int] = 5
+
+
+def _is_https_url(value: str) -> bool:
+    """Return ``True`` iff *value* is a well-formed absolute HTTPS URL.
+
+    Performs a full parse rather than a string-prefix check so that
+    ``"https://"`` (no host) and ``"https:// space"`` (whitespace in
+    netloc) are rejected. Scheme is compared case-insensitively —
+    ``"HTTPS://x"`` is accepted per RFC 3986 §3.1.
+
+    Args:
+        value: The candidate URL.
+
+    Returns:
+        ``True`` for well-formed absolute HTTPS URLs with a non-empty host.
+    """
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == _HTTPS_SCHEME and bool(parsed.netloc)
 
 
 # --------------------------------------------------------------------------- #
@@ -168,7 +208,9 @@ class Manga:
         alt_titles: Alternate titles (native script, romanized, English
             translation, …). Stored as a JSON array in the database;
             accepted here as any sequence and normalised to a tuple in
-            :meth:`__post_init__`.
+            :meth:`__post_init__`. Order and duplicates are preserved —
+            both may be significant (e.g. the same title romanised two
+            ways).
         description: Optional synopsis. Not required, frequently absent
             for lesser-known entries.
         author: Optional author name, verbatim. May be a comma-separated
@@ -179,13 +221,13 @@ class Manga:
         year: Optional release year. ``None`` when the site does not
             expose it.
         cover_url: Optional HTTPS URL of the cover image. Rejected at
-            construction if it does not start with ``https://``.
+            construction if it is not a well-formed absolute HTTPS URL.
         cover_path: Optional local filesystem path to a cached cover
             image. Populated by a "download cover" step (future); does not
             affect any current pipeline.
         tags: Genre / tag names. Stored as a JSON array in the database;
             accepted here as any sequence and normalised to a tuple in
-            :meth:`__post_init__`.
+            :meth:`__post_init__`. Order and duplicates are preserved.
         page_count: Total number of pages across all chapters.
             Denormalised from ``chapters`` for query speed; maintained by
             :meth:`LibraryDatabase.add_chapter`. Defaults to ``0`` for
@@ -247,31 +289,16 @@ class Manga:
     def __post_init__(self) -> None:
         """Validate field types, value constraints, and normalise sequences.
 
-        Three categories of check:
-
-        * **Required strings** — every one of ``id`` / ``site_id`` /
-          ``source_id`` / ``title`` / ``url`` must be a non-empty string,
-          and ``id`` must match the canonical hex16 pattern.
-        * **Enum and numeric fields** — reject wrong types, and enforce
-          the same bounds as the schema's ``CHECK`` constraints
-          (``page_count >= 0``, ``chapter_count >= 0``, ``year >= 0``).
-        * **Optional strings** — ``cover_url`` must be HTTPS when set.
-          ``cover_path`` must be a :class:`pathlib.Path` when set.
-
-        Additionally, :attr:`alt_titles` and :attr:`tags` are normalised
-        to tuples via :func:`object.__setattr__` — the only way to mutate
-        a frozen dataclass field — so that a caller-supplied list cannot
-        be mutated after construction.
-
         Raises:
             TypeError: If a field has the wrong Python type (e.g.
                 ``id=123``, ``is_manga=1``, ``year="2024"``,
                 ``alt_titles="One Piece"``, ``cover_url=123``).
             ValueError: If a required string is empty, ``id`` does not
                 match the canonical pattern, ``site_id`` does not match
-                the site-id pattern, ``cover_url`` is not HTTPS,
-                ``page_count`` / ``chapter_count`` / ``year`` is negative,
-                or ``alt_titles`` / ``tags`` contains an empty string.
+                the site-id pattern, ``cover_url`` is not a well-formed
+                HTTPS URL, ``page_count`` / ``chapter_count`` / ``year``
+                is negative, ``alt_titles`` / ``tags`` contains an empty
+                string, or a timestamp ordering invariant is violated.
         """
         self._validate_id()
         self._validate_site_id()
@@ -422,10 +449,10 @@ class Manga:
                     f"Manga.cover_url must be a str or None, got "
                     f"{type(self.cover_url).__name__}"
                 )
-            if not self.cover_url.startswith(_HTTPS_PREFIX):
+            if not _is_https_url(self.cover_url):
                 raise ValueError(
-                    f"Manga.cover_url must start with {_HTTPS_PREFIX!r}, "
-                    f"got {self.cover_url!r}"
+                    f"Manga.cover_url must be a well-formed absolute "
+                    f"HTTPS URL, got {self.cover_url!r}"
                 )
         if self.cover_path is not None and not isinstance(
             self.cover_path, Path
@@ -488,15 +515,28 @@ class Manga:
                 raise ValueError(
                     f"Manga.{field_name} must be timezone-aware"
                 )
+        skew = timedelta(seconds=_MAX_CLOCK_SKEW_SECONDS)
         if (
             self.created_at is not None
             and self.updated_at is not None
-            and self.created_at > self.updated_at
+            and self.updated_at + skew < self.created_at
         ):
             raise ValueError(
                 "Manga.created_at must be <= Manga.updated_at "
+                f"(tolerating {_MAX_CLOCK_SKEW_SECONDS}s clock skew) "
                 f"({self.created_at.isoformat()} > "
                 f"{self.updated_at.isoformat()})"
+            )
+        if (
+            self.created_at is not None
+            and self.last_read_at is not None
+            and self.last_read_at + skew < self.created_at
+        ):
+            raise ValueError(
+                "Manga.last_read_at must be >= Manga.created_at "
+                f"(tolerating {_MAX_CLOCK_SKEW_SECONDS}s clock skew) "
+                f"({self.last_read_at.isoformat()} < "
+                f"{self.created_at.isoformat()})"
             )
 
     # ------------------------------------------------------------------ #
@@ -571,11 +611,10 @@ class Manga:
 
         Computes :attr:`id` via :meth:`make_id` from ``site_id`` and
         ``source_id``. Every other field is taken from ``overrides``
-        verbatim and validated by :meth:`__post_init__`. The ``**overrides``
-        signature is deliberately untyped — the constructor's own
-        validation is the single source of truth for what values are
-        acceptable, and enumerating 15 optional keyword arguments would
-        duplicate that contract without adding safety.
+        verbatim and validated by :meth:`__post_init__`. The
+        ``**overrides`` signature is deliberately untyped — the
+        constructor's own validation is the single source of truth for
+        what values are acceptable.
 
         Use this method (rather than calling :class:`Manga` directly) when
         you are creating a **new** manga from application data. Use the
@@ -588,15 +627,32 @@ class Manga:
             title: The manga's title.
             url: The manga's canonical URL.
             **overrides: Any additional field of :class:`Manga`. See the
-                class docstring for the full attribute list.
+                class docstring for the full attribute list. Cannot
+                override ``id``, ``site_id``, ``source_id``, ``title``,
+                or ``url`` — those are computed or taken from the
+                positional arguments.
 
         Returns:
             A newly-constructed :class:`Manga` with a computed id.
 
         Raises:
-            TypeError: If any field has the wrong type.
+            TypeError: If any field has the wrong type, or if an override
+                collides with one of the explicit parameters
+                (``id``, ``site_id``, ``source_id``, ``title``, ``url``).
             ValueError: If any field fails semantic validation.
         """
+        # Reject overrides that would collide with the explicit parameters.
+        # Without this check, a caller passing ``id="..."`` (or any of the
+        # other five) would crash deep in ``cls(...)`` with a cryptic
+        # ``__init__() got multiple values for keyword argument 'id'``.
+        reserved = frozenset({"id", "site_id", "source_id", "title", "url"})
+        collisions = reserved & set(overrides)
+        if collisions:
+            raise TypeError(
+                "Manga.create() got conflicting override(s) "
+                f"{sorted(collisions)!r}; these parameters are computed "
+                "or positional. Remove them from **overrides."
+            )
         return cls(
             id=cls.make_id(site_id, source_id),
             site_id=site_id,

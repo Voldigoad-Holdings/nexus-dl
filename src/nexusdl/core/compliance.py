@@ -96,6 +96,41 @@ Design invariants
   caller that wants to test the parser does not need a running HTTP
   session.
 
+Fetch vs. match: two user-agents
+--------------------------------
+The ``user_agent`` argument controls two distinct things, and the module
+deliberately uses **different** values for each:
+
+* **Matching** — the ``user_agent`` string decides which ``User-agent``
+  group in the ``robots.txt`` applies to NexusDL's requests. ``"*"``
+  (the default) matches only the wildcard group; a specific token like
+  ``"NexusDL"`` prefers a matching explicit group when the site
+  publishes one.
+* **Fetching** — the ``robots.txt`` request itself is sent with a
+  fixed, well-formed user agent (:data:`_FETCH_USER_AGENT`) rather than
+  the matching token. The matching token may legitimately be ``"*"``,
+  which is **not** a valid HTTP ``User-Agent`` header value; a server
+  that rejects ``User-Agent: *`` would make the fetch fail and
+  silently disable compliance. Sending a fixed identifier avoids that.
+
+A site that wants to identify the robots.txt fetcher sees
+``NexusDL-Compliance/1.0`` in its access log. A site that wants to
+govern NexusDL's content requests sees the configured matching token
+in the rule group that applies.
+
+Port handling
+-------------
+The checker fetches ``robots.txt`` from ``<scheme>://<hostname>/robots.txt``
+— the default port for the scheme. A URL served on a **non-default**
+port (e.g. ``https://example.org:8443/manga``) is checked against
+``https://example.org/robots.txt`` (port 443), not against
+``https://example.org:8443/robots.txt``. This matches the common
+robots.txt tooling convention; a deployment that proxies a site onto a
+custom port and wants the port included must handle that at the session
+layer, not here. The simplification is deliberate — including the port
+would require validating every port string, and the sites NexusDL
+supports are overwhelmingly on 443.
+
 Dependency graph (no cycles)::
 
     core.exceptions  ──►  core.compliance
@@ -159,13 +194,25 @@ DEFAULT_CACHE_TTL_SECONDS: Final[float] = 86_400.0
 #: that a broken site does not stall the pipeline.
 DEFAULT_FETCH_TIMEOUT_SECONDS: Final[float] = 5.0
 
-#: User-Agent string the checker sends when fetching ``robots.txt`` and
-#: matches rules against when none is explicitly configured. ``"*"``
-#: matches the wildcard group, which is what every ``robots.txt`` must
-#: contain. Callers that want specific-group enforcement pass a bot name
+#: User-Agent string matched against ``User-agent:`` groups in
+#: ``robots.txt`` when the caller does not specify one. ``"*"`` matches
+#: the wildcard group, which is what every ``robots.txt`` must contain.
+#: Callers that want specific-group enforcement pass a bot name
 #: (``"NexusDL"``) so that a site which lists ``User-agent: NexusDL`` can
 #: grant NexusDL access that it denies to ``*``.
+#:
+#: **This value is not sent in the HTTP request** — see
+#: :data:`_FETCH_USER_AGENT` for the value that is.
 DEFAULT_USER_AGENT: Final[str] = "*"
+
+#: The value sent in the ``User-Agent`` header when *fetching*
+#: ``robots.txt``. Distinct from :data:`DEFAULT_USER_AGENT` and from the
+#: caller's matching token because ``"*"`` is not a valid HTTP
+#: ``User-Agent`` and a server that rejects it would silently disable
+#: compliance. Any well-formed product identifier works; this one names
+#: the responsibility ("Compliance") so a site operator inspecting their
+#: access log can tell what made the request.
+_FETCH_USER_AGENT: Final[str] = "NexusDL-Compliance/1.0"
 
 #: Directives the parser recognises. Any other directive is ignored
 #: silently — the RFC allows extensions the parser does not need to
@@ -539,7 +586,9 @@ class ComplianceChecker:
             Defaults to :data:`DEFAULT_USER_AGENT` (``"*"``). A
             deployment that has negotiated a specific ``User-agent``
             block with a site passes that token so the site's explicit
-            rules are honoured.
+            rules are honoured. This value is **not** sent in the
+            HTTP request — see the module docstring's
+            "Fetch vs. match: two user-agents" section.
         fetch_timeout_seconds: Timeout for the ``robots.txt`` fetch.
             Defaults to :data:`DEFAULT_FETCH_TIMEOUT_SECONDS`. Must be
             ``> 0``.
@@ -979,6 +1028,14 @@ class ComplianceChecker:
         ``(None, None)`` on transport failure or timeout — the caller
         interprets that as RFC 9309's "Unreachable" and soft-fails.
         Cancellation from the underlying session propagates untouched.
+
+        The request is sent with :data:`_FETCH_USER_AGENT`, **not**
+        with the caller-configured ``user_agent``. The configured UA
+        is a matching token (``"*"`` by default) and may not be a
+        valid HTTP ``User-Agent`` header value; using it for the fetch
+        would risk a server rejecting the request, which would
+        silently disable compliance. See the module docstring's
+        "Fetch vs. match: two user-agents" section.
         """
         robots_url = (
             f"{parsed.scheme}://{parsed.hostname}/robots.txt"
@@ -986,7 +1043,7 @@ class ComplianceChecker:
         try:
             response = await self._http_session.get(
                 robots_url,
-                headers={"User-Agent": self._user_agent},
+                headers={"User-Agent": _FETCH_USER_AGENT},
                 timeout=self._fetch_timeout,
             )
         except asyncio.CancelledError:

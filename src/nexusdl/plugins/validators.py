@@ -90,6 +90,14 @@ MANIFEST_FILENAME: Final[str] = "nexus.plugin.yaml"
 #: Host NexusDL version, parsed once at import for use as the default in
 #: compatibility checks. Injected overridable in tests via the ``host_version``
 #: argument of :func:`validate_manifest_compatibility`.
+#:
+#: Note: this module **fails fast** at import time if ``nexusdl.__version__``
+#: is not a valid PEP 440 version string. That is the correct behaviour —
+#: a project cannot ship with an unparseable version, and discovering the
+#: problem at the first plugin load (rather than at ``import nexusdl``)
+#: would make the failure much harder to diagnose. The version constant
+#: lives in ``nexusdl/version.py`` and is part of the project's release
+#: contract.
 HOST_VERSION: Final[Version] = Version(_HOST_VERSION_STR)
 
 #: Plugin identifier pattern — lowercase start, then lowercase/digit/`_`/`-`.
@@ -217,14 +225,19 @@ class PluginManifest(BaseModel):
     def _validate_hooks_no_duplicates(
         cls, value: tuple[HookName, ...]
     ) -> tuple[HookName, ...]:
-        if len(value) != len(set(value)):
-            seen: set[str] = set()
-            duplicates: list[str] = []
-            for hook in value:
-                if hook in seen and hook not in duplicates:
+        # A hook declared twice in a manifest would make the loader dispatch
+        # it twice — a real, silent bug. Detect duplicates deterministically
+        # and list them all in the error message so the author can fix the
+        # manifest in one pass.
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for hook in value:
+            if hook in seen:
+                if hook not in duplicates:
                     duplicates.append(hook)
-                else:
-                    seen.add(hook)
+            else:
+                seen.add(hook)
+        if duplicates:
             raise ValueError(
                 f"hooks contains duplicate entries: {sorted(duplicates)}"
             )
@@ -248,6 +261,10 @@ class PluginManifest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_version_range(self) -> PluginManifest:
+        # Only enforce the range when the upper bound is present. A manifest
+        # that declares only a lower bound is valid — it just means "no
+        # upper bound", which is the correct default for plugins whose
+        # upstream API is stable.
         if self.max_nexusdl_version is not None:
             min_v = Version(self.min_nexusdl_version)
             max_v = Version(self.max_nexusdl_version)

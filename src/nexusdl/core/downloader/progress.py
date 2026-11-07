@@ -63,11 +63,11 @@ See also
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, Literal, TypeAlias
+from itertools import count
+from typing import TYPE_CHECKING, Final, Literal, TypeAlias, cast
 
 from loguru import logger
 
@@ -119,6 +119,13 @@ PHASE_CANCELLED: Final = "cancelled"
 #: :meth:`ProgressTracker.update_task`.
 _TERMINAL_PHASES: Final[frozenset[str]] = frozenset(
     {PHASE_DONE, PHASE_FAILED, PHASE_CANCELLED}
+)
+
+#: Phases that :meth:`ProgressTracker.update_task` may set. Excludes
+#: terminal phases (which require dedicated methods) and ``pending`` (which
+#: is set by :meth:`ProgressTracker.start_task`, not by an in-flight update).
+_UPDATABLE_PHASES: Final[frozenset[str]] = frozenset(
+    {PHASE_PENDING, PHASE_PAGES, PHASE_PACKAGING}
 )
 
 
@@ -200,7 +207,13 @@ class TaskProgress:
 
     @property
     def elapsed_seconds(self) -> float:
-        """Seconds elapsed since :attr:`started_at`, at :attr:`updated_at`."""
+        """Seconds elapsed since :attr:`started_at`, at :attr:`updated_at`.
+
+        The value is derived from wall-clock timestamps. It is normally
+        positive, but can be negative if the injectable ``clock`` returns
+        a value earlier than :attr:`started_at` (a misconfigured test clock,
+        for instance). :attr:`remaining_seconds` guards against that case.
+        """
         return (self.updated_at - self.started_at).total_seconds()
 
     @property
@@ -213,7 +226,7 @@ class TaskProgress:
 
         Returns:
             ``0.0`` for terminal tasks; ``None`` when there is not enough
-            data yet (``progress == 0`` or ``elapsed == 0``); otherwise the
+            data yet (``progress == 0`` or ``elapsed <= 0``); otherwise the
             estimate in seconds.
         """
         if self.is_terminal:
@@ -289,7 +302,9 @@ class ProgressSnapshot:
             return 0.0
         weights = [max(t.pages_total, 1) for t in self.tasks]
         total_weight = sum(weights)
-        weighted = sum(t.progress * w for t, w in zip(self.tasks, weights))
+        weighted = sum(
+            t.progress * w for t, w in zip(self.tasks, weights, strict=True)
+        )
         return weighted / total_weight
 
     @property
@@ -312,7 +327,7 @@ class ProgressSnapshot:
         if any(eta is None for eta in etas):
             return None
         # ``etas`` is now guaranteed to contain only floats.
-        return max(eta for eta in etas if eta is not None)
+        return max(cast("list[float]", etas))
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +347,7 @@ class _MutableTaskState:
     started_at: datetime
     updated_at: datetime
     error: str | None = None
+    sequence: int = 0
 
     def to_immutable(self) -> TaskProgress:
         """Project this mutable state onto an immutable :class:`TaskProgress`."""
@@ -385,7 +401,11 @@ class ProgressTracker:
         self._max_completed_history = max_completed_history
         self._clock = clock
         self._tasks: dict[str, _MutableTaskState] = {}
-        self._terminal_order: deque[str] = deque()
+        #: Insertion-ordered dict of terminal task ids. Replaces a deque so
+        #: that re-registering the same id cannot leave duplicate entries
+        #: (which would let an old entry evict a freshly-resubmitted task).
+        self._terminal_order: dict[str, None] = {}
+        self._sequence = count()
         self._lock = asyncio.Lock()
         self._log = logger.bind(component="downloader.progress")
 
@@ -429,7 +449,7 @@ class ProgressTracker:
         event_type = event.type
 
         if event_type == _EVENT_DOWNLOAD_STARTED:
-            self._handle_started(payload)
+            await self._handle_started(payload)
             return
         if event_type == _EVENT_DOWNLOAD_PROGRESS:
             await self._handle_progress(payload)
@@ -455,10 +475,10 @@ class ProgressTracker:
     ) -> None:
         """Begin tracking a task.
 
-        If the id is already tracked, the existing entry is overwritten.
-        Idempotent — the composition root may call this on
-        ``download.started`` without checking whether the tracker already
-        knows about the task.
+        If the id is already tracked, the existing entry is overwritten and
+        any stale terminal-history reference is dropped. Idempotent — the
+        composition root may call this on ``download.started`` without
+        checking whether the tracker already knows about the task.
 
         Args:
             task_id: The task's id, as a string.
@@ -467,14 +487,18 @@ class ProgressTracker:
         """
         now = self._clock()
         async with self._lock:
+            # If this id was previously terminal, remove its history entry
+            # so a future eviction cannot target the new registration.
+            self._terminal_order.pop(task_id, None)
             self._tasks[task_id] = _MutableTaskState(
                 task_id=task_id,
                 chapter_id=chapter_id,
-                phase=PHASE_PAGES,
+                phase=PHASE_PENDING,
                 progress=0.0,
                 pages_total=max(0, pages_total),
                 started_at=now,
                 updated_at=now,
+                sequence=next(self._sequence),
             )
 
     async def update_task(
@@ -495,11 +519,12 @@ class ProgressTracker:
         Args:
             task_id: The task's id, as a string.
             progress: Completion fraction. Clamped to ``[0.0, 1.0]``.
-            phase: Optional phase string. When provided, must be one of the
-                non-terminal :data:`Phase` values (``pending``, ``pages``,
-                ``packaging``). Passing a terminal phase is logged and
-                dropped; use :meth:`complete_task`, :meth:`fail_task`, or
-                :meth:`cancel_task` instead.
+            phase: Optional phase string. When provided, must be one of
+                :data:`_UPDATABLE_PHASES` (``pending``, ``pages``,
+                ``packaging``). Passing a terminal phase or an unknown value
+                is logged and dropped; use :meth:`complete_task`,
+                :meth:`fail_task`, or :meth:`cancel_task` for terminal
+                transitions.
         """
         now = self._clock()
         async with self._lock:
@@ -526,7 +551,15 @@ class ProgressTracker:
                         task_id,
                     )
                     return
-                state.phase = phase  # type: ignore[assignment]
+                if phase not in _UPDATABLE_PHASES:
+                    self._log.debug(
+                        "update_task called with unknown phase={!r} for "
+                        "task_id={}; ignoring",
+                        phase,
+                        task_id,
+                    )
+                    return
+                state.phase = cast("Phase", phase)
             state.progress = max(0.0, min(1.0, float(progress)))
             state.updated_at = now
 
@@ -590,7 +623,7 @@ class ProgressTracker:
     async def remove_task(self, task_id: str) -> bool:
         """Remove a task from the tracker entirely.
 
-        The terminal-history FIFO also drops the id lazily, so calling this
+        The terminal-history map also drops the id lazily, so calling this
         on a terminal task is safe and does not leave a dangling reference
         in :attr:`_terminal_order`.
 
@@ -601,7 +634,9 @@ class ProgressTracker:
             ``True`` iff a task with that id was tracked.
         """
         async with self._lock:
-            return self._tasks.pop(task_id, None) is not None
+            removed = self._tasks.pop(task_id, None) is not None
+            self._terminal_order.pop(task_id, None)
+            return removed
 
     async def clear(self) -> None:
         """Drop every tracked task. Intended for tests and explicit resets."""
@@ -626,20 +661,21 @@ class ProgressTracker:
     async def snapshot(self) -> ProgressSnapshot:
         """Return an immutable snapshot of every tracked task.
 
-        Tasks are ordered by ``(started_at, task_id)``, matching submission
-        order for tasks created by the manager.
+        Tasks are ordered by ``(started_at, sequence)`` — submission order,
+        even when the injected clock returns identical timestamps for
+        several tasks. The public ``TaskProgress`` view does not expose
+        ``sequence``; it is an ordering key internal to this class.
 
         Returns:
             A :class:`ProgressSnapshot` frozen at the current clock value.
         """
         async with self._lock:
             now = self._clock()
-            tasks = tuple(
-                sorted(
-                    (s.to_immutable() for s in self._tasks.values()),
-                    key=lambda t: (t.started_at, t.task_id),
-                )
+            ordered = sorted(
+                self._tasks.values(),
+                key=lambda s: (s.started_at, s.sequence),
             )
+            tasks = tuple(s.to_immutable() for s in ordered)
             return ProgressSnapshot(tasks=tasks, captured_at=now)
 
     # ------------------------------------------------------------------ #
@@ -647,38 +683,54 @@ class ProgressTracker:
     # ------------------------------------------------------------------ #
 
     def _record_terminal(self, task_id: str) -> None:
-        """Append *task_id* to the terminal FIFO and evict on overflow.
+        """Record *task_id* as terminal and evict on overflow.
 
-        Caller must hold :attr:`_lock`.
+        Caller must hold :attr:`_lock`. Uses an insertion-ordered dict so a
+        task that is completed, removed, and resubmitted does not leave a
+        stale entry capable of evicting the new registration.
 
         Args:
             task_id: The id of a task that just became terminal.
         """
-        self._terminal_order.append(task_id)
+        # Re-registering the same id replaces the entry in place, keeping
+        # insertion order at the most-recent position.
+        self._terminal_order.pop(task_id, None)
+        self._terminal_order[task_id] = None
         while len(self._terminal_order) > self._max_completed_history:
-            oldest = self._terminal_order.popleft()
+            oldest, _ = self._terminal_order.popitem(last=False)
             state = self._tasks.get(oldest)
             # Only evict if the task is still terminal. A user could, in
             # theory, re-submit the same id after removing it — in that
-            # case the FIFO entry is stale and must not evict the new task.
+            # case the map entry is stale and must not evict the new task.
             if state is not None and state.phase in _TERMINAL_PHASES:
                 del self._tasks[oldest]
 
-    def _handle_started(self, payload: dict[str, object]) -> None:
+    async def _handle_started(self, payload: dict[str, object]) -> None:
         """Process a ``download.started`` event payload.
 
-        Synchronous because :meth:`start_task` cannot fail in a way the
-        caller needs to await — but :meth:`handle_event` still calls it via
-        ``await``, so keeping the split makes the async boundary explicit.
-        This helper is only called from :meth:`handle_event`, which is
-        itself async.
+        Registers the task in the tracker. Without this, tasks that fail
+        before emitting any ``download.progress`` (e.g. ``EmptyChapterError``
+        raised from ``get_pages``) would never be visible in snapshots.
 
         Args:
             payload: The event's payload dict.
         """
-        # Deferred: this method is unused at the moment because
-        # ``handle_event`` inlines the payload parsing. Kept as an explicit
-        # extension point if the parsing grows.
+        task_id = payload.get("task_id")
+        chapter_id = payload.get("chapter_id")
+        if not isinstance(task_id, str):
+            self._log.debug(
+                "Ignoring download.started event without task_id: {}", payload
+            )
+            return
+        if not isinstance(chapter_id, str):
+            self._log.debug(
+                "Ignoring download.started event without chapter_id: {}",
+                payload,
+            )
+            return
+        page_count = payload.get("page_count")
+        pages_total = page_count if isinstance(page_count, int) else 0
+        await self.start_task(task_id, chapter_id, pages_total=pages_total)
 
     async def _handle_progress(self, payload: dict[str, object]) -> None:
         """Process a ``download.progress`` event payload."""

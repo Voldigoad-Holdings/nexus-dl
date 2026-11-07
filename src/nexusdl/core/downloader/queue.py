@@ -85,6 +85,7 @@ from collections.abc import Mapping
 from itertools import count
 from types import MappingProxyType
 from typing import Final
+from uuid import UUID
 
 from loguru import logger
 
@@ -464,6 +465,13 @@ class DownloadQueue:
     def __len__(self) -> int:
         """Return the total number of tasks in the queue, at any status.
 
+        Reads ``_tasks`` without taking :attr:`_lock`. On CPython this is
+        safe because ``len(dict)`` is atomic and every mutation of
+        ``_tasks`` is a single ``dict[key] = value`` assignment — no
+        multi-step mutation of ``_tasks`` alone is observable. The method
+        is intentionally synchronous so it can be used in ``len(queue)``
+        and logging without awaiting.
+
         For the number of tasks *eligible to run*, use
         ``len(await queue.list(DownloadStatus.PENDING))`` or check
         :meth:`next`'s return value.
@@ -471,16 +479,34 @@ class DownloadQueue:
         return len(self._tasks)
 
     def __contains__(self, task_id: object) -> bool:
-        """Return ``True`` iff a task with id ``str(task_id)`` is in the queue."""
-        if not isinstance(task_id, str):
-            return False
-        return task_id in self._tasks
+        """Return ``True`` iff a task with id ``task_id`` is in the queue.
+
+        Accepts both :class:`uuid.UUID` and :class:`str`. Any other type
+        returns ``False`` rather than raising — ``in`` is expected to be
+        total.
+        """
+        if isinstance(task_id, UUID):
+            return str(task_id) in self._tasks
+        if isinstance(task_id, str):
+            return task_id in self._tasks
+        return False
 
     def __repr__(self) -> str:
-        """Return a compact debug representation."""
+        """Return a compact debug representation.
+
+        ``pending`` counts actual :attr:`DownloadStatus.PENDING` tasks, not
+        heap entries — the heap may hold stale entries for tasks that were
+        cancelled after submission, and reporting the heap size would
+        overstate the pending count.
+        """
+        pending = sum(
+            1
+            for task in self._tasks.values()
+            if task.status is DownloadStatus.PENDING
+        )
         return (
             f"DownloadQueue(tasks={len(self._tasks)}, "
-            f"pending={len(self._heap)}, "
+            f"pending={pending}, "
             f"running={len(self._running)}/{self._max_concurrent})"
         )
 

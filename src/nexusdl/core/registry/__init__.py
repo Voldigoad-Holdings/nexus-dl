@@ -43,6 +43,21 @@ does not have to import the runtime registry, and a deployed process
 that serves traffic does not have to re-run schema validation on every
 request.
 
+.. warning::
+   **Parser search contract.** The :class:`ParserProtocol.search`
+   method is declared as returning a
+   :class:`~nexusdl.core.models.search.SearchResultPage` (with a
+   ``.items`` attribute), and the composition example below shows
+   ``for hit in page.items``. However,
+   :meth:`~nexusdl.core.registry.site_registry.SiteRegistry.search_all`
+   currently iterates the parser as an **async generator**
+   (``async for hit in parser.search(...)``). The two cannot both be
+   right for the same implementation — see the
+   ``ParserProtocol.search`` docstring and the ``search_all``
+   docstring for the details. Verify against
+   ``parsers/base.py::BaseParser.search`` before relying on either
+   shape.
+
 Composition example
 -------------------
 The composition root wires the registry with a concrete
@@ -95,9 +110,9 @@ CI usage — validate ``sites.yaml`` and its parser classes::
 
 Lazy loading
 ------------
-All twenty exports are resolved through PEP 562's ``__getattr__``
-mechanism. Importing ``nexusdl.core.registry`` **does not import any
-submodule**.
+Every export in ``__all__`` is resolved through PEP 562's
+``__getattr__`` mechanism. Importing ``nexusdl.core.registry`` **does
+not import any submodule**.
 
 This matters more here than in most other packages because the eager
 ``__init__.py`` paid a heavy cost even for callers who only needed a
@@ -344,6 +359,11 @@ def __getattr__(name: str) -> Any:
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
+    The catch is intentionally broadened from ``ModuleNotFoundError`` to
+    ``ImportError`` — a partially-initialized submodule (missing symbol,
+    circular import resolved differently across Python versions) also
+    deserves the ``[core]`` install hint rather than a raw traceback.
+
     Args:
         name: The attribute name being accessed.
 
@@ -376,19 +396,25 @@ def __getattr__(name: str) -> Any:
             f"Available registry exports: {available}. "
             f"Every other symbol lives in its specific submodule - "
             f"e.g. 'from nexusdl.core.registry.validator import "
-            f"load_schema' or 'from nexusdl.core.registry.protocols "
+            f'load_schema\' or \'from nexusdl.core.registry.protocols '
             f"import ParserProtocol'."
         )
 
     submodule_basename, attr_name = entry
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
-    except ModuleNotFoundError as exc:
-        # Optional dependency missing from the registry subsystem.
-        if exc.name in {"jsonschema", "yaml", "pydantic"}:
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose — see the docstring.
+        if getattr(exc, "name", None) in {
+            "jsonschema",
+            "yaml",
+            "pydantic",
+            "loguru",
+        }:
             raise ImportError(
                 f"{name!r} requires the core extra (registry subsystem "
-                f"dependencies: jsonschema, PyYAML, pydantic). "
+                f"dependencies: jsonschema, PyYAML, pydantic, loguru). "
                 f"Install it with: pip install 'nexusdl[core]' "
                 f"(or 'nexusdl[all]' for the full set)."
             ) from exc
@@ -396,13 +422,18 @@ def __getattr__(name: str) -> Any:
 
     try:
         value = getattr(module, attr_name)
-    except AttributeError:
+    except AttributeError as exc:
+        # ``from exc`` preserves the cause. A ``getattr`` on a healthy
+        # module raises ``AttributeError`` with the standard message;
+        # an exotic failure (a broken descriptor, a partially-initialised
+        # class) shows up with its own message attached, which is the
+        # diagnostic the operator needs.
         raise AttributeError(
             f"The registry submodule {submodule_basename!r} does not "
             f"define {attr_name!r}. This is a package-internal "
             f"inconsistency - nexusdl.core.registry.__all__ and the "
-            f"submodules are out of sync."
-        ) from None
+            f"submodules are out of sync. Original error: {exc}"
+        ) from exc
 
     # Cache in the module namespace so subsequent lookups bypass
     # __getattr__ entirely (same behavior as a top-level import).
@@ -411,21 +442,30 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Return the public names for interactive introspection.
+    """Return the package's visible attributes, including lazy exports.
 
-    Python's default :func:`dir` implementation collects a module's
-    ``__dict__`` and, when the module defines ``__getattr__``, calls it
-    with each candidate name to decide what to display. Because none of
-    the twenty exports are present in ``__dict__`` at import time, an
-    unmodified :func:`dir` would not list them - the package would
-    appear empty in a REPL.
+    Python's default :func:`dir` on a module already lists ``__all__``
+    entries even when they are not bound in ``__dict__`` — so without
+    this override, ``SiteRegistry``, ``ParserFactory``, etc. would still
+    appear. Keeping the override explicit serves two purposes:
 
-    The returned list is :data:`__all__` plus the standard module
-    dunders a user typically expects to see.
+    1. It documents that the registry exports are *intentional*
+       attributes of this package, not accidental names.
+    2. It preserves the module's actual attributes (``__file__``,
+       ``__spec__``, ``__loader__``, ``__dict__``, ``__getattr__``,
+       ``__dir__``, ``list_symbols``, ``get_symbol``, ``_LAZY``, …)
+       alongside the lazy ones — a plain ``dir`` would include them
+       anyway, but spelling out the union makes the contract explicit
+       and future-proof against refactors that change how ``__all__``
+       is built.
+
+    The result is the union of the module's actual namespace (dunders,
+    introspection helpers, any submodule already imported and cached by
+    :func:`__getattr__`) and :data:`__all__`, deduplicated and sorted
+    so that ``dir()`` output is stable across Python versions and
+    repeat calls.
     """
-    return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
-    )
+    return sorted(set(globals()) | set(__all__))
 
 
 # ===========================================================================
@@ -438,10 +478,12 @@ def list_symbols() -> list[str]:
     Useful for parametrized tests (``@pytest.mark.parametrize("name",
     list_symbols())``), schema registries, and tooling that needs to
     enumerate the registry subsystem's public surface without importing
-    every submodule.
+    every submodule. The list is derived from :data:`_LAZY` — it
+    reflects the actual lazy registry, not a hand-maintained second
+    list that could drift from :data:`__all__`.
     """
-    # Only the twenty public exports, not the introspection helpers
-    # themselves - otherwise ``list_symbols`` would include itself.
+    # Only the public exports, not the introspection helpers themselves -
+    # otherwise ``list_symbols`` would include itself.
     return sorted(_LAZY.keys())
 
 
@@ -454,6 +496,12 @@ def get_symbol(name: str) -> Any:
     from a config string, CI tooling that resolves a validator or loader
     helper).
 
+    The lookup goes through :func:`__getattr__` so the resolution is
+    cached in ``globals()`` and subsequent calls do not pay the
+    ``importlib`` overhead again — and so a missing optional dependency
+    surfaces as an :class:`ImportError` with the ``nexusdl[core]`` hint,
+    not a raw ``ModuleNotFoundError``.
+
     Raises:
         KeyError: If ``name`` is not a public registry export.
     """
@@ -464,4 +512,4 @@ def get_symbol(name: str) -> Any:
             f"Every other symbol lives in its specific submodule - import "
             f"from 'nexusdl.core.registry.<submodule>' directly."
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    return __getattr__(name)

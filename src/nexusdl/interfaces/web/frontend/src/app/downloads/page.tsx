@@ -63,8 +63,8 @@ import {
   XCircle,
   type LucideIcon,
 } from "lucide-react";
-import { useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useMemo } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useMemo, useRef } from "react";
 
 import { DownloadItem } from "../../components/DownloadItem";
 import { useDownload } from "../../hooks/useDownload";
@@ -112,6 +112,16 @@ function isFilterTabId(value: string | null): value is FilterTab["id"] {
   return FILTER_TABS.some((tab) => tab.id === value);
 }
 
+/**
+ * Exhaustiveness helper for ``switch`` over the tab union.
+ *
+ * Never called at runtime; its presence makes the compiler fail if a new
+ * ``FilterTab["id"]`` is added and a ``switch`` is not updated.
+ */
+function assertNeverTab(value: never): never {
+  throw new Error(`Unhandled filter tab: ${String(value)}`);
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Page
 // ───────────────────────────────────────────────────────────────────────────
@@ -134,6 +144,7 @@ export default function DownloadsPage() {
 
 function DownloadsBody() {
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
 
   const downloads = useDownload();
@@ -149,6 +160,10 @@ function DownloadsBody() {
   // When the user switches tabs, update the URL **without** adding a
   // history entry — otherwise the back button becomes a stack of tab
   // toggles, which is surprising.
+  //
+  // The path is always explicit (``pathname`` + optional query): passing
+  // only ``"?status=active"`` to ``router.replace`` is fragile in the App
+  // Router and can lose the current route on some Next versions.
   const setActiveTab = useCallback(
     (tab: FilterTab["id"]) => {
       const params = new URLSearchParams(searchParams.toString());
@@ -158,9 +173,10 @@ function DownloadsBody() {
         params.set("status", tab);
       }
       const query = params.toString();
-      router.replace(query.length > 0 ? `?${query}` : "?", { scroll: false });
+      const target = query.length > 0 ? `${pathname}?${query}` : pathname;
+      router.replace(target, { scroll: false });
     },
-    [router, searchParams],
+    [pathname, router, searchParams],
   );
 
   // -------------------------------------------------------------------
@@ -176,6 +192,8 @@ function DownloadsBody() {
         return downloads.completedTasks;
       case "failed":
         return downloads.failedTasks;
+      default:
+        return assertNeverTab(activeTab);
     }
   }, [
     activeTab,
@@ -190,13 +208,18 @@ function DownloadsBody() {
   // -------------------------------------------------------------------
   const showInitialLoading =
     downloads.isLoading && !downloads.isInitialized;
-  const isEmptyOverall = downloads.isInitialized && downloads.tasks.length === 0;
+  const isEmptyOverall =
+    downloads.isInitialized && downloads.tasks.length === 0;
   const isEmptyFiltered =
     downloads.isInitialized &&
     downloads.tasks.length > 0 &&
     visibleTasks.length === 0;
 
-  const hasFinished = downloads.completedTasks.length + downloads.failedTasks.length > 0;
+  const hasFinished = useMemo(
+    () =>
+      downloads.completedTasks.length + downloads.failedTasks.length > 0,
+    [downloads.completedTasks.length, downloads.failedTasks.length],
+  );
 
   // -------------------------------------------------------------------
   // Re-fetch on visibility change
@@ -204,20 +227,44 @@ function DownloadsBody() {
   // A user who leaves the tab open in the background may miss WS events
   // (e.g. the OS suspends the socket).  A refresh when the tab becomes
   // visible again reconciles the store with the backend without polling.
+  //
+  // ``refetch`` is stashed in a ref so the listener is attached **once**
+  // for the component lifetime, regardless of whether ``useDownload``
+  // returns a stable callback.  Depending on it directly would re-attach
+  // the listener on every render (a real bug if the hook uses an inline
+  // arrow).
+  const refetchRef = useRef(downloads.refetch);
+  refetchRef.current = downloads.refetch;
+
   useEffect(() => {
     if (typeof document === "undefined") {
       return;
     }
     const handleVisibility = (): void => {
       if (document.visibilityState === "visible") {
-        void downloads.refetch();
+        void refetchRef.current();
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [downloads.refetch]);
+  }, []);
+
+  // Confirmation for the destructive "Clear finished" action.  Removing
+  // every terminal task in one click is easy to trigger by accident, and
+  // there is no undo.
+  const handleClearFinished = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const confirmed = window.confirm(
+      "Remove every completed, failed and cancelled task from this list?",
+    );
+    if (confirmed) {
+      downloads.clearFinished();
+    }
+  }, [downloads.clearFinished]);
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 p-4 sm:p-6 lg:p-8">
@@ -399,7 +446,7 @@ function DownloadsBody() {
         {hasFinished && (
           <button
             type="button"
-            onClick={downloads.clearFinished}
+            onClick={handleClearFinished}
             aria-label="Clear finished downloads"
             title="Remove every completed, failed and cancelled task from the list"
             className={cn(
@@ -510,11 +557,16 @@ function ConnectionPill({
     icon = Wifi;
     classes =
       "bg-emerald-500/10 text-emerald-700 ring-emerald-600/20 dark:text-emerald-400";
-  } else {
-    // ``failed``
+  } else if (state === "failed") {
     label = "Disconnected";
     icon = WifiOff;
     classes = "bg-red-500/10 text-red-700 ring-red-600/20 dark:text-red-400";
+  } else {
+    // Defensive fallback: a new state value must be handled explicitly
+    // in this component rather than silently masquerading as "failed".
+    label = "Unknown";
+    icon = WifiOff;
+    classes = "bg-muted text-muted-foreground ring-border";
   }
 
   const Icon = icon;
@@ -616,10 +668,15 @@ function StatCard({
  * Uses the same vertical rhythm as a real task row (badge + two text
  * lines + progress bar), so the layout does not shift when the real rows
  * replace the skeletons.
+ *
+ * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
+ * is static, so an ``aria-live`` region would never announce anything
+ * (screen readers only announce *changes*).  The section's ``aria-busy``
+ * is the correct signal for "content is loading".
  */
 function LoadingState() {
   return (
-    <div className="flex flex-col gap-2" aria-busy="true" aria-live="polite">
+    <div className="flex flex-col gap-2" aria-busy="true">
       <span className="sr-only">Loading downloads…</span>
       {[0, 1, 2].map((index) => (
         <div

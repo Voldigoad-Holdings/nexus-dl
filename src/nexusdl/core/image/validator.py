@@ -58,7 +58,7 @@ Three entry points, one shared result type:
 Design invariants
 -----------------
 * **No hidden I/O** — :func:`validate_bytes` never touches the filesystem;
-  :func:`validate_file` does exactly one ``stat`` and one ``read_bytes``.
+  :func:`validate_file` does exactly one ``stat`` and one bounded read.
 * **No cross-layer imports** — only :mod:`nexusdl.core.exceptions`,
   :mod:`loguru`, and Pillow. No ``parsers/``, ``plugins/``, or
   ``interfaces/`` dependency (PROMPT MASTER rule R1).
@@ -405,6 +405,14 @@ def validate_bytes(
     except Image.DecompressionBombError as exc:
         _log.debug("Rejected image: decompression bomb ({})", exc)
         return _invalid(f"image is too large to process safely: {exc}")
+    except Image.DecompressionBombWarning as exc:
+        # Pillow raises this as a warning under default filters, but a
+        # caller configured with ``warnings.simplefilter("error")`` (pytest
+        # ``-W error``, strict production setups) makes it an exception.
+        # The invariant is "never raises for an invalid image", so treat it
+        # as a rejection too.
+        _log.debug("Rejected image: decompression bomb warning ({})", exc)
+        return _invalid(f"image is too large to process safely: {exc}")
     except UnidentifiedImageError:
         _log.debug("Rejected image: Pillow could not identify the format")
         return _invalid(
@@ -414,6 +422,27 @@ def validate_bytes(
     except (OSError, SyntaxError) as exc:
         _log.debug("Rejected image: decode/verify failed ({})", exc)
         return _invalid(f"image data is truncated or corrupted: {exc}")
+    except (MemoryError, RecursionError):
+        # Resource exhaustion must never be re-interpreted as an image
+        # rejection — the caller (worker) needs to see it and abort the
+        # chapter. Re-raise untouched.
+        raise
+    except Exception as exc:
+        # Pillow occasionally surfaces structured errors as
+        # ``struct.error`` / ``ValueError`` / ``KeyError`` depending on
+        # format and version. The contract says "never raises for an
+        # invalid image", so treat anything else as a rejection. Logged
+        # at WARNING because it may indicate a Pillow version drift worth
+        # investigating.
+        _log.warning(
+            "Unexpected error during image validation ({}: {}); "
+            "treating as invalid",
+            type(exc).__name__,
+            exc,
+        )
+        return _invalid(
+            f"image could not be validated: {type(exc).__name__}: {exc}"
+        )
 
 
 def validate_file(
@@ -423,11 +452,13 @@ def validate_file(
 ) -> ValidationResult:
     """Validate the image file at *path* and return the outcome.
 
-    Performs a single ``stat`` (for size bounds), a single ``read_bytes``
-    (bounded by :attr:`ValidationLimits.max_file_size_bytes`), then delegates
-    to :func:`validate_bytes`. The returned :class:`ValidationResult` always
-    carries ``path=path`` so callers can correlate the outcome with the file
-    they asked about.
+    Performs a single ``stat`` (for size bounds) followed by a **bounded**
+    read: :func:`read` is asked for at most
+    ``limits.max_file_size_bytes + 1`` bytes, so a file that grew between
+    the ``stat`` and the read cannot consume unbounded memory. The read
+    result is then delegated to :func:`validate_bytes`. The returned
+    :class:`ValidationResult` always carries ``path=path`` so callers can
+    correlate the outcome with the file they asked about.
 
     Never raises for an invalid file — the rejection reason is reported in
     the returned :class:`ValidationResult`.
@@ -442,12 +473,11 @@ def validate_file(
     """
     lim = limits if limits is not None else DEFAULT_LIMITS
 
-    if not path.is_file():
-        _log.debug("Rejected image: path does not exist: {}", path)
-        return _invalid(f"file does not exist: {path}", path=path)
-
     try:
         size = path.stat().st_size
+    except FileNotFoundError:
+        _log.debug("Rejected image: path does not exist: {}", path)
+        return _invalid(f"file does not exist: {path}", path=path)
     except OSError as exc:
         _log.debug("Rejected image: cannot stat {}: {}", path, exc)
         return _invalid(f"cannot stat file {path}: {exc}", path=path)
@@ -481,10 +511,32 @@ def validate_file(
         )
 
     try:
-        data = path.read_bytes()
+        with path.open("rb") as fh:
+            # Read at most ``max_file_size_bytes + 1`` so we can detect a
+            # file that grew since ``stat`` and reject it without
+            # allocating unbounded memory.
+            data = fh.read(lim.max_file_size_bytes + 1)
     except OSError as exc:
         _log.debug("Rejected image: cannot read {}: {}", path, exc)
         return _invalid(f"cannot read file {path}: {exc}", path=path)
+
+    if len(data) > lim.max_file_size_bytes:
+        # The file grew between ``stat`` and ``read``, or ``stat`` reported
+        # a stale size (network filesystem, concurrent writer). Reject at
+        # the cap rather than processing a partial payload.
+        _log.debug(
+            "Rejected image: read {} bytes > maximum {} bytes after stat "
+            "reported {} (path={})",
+            len(data),
+            lim.max_file_size_bytes,
+            size,
+            path,
+        )
+        return _invalid(
+            f"file grew past maximum size while reading "
+            f"({lim.max_file_size_bytes} bytes)",
+            path=path,
+        )
 
     result = validate_bytes(data, limits=lim)
     if result.path is not None:
@@ -547,6 +599,12 @@ def _looks_like_html(data: bytes) -> bool:
     :data:`_HTML_SNIFF_BYTES` bytes, then checks whether the result starts
     with ``<``. No supported image format begins with that byte, so the test
     has no false positives against legitimate images.
+
+    UTF-16 / UTF-32 payloads are not detected here; they fall through to
+    Pillow, which rejects them as unrecognised images with a less specific
+    (but still correct) error message. Detecting them would add ~50 lines of
+    BOM handling for a case that is rare in practice and already covered by
+    the final rejection.
 
     Args:
         data: Raw bytes to inspect.

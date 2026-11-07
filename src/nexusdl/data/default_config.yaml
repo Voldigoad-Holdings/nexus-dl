@@ -46,6 +46,10 @@ app:
   #: Enable telemetry? (always false in NexusDL — no tracking).
   telemetry: false
 
+  #: Frontend URL for CORS (overridden by NEXUSDL_FRONTEND_URL).
+  #: Also read from env by `main.py::_get_frontend_url`. Set via .env in prod.
+  frontend_url: null
+
 
 # ────────────────────────────────────────────────────────────────────
 # HTTP
@@ -53,15 +57,6 @@ app:
 http:
   #: Timeout per request (seconds).
   timeout_seconds: 30.0
-
-  #: Max retries (tenacity) for failed requests.
-  max_retries: 3
-
-  #: Retry backoff base (seconds, exponential).
-  retry_backoff_seconds: 2.0
-
-  #: Retry jitter ratio (0.0 to 1.0).
-  retry_jitter_ratio: 0.2
 
   #: Follow redirects?
   follow_redirects: true
@@ -115,17 +110,13 @@ session:
   #: Enable circuit breaker (per site).
   circuit_breaker_enabled: true
 
-  #: Circuit breaker: failures before OPEN.
+  #: Circuit breaker: consecutive failures before OPEN.
+  #: Matches `circuit_breaker.py::DEFAULT_FAILURE_THRESHOLD`.
   circuit_breaker_threshold: 5
 
   #: Circuit breaker: seconds before HALF_OPEN.
-  circuit_breaker_timeout_seconds: 60
-
-  #: Cookie auto-refresh (for Cloudflare sites).
-  cookie_auto_refresh: true
-
-  #: Cookie refresh interval (minutes).
-  cookie_refresh_interval_minutes: 30
+  #: Matches `circuit_breaker.py::DEFAULT_RECOVERY_TIMEOUT` (30.0).
+  circuit_breaker_timeout_seconds: 30
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -181,7 +172,12 @@ logging:
 # CONTENT
 # ────────────────────────────────────────────────────────────────────
 content:
-  #: Allow violent/gore content (default: true).
+  #: **Required** by `sites.py::_policy_allows_adult` and
+  #: `search.py::_policy_allows_adult`. When `false`, any request that
+  #: sets `include_adult=true` is rejected with 403.
+  allow_adult: true
+
+  #: Allow violent/gore content (informational; no code reads it yet).
   allow_violent: true
 
   #: Strict content filter (whitelist genres).
@@ -222,11 +218,11 @@ downloader:
   #: Max retry attempts per page.
   retry_max_attempts: 3
 
-  #: Retry backoff base (seconds).
-  retry_backoff_seconds: 2.0
+  #: Retry backoff base (seconds). Matches `utils/retry.py::_DEFAULT_INITIAL_DELAY`.
+  retry_backoff_seconds: 0.5
 
-  #: Retry jitter ratio.
-  retry_jitter_ratio: 0.2
+  #: Retry jitter ratio. Matches `utils/retry.py::_DEFAULT_JITTER_FACTOR`.
+  retry_jitter_ratio: 0.1
 
   #: Resume partial downloads (.part files).
   resume_partial: true
@@ -237,16 +233,16 @@ downloader:
 # ────────────────────────────────────────────────────────────────────
 packaging:
   #: ZIP compression level (0-9, 6 = default).
+  #: Matches `zip_packager.py::DEFAULT_COMPRESSION_LEVEL`.
   zip_compression_level: 6
 
-  #: 7z compression level (0-9, 7 = default).
-  cb7_compression_level: 7
+  #: 7z compression level (0-9, 6 = default).
+  #: Matches `cb7_packager.py::DEFAULT_COMPRESSION_LEVEL`.
+  cb7_compression_level: 6
 
-  #: PDF compression: lossless | jpeg | webp.
+  #: PDF is lossless by design — `pdf_packager.py` does not support
+  #: re-compression or quality knobs. This field is informational only.
   pdf_compression: lossless
-
-  #: PDF image quality (1-100, if lossy).
-  pdf_image_quality: 85
 
   #: Include ComicInfo.xml (recommended).
   include_comic_info_xml: true
@@ -301,6 +297,7 @@ playwright:
   headless: true
 
   #: Max concurrent browser contexts.
+  #: Matches `playwright_pool.py::DEFAULT_MAX_CONTEXTS`.
   max_contexts: 4
 
   #: Context timeout (seconds).
@@ -318,10 +315,10 @@ playwright:
   #: Block fonts.
   block_fonts: true
 
-  #: Viewport width.
+  #: Viewport dimensions. `playwright_pool.py::DEFAULT_VIEWPORT` uses
+  #: (1920, 1080); the shipped default here matches a portrait ebook
+  #: layout, which is a common choice for manga readers.
   viewport_width: 1280
-
-  #: Viewport height.
   viewport_height: 1920
 
   #: User-Agent (null = rotate from user_agents.txt).
@@ -338,17 +335,15 @@ playwright:
 # FLARESOLVERR (alternative to Playwright for Cloudflare)
 # ────────────────────────────────────────────────────────────────────
 flaresolverr:
-  #: Timeout per request (seconds).
-  timeout_seconds: 60
+  #: Endpoint (overridden by NEXUSDL_FLARESOLVERR_ENDPOINT).
+  endpoint: null
 
-  #: Max concurrent requests.
-  max_concurrent_requests: 2
+  #: Master switch.
+  enabled: false
 
-  #: Retry on failure.
-  retry_on_failure: true
-
-  #: Max retry attempts.
-  retry_max_attempts: 2
+  #: Timeout per request (milliseconds). Matches
+  #: `flaresolverr.py::DEFAULT_TIMEOUT_MS`.
+  timeout_ms: 60000
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -358,13 +353,21 @@ proxy:
   #: Enable proxy rotation.
   enabled: false
 
-  #: Rotation strategy: round_robin | random | least_used.
+  #: Single proxy URL (env: NEXUSDL_PROXY_URL). Prefer this over `urls`.
+  url: null
+
+  #: Proxy pool URLs (env: comma-separated NEXUSDL_PROXY_URLS).
+  urls: []
+
+  #: Rotation strategy: round_robin | random.
+  #: Matches `proxy_manager.py::RotationStrategy`.
   rotation_strategy: round_robin
 
   #: Health check interval (seconds).
   health_check_interval_seconds: 300
 
-  #: Max failures before removal.
+  #: Max consecutive failures before a proxy is benched.
+  #: Matches `proxy_manager.py::DEFAULT_FAILURE_THRESHOLD`.
   max_failures_before_removal: 3
 
   #: Timeout per request (seconds).
@@ -416,7 +419,8 @@ api:
   #: Bind port.
   port: 8000
 
-  #: Number of uvicorn workers (> 1 requires PostgreSQL).
+  #: Number of uvicorn workers. **Only** used by multi-worker launchers
+  #: (`uvicorn --workers`); the single-worker CLI ignores it.
   workers: 1
 
   #: Enable Swagger/ReDoc (NEVER true in prod).
@@ -437,6 +441,14 @@ api:
   #: Max request size (MB).
   max_request_size_mb: 100
 
+  #: Trust X-Forwarded-For (must be behind a trusted reverse proxy).
+  #: Read by `main.py::create_app` → `RateLimitConfig`.
+  trust_forwarded_for: false
+
+  #: Comma-separated list of trusted proxy IPs. Empty = trust all
+  #: forwarders (only safe when `trust_forwarded_for=true`).
+  trusted_proxies: []
+
 
 # ────────────────────────────────────────────────────────────────────
 # WEBSOCKET
@@ -445,20 +457,20 @@ websocket:
   #: Enable WebSocket.
   enabled: true
 
-  #: Server ping interval (seconds).
-  ping_interval_seconds: 30
+  #: Server heartbeat interval (seconds). Must match
+  #: `websocket.py::DEFAULT_HEARTBEAT_INTERVAL_S`.
+  heartbeat_interval_s: 25.0
 
-  #: Client ping timeout (seconds).
-  ping_timeout_seconds: 10
+  #: Client heartbeat timeout (seconds). Must be greater than
+  #: `heartbeat_interval_s`. Matches `websocket.py::DEFAULT_HEARTBEAT_TIMEOUT_S`.
+  heartbeat_timeout_s: 60.0
 
-  #: Max concurrent connections.
-  max_connections: 100
+  #: Max concurrent connections. Matches `websocket.py::DEFAULT_MAX_CONNECTIONS`.
+  max_connections: 2000
 
-  #: Max message size (KB).
-  max_message_size_kb: 1024
-
-  #: Progress update throttle (Hz).
-  progress_throttle_hz: 10
+  #: Per-connection outgoing queue size. Matches
+  #: `websocket.py::DEFAULT_QUEUE_SIZE`.
+  queue_size: 256
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -560,21 +572,3 @@ performance:
 
 
 # ────────────────────────────────────────────────────────────────────
-# DEVELOPMENT
-# ────────────────────────────────────────────────────────────────────
-#: ⚠️  Ignored in prod (app.environment=prod).
-development:
-  #: Reload on file change.
-  reload_on_change: true
-
-  #: Enable profiler.
-  profile_enabled: false
-
-  #: Mock network (use fixtures).
-  mock_network: false
-
-  #: Enable debug endpoints (/api/v1/_debug/*).
-  debug_endpoints: false
-
-  #: Seed DB on startup with fake mangas.
-  seed_db_on_startup: false

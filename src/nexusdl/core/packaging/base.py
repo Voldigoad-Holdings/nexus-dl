@@ -1,6 +1,6 @@
 """Abstract base class for chapter packagers.
 
-Every concrete packager — FOLDER, ZIP, CBZ, CB7, PDF — subclasses
+Every concrete packager — FOLDER, ZIP, CBZ, CB7, PDF, CBT — subclasses
 :class:`BasePackager` and implements a single coroutine, :meth:`package`.
 The ABC defines the contract those subclasses must satisfy and gives the
 :class:`~nexusdl.core.packaging.factory.PackagerFactory` a single type to
@@ -32,6 +32,12 @@ factory both call through it, so a signature drift in any subclass fails
 at ``mypy --strict`` time in the subclass's own file — not silently at
 runtime in the worker.
 
+**``format`` must be a real attribute, not just an annotation.** A
+subclass that writes only ``format: ClassVar[PackagingFormat]`` (an
+annotation) and forgets the ``= PackagingFormat.X`` assignment is
+rejected by :meth:`__init_subclass__` at class-definition time — see
+the "Enforcement of ``format``" section below.
+
 What the contract guarantees to the caller
 ------------------------------------------
 * **Return value** — on success, ``package`` returns ``output``
@@ -47,15 +53,16 @@ What the contract guarantees to the caller
   temp-dir-plus-swap).
 * **Extension validation** — each packager checks that ``output``'s
   extension matches its format (``.zip``, ``.cbz``, ``.cb7``, ``.pdf``,
-  or no suffix for ``FOLDER``). A caller that mixes up ``fmt`` and
-  ``output`` gets a clear error before any file is written.
+  ``.cbt``, or no suffix for ``FOLDER``). A caller that mixes up ``fmt``
+  and ``output`` gets a clear error before any file is written.
 * **Metadata handling** — ``metadata`` is honoured by the packagers
-  whose format supports it (CBZ, CB7, FOLDER, PDF); ignored by ZIP. The
-  packager documents which is which in its own docstring.
+  whose format supports it (CBZ, CB7, CBT, FOLDER, PDF); ignored by
+  ZIP. The packager documents which is which in its own docstring.
 * **Compression handling** — ``compression_level`` is honoured by ZIP
   (DEFLATE 0-9, 0=STORED) and CB7 (LZMA2 preset 0-9); ignored by PDF
-  (lossless by design) and FOLDER (images are already compressed). The
-  ABC does not dictate semantics — each subclass documents them.
+  (lossless by design), FOLDER (images are already compressed), and CBT
+  (TAR is uncompressed by design). The ABC does not dictate semantics —
+  each subclass documents them.
 
 What the contract does **not** require
 --------------------------------------
@@ -79,8 +86,9 @@ Enforcement of ``format``
 -------------------------
 :meth:`__init_subclass__` runs for every subclass and validates that:
 
-* :attr:`format` is defined (either on the subclass or inherited from an
-  ancestor that already passed this check),
+* :attr:`format` is a **real attribute** on the subclass (not just a
+  ``ClassVar`` annotation — annotations do not create attributes at
+  runtime, so ``hasattr`` correctly returns ``False`` for them),
 * :attr:`format` is a :class:`~nexusdl.core.models.enums.PackagingFormat`
   member.
 
@@ -89,8 +97,8 @@ executes only when the module is imported, so a subclass that forgot to
 set ``format`` fails at import, not at the first ``package`` call.
 This is what makes the
 :data:`~nexusdl.core.packaging.factory._DEFAULT_REGISTRY` safe to trust:
-a typo in ``format = PackagingFormat.CBZ`` becomes an ``AttributeError``
-on the *module* import, not a wrong-format archive silently produced at
+a typo in ``format = PackagingFormat.CBZ`` becomes a ``TypeError`` on
+the *module* import, not a wrong-format archive silently produced at
 runtime.
 
 Dependency graph (no cycles)::
@@ -109,7 +117,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Final
+from typing import TYPE_CHECKING, ClassVar
 
 from nexusdl.core.models.enums import PackagingFormat
 
@@ -174,7 +182,8 @@ class BasePackager(ABC):
         if not hasattr(cls, "format"):
             raise TypeError(
                 f"{cls.__qualname__} must define a class-level "
-                f"`format` attribute of type PackagingFormat"
+                f"`format` attribute of type PackagingFormat "
+                f"(an annotation alone is not enough)"
             )
         if not isinstance(cls.format, PackagingFormat):
             raise TypeError(
@@ -200,8 +209,8 @@ class BasePackager(ABC):
         Concrete implementations are responsible for:
 
         * validating that *output* carries the extension expected by the
-          format (``.zip``, ``.cbz``, ``.cb7``, ``.pdf``, or none for
-          ``FOLDER``),
+          format (``.zip``, ``.cbz``, ``.cb7``, ``.cbt``, ``.pdf``, or
+          none for ``FOLDER``),
         * validating that every source file in *pages* exists,
         * rejecting duplicate entry names (two pages mapping to the same
           archive entry),
@@ -221,11 +230,11 @@ class BasePackager(ABC):
                 if it does not exist; an existing file is replaced
                 atomically.
             metadata: Optional chapter metadata. Formats that carry a
-                ``ComicInfo.xml`` (CBZ, CB7, FOLDER) embed it; PDF maps
-                a subset to document properties; ZIP ignores it.
+                ``ComicInfo.xml`` (CBZ, CB7, CBT, FOLDER) embed it; PDF
+                maps a subset to document properties; ZIP ignores it.
             compression_level: Optional compression setting. ZIP and
-                CB7 honour it; PDF and FOLDER ignore it. Semantics are
-                documented per packager.
+                CB7 honour it; PDF, FOLDER, and CBT ignore it. Semantics
+                are documented per packager.
 
         Returns:
             The path the packager actually produced, which for every

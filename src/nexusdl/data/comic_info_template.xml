@@ -3,9 +3,8 @@
   NexusDL — ComicInfo.xml template
   File: src/nexusdl/data/comic_info_template.xml
 
-  This is the Jinja2 template used by ComicInfo.to_xml() to generate
-  the standard ComicInfo.xml file. It follows the ComicRack / Anansi
-  Project specification, compatible with:
+  Jinja2 template for ComicInfo.xml, following the ComicRack / Anansi
+  Project specification. Compatible with:
 
       - Komga (https://komga.org)
       - Kavita (https://www.kavitareader.com)
@@ -13,95 +12,84 @@
       - YACReader (https://www.yacreader.com)
       - CDisplayEx (https://www.cdisplayex.com)
 
-  Placeholders (Jinja2 syntax):
-      {{ title }}         — Chapter title (required)
-      {{ series }}        — Manga title (required)
-      {{ number }}        — Chapter number as string (required)
-      {{ language_iso }}  — ISO 639-1 (required)
-      {{ page_count }}    — Number of pages (required)
-      {{ volume }}        — Volume number (optional)
-      {{ count }}         — Total chapter count (optional)
-      {{ writer }}        — Author (optional)
-      {{ penciller }}     — Artist (optional)
-      {{ inker }}         — Inker (optional)
-      {{ colorist }}      — Colorist (optional)
-      {{ letterer }}      — Letterer (optional)
-      {{ cover_artist }}  — Cover artist (optional)
-      {{ editor }}        — Editor (optional)
-      {{ publisher }}     — Publisher (optional)
-      {{ imprint }}       — Imprint (optional)
-      {{ summary }}       — Description (optional)
-      {{ year }}          — Year (optional)
-      {{ month }}         — Month (optional)
-      {{ day }}           — Day (optional)
-      {{ genres }}        — Comma-separated genres (optional)
-      {{ characters }}    — Comma-separated characters (optional)
-      {{ teams }}         — Comma-separated teams (optional)
-      {{ locations }}     — Comma-separated locations (optional)
-      {{ scan_information }} — Scan group / version (optional)
-      {{ web }}           — Source URL (optional)
-      {{ notes }}         — Free-form notes (optional)
-      {{ black_and_white }} — "Yes" or "No" (optional)
-      {{ manga }}         — "YesAndRightToLeft" or "No" (optional)
-      {{ pages }}         — List of page dicts with image_index, type (optional)
+  Contract
+  --------
+  This template is rendered by ``ComicInfo.to_xml()`` through a Jinja2
+  environment with ``autoescape=True`` (XML-safe escaping). Context
+  variables are the fields of :class:`nexusdl.core.packaging.comic_info.ComicInfo`;
+  optional scalars are ``None`` when absent, optional collections are
+  empty (``()``) when absent.
 
-  ⚠️  Optional fields are wrapped in {{#if ...}}...{{/if}} blocks.
-      Empty fields are omitted (not rendered as empty tags).
+  Escaping
+  --------
+  Jinja2's ``autoescape=True`` escapes ``&``, ``<``, ``>``, ``"``, and
+  ``'`` for text nodes; for attribute values, use ``|e`` explicitly
+  (Jinja2's HTML escaping is not XML-attribute-safe without it for
+  certain code points).
 
-  ⚠️  XML special characters (&, <, >, ", ') are auto-escaped
-      by the XML library — do NOT escape them in the template.
+  Field selection
+  ---------------
+  Every optional field is guarded with ``{% if var is not none %}``
+  (or ``{% if var %}`` for collections). Required fields (title, series,
+  number, language_iso, page_count) are always emitted.
+
+  Page entries
+  ------------
+  Each ``<Page>`` carries ``Image`` (filename), and — when available —
+  ``ImageSize``, ``ImageWidth``, ``ImageHeight``, ``Type``,
+  ``DoublePage``. The filename is :attr:`ComicInfoPage.image`, which is
+  the ``basename`` of the page's source file.
+
+  Maintenance
+  -----------
+  Keep this template in sync with :class:`ComicInfo` and
+  :class:`ComicInfoPage`. If you add a field to the model, add it here
+  and to the ``_SCALAR_FIELDS`` / ``_CSV_FIELDS`` tuples in
+  ``comic_info.py`` — the two are the source of truth for serialization.
 -->
 <ComicInfo>
-  <!-- ── Required fields ─────────────────────────────────────── -->
   <Title>{{ title }}</Title>
   <Series>{{ series }}</Series>
   <Number>{{ number }}</Number>
-  <LanguageISO>{{ language_iso }}</LanguageISO>
+  <Count>{% if count is not none %}{{ count }}{% endif %}</Count>
+  <Volume>{% if volume is not none %}{{ volume }}{% endif %}</Volume>
+  <AlternateSeries>{% if alternate_series is not none %}{{ alternate_series }}{% endif %}</AlternateSeries>
+  <AlternateNumber>{% if alternate_number is not none %}{{ alternate_number }}{% endif %}</AlternateNumber>
+  <AlternateCount>{% if alternate_count is not none %}{{ alternate_count }}{% endif %}</AlternateCount>
+  <Summary>{% if summary is not none %}{{ summary }}{% endif %}</Summary>
+  <Notes>{% if notes is not none %}{{ notes }}{% endif %}</Notes>
+  <Year>{% if year is not none %}{{ year }}{% endif %}</Year>
+  <Month>{% if month is not none %}{{ month }}{% endif %}</Month>
+  <Day>{% if day is not none %}{{ day }}{% endif %}</Day>
+  <Writer>{% if writer is not none %}{{ writer }}{% endif %}</Writer>
+  <Penciller>{% if penciller is not none %}{{ penciller }}{% endif %}</Penciller>
+  <Inker>{% if inker is not none %}{{ inker }}{% endif %}</Inker>
+  <Colorist>{% if colorist is not none %}{{ colorist }}{% endif %}</Colorist>
+  <Letterer>{% if letterer is not none %}{{ letterer }}{% endif %}</Letterer>
+  <CoverArtist>{% if cover_artist is not none %}{{ cover_artist }}{% endif %}</CoverArtist>
+  <Editor>{% if editor is not none %}{{ editor }}{% endif %}</Editor>
+  <Translator>{% if translator is not none %}{{ translator }}{% endif %}</Translator>
+  <Publisher>{% if publisher is not none %}{{ publisher }}{% endif %}</Publisher>
+  <Imprint>{% if imprint is not none %}{{ imprint }}{% endif %}</Imprint>
+  <Web>{% if web is not none %}{{ web }}{% endif %}</Web>
   <PageCount>{{ page_count }}</PageCount>
-
-  <!-- ── Optional: numbering ─────────────────────────────────── -->
-  {% if volume is not none %}<Volume>{{ volume }}</Volume>{% endif %}
-  {% if count is not none %}<Count>{{ count }}</Count>{% endif %}
-
-  <!-- ── Optional: credits ───────────────────────────────────── -->
-  {% if writer %}<Writer>{{ writer }}</Writer>{% endif %}
-  {% if penciller %}<Penciller>{{ penciller }}</Penciller>{% endif %}
-  {% if inker %}<Inker>{{ inker }}</Inker>{% endif %}
-  {% if colorist %}<Colorist>{{ colorist }}</Colorist>{% endif %}
-  {% if letterer %}<Letterer>{{ letterer }}</Letterer>{% endif %}
-  {% if cover_artist %}<CoverArtist>{{ cover_artist }}</CoverArtist>{% endif %}
-  {% if editor %}<Editor>{{ editor }}</Editor>{% endif %}
-  {% if publisher %}<Publisher>{{ publisher }}</Publisher>{% endif %}
-  {% if imprint %}<Imprint>{{ imprint }}</Imprint>{% endif %}
-
-  <!-- ── Optional: description ───────────────────────────────── -->
-  {% if summary %}<Summary>{{ summary }}</Summary>{% endif %}
-
-  <!-- ── Optional: dates ─────────────────────────────────────── -->
-  {% if year is not none %}<Year>{{ year }}</Year>{% endif %}
-  {% if month is not none %}<Month>{{ month }}</Month>{% endif %}
-  {% if day is not none %}<Day>{{ day }}</Day>{% endif %}
-
-  <!-- ── Optional: classification ────────────────────────────── -->
-  {% if genres %}<Genre>{{ genres }}</Genre>{% endif %}
-  {% if characters %}<Characters>{{ characters }}</Characters>{% endif %}
-  {% if teams %}<Teams>{{ teams }}</Teams>{% endif %}
-  {% if locations %}<Locations>{{ locations }}</Locations>{% endif %}
-  {% if scan_information %}<ScanInformation>{{ scan_information }}</ScanInformation>{% endif %}
-
-  <!-- ── Optional: source ────────────────────────────────────── -->
-  {% if web %}<Web>{{ web }}</Web>{% endif %}
-  {% if notes %}<Notes>{{ notes }}</Notes>{% endif %}
-
-  <!-- ── Optional: manga-specific ────────────────────────────── -->
-  {% if black_and_white is not none %}<BlackAndWhite>{{ black_and_white }}</BlackAndWhite>{% endif %}
-  {% if manga is not none %}<Manga>{{ manga }}</Manga>{% endif %}
-
-  <!-- ── Optional: page list (ComicRack) ─────────────────────── -->
+  <LanguageISO>{{ language_iso }}</LanguageISO>
+  <Format>{% if format is not none %}{{ format }}{% endif %}</Format>
+  <BlackAndWhite>{% if black_and_white is not none %}{{ black_and_white }}{% endif %}</BlackAndWhite>
+  <Manga>{% if manga is not none %}{{ manga }}{% endif %}</Manga>
+  <ScanInformation>{% if scan_information is not none %}{{ scan_information }}{% endif %}</ScanInformation>
+  <StoryArc>{% if story_arc is not none %}{{ story_arc }}{% endif %}</StoryArc>
+  <SeriesGroup>{% if series_group is not none %}{{ series_group }}{% endif %}</SeriesGroup>
+  <AgeRating>{% if age_rating is not none %}{{ age_rating }}{% endif %}</AgeRating>
+  {% if genres %}<Genre>{{ genres | join(', ') }}</Genre>{% endif %}
+  {% if tags %}<Tags>{{ tags | join(', ') }}</Tags>{% endif %}
+  {% if characters %}<Characters>{{ characters | join(', ') }}</Characters>{% endif %}
+  {% if teams %}<Teams>{{ teams | join(', ') }}</Teams>{% endif %}
+  {% if locations %}<Locations>{{ locations | join(', ') }}</Locations>{% endif %}
   {% if pages %}
   <Pages>
     {% for page in pages %}
-    <Page Image="{{ page.image_index }}"{% if page.type %} Type="{{ page.type }}"{% endif %} />
+    <Page Image="{{ page.image | e }}"{% if page.image_size is not none %} ImageSize="{{ page.image_size }}"{% endif %}{% if page.image_width is not none %} ImageWidth="{{ page.image_width }}"{% endif %}{% if page.image_height is not none %} ImageHeight="{{ page.image_height }}"{% endif %}{% if page.type is not none %} Type="{{ page.type | e }}"{% endif %}{% if page.double_page is not none %} DoublePage="{{ page.double_page | e }}"{% endif %} />
     {% endfor %}
   </Pages>
   {% endif %}

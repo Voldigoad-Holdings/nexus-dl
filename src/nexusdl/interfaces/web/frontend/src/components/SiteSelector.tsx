@@ -32,8 +32,13 @@
  * Orphan ids
  * ----------
  * ``value`` may contain ids not present in ``sites`` (e.g. a site disabled
- * after selection).  Those ids are preserved by every toggle, so the
- * caller controls whether to prune them.
+ * after selection).  Those ids are preserved by every **per-site toggle**
+ * and by "Select all visible", so the caller controls whether to prune
+ * them.  The "Clear" button is the deliberate exception: it resets
+ * ``value`` to the empty array, orphans included, because its purpose is
+ * to give the caller a clean slate.  A caller that wants to keep orphans
+ * while still offering a reset affordance should implement the reset
+ * itself with ``onChange(value.filter(id => sites.some(s => s.id === id)))``.
  *
  * Adult filtering
  * ---------------
@@ -43,15 +48,18 @@
  * Accessibility
  * -------------
  * * Each row is a ``<label>`` wrapping its ``<input type="checkbox">`` —
- *   the whole row is a click target, and the checkbox takes its accessible
- *   name from the label text.
+ *   the whole row is a click target.  The checkbox takes its accessible
+ *   name from an explicit ``aria-label`` carrying only the site name, not
+ *   from the label's concatenated text (which would otherwise include the
+ *   language tag and the health badge, producing an announcement like
+ *   "MangaDex en Healthy").
  * * Groups are ``role="group"`` with an ``<h3>`` heading linked via
  *   ``aria-labelledby``.
  * * The "N of M selected" counter is ``aria-live="polite"``.
  * * The search input has an explicit ``aria-label``.
  */
 import { Filter, Search, X } from "lucide-react";
-import { useId, useMemo, useState } from "react";
+import { useCallback, useId, useMemo, useState } from "react";
 
 import { cn } from "../lib/utils";
 import {
@@ -126,7 +134,7 @@ function HealthBadge({ health }: { health: SiteHealth }) {
         "font-medium ring-1 ring-inset",
         HEALTH_BADGE_CLASSES[tone],
       )}
-      aria-label={`Site health: ${HEALTH_LABELS[health]}`}
+      title={`Site health: ${HEALTH_LABELS[health]}`}
     >
       {HEALTH_LABELS[health]}
     </span>
@@ -163,6 +171,11 @@ function SiteRow({
         checked={selected}
         onChange={() => onToggle(site.id)}
         disabled={disabled}
+        // The label's concatenated text would otherwise include the
+        // language tag and the health badge ("MangaDex en Healthy").  An
+        // explicit ``aria-label`` keeps the accessible name as just the
+        // site name, which is what a screen-reader user is scanning for.
+        aria-label={site.name}
         className={cn(
           "h-4 w-4 shrink-0 cursor-pointer rounded accent-primary",
           "focus-visible:outline-none focus-visible:ring-2",
@@ -170,7 +183,15 @@ function SiteRow({
           "focus-visible:ring-offset-background",
         )}
       />
-      <span className="min-w-0 flex-1 truncate text-sm font-medium">
+      <span
+        className="min-w-0 flex-1 truncate text-sm font-medium"
+        // The visible text is intentionally *not* tied to the label via
+        // ``htmlFor`` — doing so would put the language tag and the health
+        // badge back into the accessible name.  The input's
+        // ``aria-label`` is the single source of truth for its name; this
+        // span is purely visual.
+        aria-hidden
+      >
         {site.name}
       </span>
       {showLanguageTag && (
@@ -180,6 +201,7 @@ function SiteRow({
             "bg-muted font-mono text-xs uppercase text-muted-foreground",
           )}
           title={LANGUAGE_LABELS[site.language]}
+          aria-hidden
         >
           {site.language}
         </span>
@@ -227,7 +249,9 @@ export function SiteSelector({
       filtered = filtered.filter((site) => {
         if (site.id.toLowerCase().includes(needle)) return true;
         if (site.name.toLowerCase().includes(needle)) return true;
-        const languageName = LANGUAGE_LABELS[site.language] ?? site.language;
+        // ``LANGUAGE_LABELS`` is exhaustive over ``Language``, so this
+        // lookup is never ``undefined`` — no ``??`` fallback is needed.
+        const languageName = LANGUAGE_LABELS[site.language];
         return languageName.toLowerCase().includes(needle);
       });
     }
@@ -275,23 +299,31 @@ export function SiteSelector({
     [visibleSites, groupBy],
   );
 
-  const toggleSite = (siteId: string): void => {
-    if (selectedSet.has(siteId)) onChange(value.filter((id) => id !== siteId));
-    else onChange([...value, siteId]);
-  };
+  // ``toggleSite`` is stable across renders for the same ``value`` array.
+  // Without ``useCallback``, every keystroke in the parent's search box
+  // would recreate the callback, which would (in a future ``memo`` pass)
+  // re-render every row.  Kept here for consistency with the rest of the
+  // component, even though ``SiteRow`` is not ``memo``-wrapped yet.
+  const toggleSite = useCallback(
+    (siteId: string): void => {
+      if (selectedSet.has(siteId)) onChange(value.filter((id) => id !== siteId));
+      else onChange([...value, siteId]);
+    },
+    [selectedSet, value, onChange],
+  );
 
-  const selectAllVisible = (): void => {
+  const selectAllVisible = useCallback((): void => {
     const merged = new Set<string>(value);
     for (const site of visibleSites) merged.add(site.id);
     onChange(Array.from(merged));
-  };
+  }, [value, visibleSites, onChange]);
 
-  const clearAll = (): void => onChange([]);
+  const clearAll = useCallback((): void => onChange([]), [onChange]);
 
-  const clearFilters = (): void => {
+  const clearFilters = useCallback((): void => {
     setSearchQuery("");
     setLanguageFilter("all");
-  };
+  }, []);
 
   const hasActiveFilter =
     searchQuery.trim().length > 0 || languageFilter !== "all";

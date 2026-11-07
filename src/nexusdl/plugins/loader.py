@@ -41,6 +41,10 @@ Design invariants
 * **Read-only paths** — plugin code lives in the plugin directory and is
   never written by the framework; mutable state goes under
   ``<data_root>/<plugin_name>/``, guaranteed to exist before ``on_load``.
+* **Idempotent load** — calling :meth:`PluginLoader.load_all` twice never
+  duplicates a plugin: an already-loaded name is skipped and recorded in
+  the report, so the dispatch snapshot always contains exactly one entry
+  per plugin name.
 
 This module is the only one that imports plugin ``plugin.py`` files. It is
 also the only one that mutates ``sys.modules`` for plugins.
@@ -319,6 +323,13 @@ class PluginLoader:
         Loading is additive: plugins already loaded are left untouched, and
         newly discovered plugins are appended to the dispatch snapshot.
 
+        **Idempotence.** A plugin whose name is already present in the
+        current dispatch snapshot is skipped and recorded in
+        ``report.skipped`` with the reason ``"already loaded"``. This
+        guarantees that the snapshot never contains two entries for the
+        same plugin name, even when ``load_all`` is called more than once
+        (e.g. after a hot-reload signal from an editor).
+
         Args:
             plugin_dirs: Roots to scan. Defaults to the roots passed to the
                 constructor.
@@ -349,6 +360,18 @@ class PluginLoader:
                     report.skipped[str(root)] = "directory does not exist"
                     continue
                 for plugin_dir in self._iter_plugin_dirs(root, report):
+                    # Idempotence guard: ``_load_one`` records the loaded
+                    # plugin name in ``report.loaded`` *after* it is
+                    # committed to ``self._loaded``. Comparing against
+                    # ``self._loaded`` here is the only place a duplicate
+                    # could otherwise slip in, so this is where the guard
+                    # belongs.
+                    already = any(
+                        p.name == plugin_dir.name for p in self._loaded
+                    )
+                    if already:
+                        report.skipped[plugin_dir.name] = "already loaded"
+                        continue
                     await self._load_one(plugin_dir, report, strict=strict)
         return report
 
@@ -606,6 +629,14 @@ class PluginLoader:
         (module purge + ``on_unload`` attempt) before the exception is
         re-raised.
 
+        The rollback path is guarded by ``except Exception`` rather than
+        ``except BaseException``: ``KeyboardInterrupt``, ``SystemExit`` and
+        ``asyncio.CancelledError`` are **not** ``Exception`` subclasses and
+        should not trigger a half-initialised ``on_unload`` attempt — those
+        three signals mean "stop now", not "clean up and retry". A plugin
+        whose ``on_load`` is cancelled is handled by the caller's
+        cancellation handler, not by the loader's rollback.
+
         Args:
             plugin_dir: Directory containing the plugin.
 
@@ -658,10 +689,16 @@ class PluginLoader:
                 data_dir,
             )
             instance.on_load(context)
-        except BaseException:
+        except Exception:
             # Roll back: give the (possibly half-initialized) plugin a
             # chance to clean up, then purge the module so a reload starts
             # from a clean slate.
+            #
+            # ``except Exception`` (not ``BaseException``): ``CancelledError``
+            # and the interpreter-shutdown signals must not trigger an
+            # ``on_unload`` that would slow down a cancellation request or
+            # crash during interpreter exit. Their cleanup path is handled
+            # by the caller's cancellation handler, not here.
             if instance is not None:
                 try:
                     instance.on_unload()

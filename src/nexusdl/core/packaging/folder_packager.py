@@ -40,7 +40,9 @@ therefore uses a two-step dance:
 1. If the target directory exists, rename it to a sibling backup name
    (``".<name>.old-<uuid>"``). The target no longer exists.
 2. Rename the freshly-built temporary directory to the target.
-3. Delete the backup. If deletion fails, a warning is logged and the
+3. ``fsync`` the target's parent directory so the rename itself is
+   durable across a crash.
+4. Delete the backup. If deletion fails, a warning is logged and the
    backup is left on disk — the target itself is intact, which is what
    matters.
 
@@ -246,13 +248,26 @@ class FolderPackager(BasePackager):
 
         output.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build into a sibling temp directory so the eventual rename is a
-        # same-filesystem operation.
-        with tempfile.TemporaryDirectory(
+        # We do **not** use ``tempfile.TemporaryDirectory`` here: after
+        # the atomic rename the temp directory becomes the output
+        # directory, and the context manager's ``__exit__`` would either
+        # raise ``FileNotFoundError`` (Python ≤ 3.9) or silently call
+        # ``rmtree(..., ignore_errors=True)`` on a path that no longer
+        # exists (3.10+). Neither behaviour is what we want, and neither
+        # is documented in the class. ``mkdtemp`` plus an explicit
+        # best-effort cleanup in ``finally`` gives us the same safety
+        # with no surprises.
+        raw_tmpdir = tempfile.mkdtemp(
             dir=output.parent,
             prefix=_TEMP_DIR_PREFIX_FMT.format(name=output.name),
-        ) as raw_tmpdir:
-            tmpdir = Path(raw_tmpdir)
+        )
+        tmpdir = Path(raw_tmpdir)
+        # Set as soon as the temp directory has been renamed onto
+        # ``output`` — the cleanup below must skip the ``rmtree`` in that
+        # case (there is nothing left to delete).
+        renamed = False
+
+        try:
             for page, src in sorted_pages:
                 dst = tmpdir / src.name
                 try:
@@ -265,10 +280,8 @@ class FolderPackager(BasePackager):
             if metadata is not None:
                 _write_comic_info(tmpdir, metadata)
 
-            # fsync the directory so its entries are durable before the
-            # rename makes it visible. Per-file fsync is deliberately
-            # skipped — the images are copies of files the worker already
-            # closed, and the OS will persist them normally.
+            # fsync the build directory so its entries are durable
+            # before the rename makes it visible.
             _fsync_directory(tmpdir)
 
             try:
@@ -277,10 +290,18 @@ class FolderPackager(BasePackager):
                 raise PackagingError(
                     f"cannot finalise directory {output}: {exc}"
                 ) from exc
-            # The TemporaryDirectory context manager will try to remove
-            # `tmpdir` on exit — but we just renamed it to `output`, so
-            # the cleanup becomes a no-op. This is intentional: the
-            # `output` directory must survive.
+            renamed = True
+
+            # ``fsync`` the parent directory so the rename itself is
+            # durable — a crash between the rename and the next
+            # directory flush can otherwise revert it.
+            _fsync_directory(output.parent)
+        finally:
+            if not renamed:
+                # Best-effort cleanup of the temp directory. A failure
+                # here (permissions, FS read-only) must not mask the
+                # exception the caller actually needs to see.
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
         _log.info(
             "Packaged folder: {} ({} pages{})",
@@ -333,34 +354,51 @@ def _fsync_directory(directory: Path) -> None:
     survive a crash immediately after the subsequent rename.
 
     Non-POSIX platforms (Windows) do not support opening a directory;
-    the operation is best-effort there and a failure is silently ignored
-    — the rename that follows is still the atomicity boundary, and
-    Windows's journaled filesystems provide the durability guarantee on
-    their own.
+    the operation is best-effort there and a failure is logged at
+    ``DEBUG`` — the rename that follows is still the atomicity boundary,
+    and Windows's journaled filesystems provide the durability guarantee
+    on their own.
 
     Args:
         directory: The directory to flush. Must exist.
     """
     try:
         fd = os.open(directory, os.O_RDONLY)
-    except (OSError, PermissionError):
+    except OSError:
+        # Windows (no directory fds), or a directory the caller lost
+        # access to. Log and move on — the subsequent rename is what
+        # matters for atomicity.
+        _log.debug(
+            "fsync_directory({}): cannot open directory", directory
+        )
         return
     try:
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as exc:
+        # Best-effort. A failed fsync does not invalidate the rename.
+        _log.debug(
+            "fsync_directory({}): fsync failed: {}", directory, exc
+        )
     finally:
-        os.close(fd)
+        # ``os.close`` can raise ``EBADF`` / ``EIO`` on a filesystem
+        # that failed mid-operation. The close is cleanup, not part of
+        # the caller's contract — surfacing its failure would violate
+        # the "best-effort" promise of this helper.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _atomic_replace_directory(tmpdir: Path, target: Path) -> None:
     """Atomically (as far as POSIX allows) replace *target* with *tmpdir*.
 
     If *target* does not exist, a single ``rename`` is used — genuinely
-    atomic. If *target* exists, it is renamed to a unique backup, the
-    new directory is renamed to *target*, and the backup is deleted. If
-    the second rename fails, the backup is restored so the previous
-    state is preserved.
+    atomic in the absence of a concurrent creator (the packager is the
+    only writer for a given output path in practice). If *target*
+    exists, it is renamed to a unique backup, the new directory is
+    renamed to *target*, and the backup is deleted. If the second rename
+    fails, the backup is restored so the previous state is preserved.
 
     Args:
         tmpdir: The freshly-built directory. It must exist and be
@@ -369,8 +407,11 @@ def _atomic_replace_directory(tmpdir: Path, target: Path) -> None:
 
     Raises:
         OSError: If any rename fails for a reason other than the target
-            already existing in the simple-rename case. This exception is
-            translated to :class:`PackagingError` by the caller.
+            already existing in the simple-rename case. If the restore
+            rename also fails, the raised exception names *both* failures
+            and the surviving backup path so the operator can recover
+            manually. This exception is translated to
+            :class:`PackagingError` by the caller.
     """
     if not target.exists():
         tmpdir.rename(target)
@@ -382,7 +423,7 @@ def _atomic_replace_directory(tmpdir: Path, target: Path) -> None:
     target.rename(backup)
     try:
         tmpdir.rename(target)
-    except OSError:
+    except OSError as rename_exc:
         # Restore the previous state before propagating.
         try:
             backup.rename(target)
@@ -394,6 +435,17 @@ def _atomic_replace_directory(tmpdir: Path, target: Path) -> None:
                 backup,
                 restore_exc,
             )
+            # Raise a combined error so the caller sees both the original
+            # rename failure and the failed rollback (with the surviving
+            # backup path). Without this, the caller only sees the
+            # rename failure and would not know that the target is now
+            # missing and a backup survives.
+            raise OSError(
+                f"cannot replace directory {target!s} and cannot "
+                f"restore previous state from backup at {backup!s}: "
+                f"rename failed with {rename_exc!r}; restore failed "
+                f"with {restore_exc!r}"
+            ) from rename_exc
         raise
     # The target is now correct. Deleting the backup is a cleanup step;
     # a failure here leaves a stray directory but does not affect the

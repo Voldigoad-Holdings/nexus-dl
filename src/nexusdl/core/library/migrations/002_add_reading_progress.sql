@@ -63,6 +63,17 @@
 --   one the user has reached, not the one they have just finished.
 --   Progress readers set ``page_index = 0`` when opening a chapter.
 --
+-- * **``page_index`` is bounded by ``chapters.page_count``** via
+--   ``BEFORE INSERT`` / ``BEFORE UPDATE`` triggers. A CHECK constraint
+--   cannot reference another table in SQLite, and enforcing the bound only
+--   in ``LibraryDatabase.set_reading_progress()`` would leave a gap for
+--   direct SQL callers and for future bulk imports. The bound is
+--   ``page_index < page_count`` for ``page_count > 0``; ``page_index = 0``
+--   is always allowed so a chapter that has not been downloaded yet can
+--   still be bookmarked. The trigger raises ``ABORT`` with a specific
+--   message, which ``LibraryDatabase`` translates into ``LibraryError``
+--   uniformly with FK violations.
+--
 -- * **Upsert semantics live in the application layer.** The
 --   ``PRIMARY KEY (manga_id)`` makes ``INSERT … ON CONFLICT(manga_id) DO
 --   UPDATE`` the natural shape for ``set_reading_progress``, but this
@@ -105,10 +116,16 @@ CREATE UNIQUE INDEX idx_chapters_manga_id_id ON chapters(manga_id, id);
 -- ``manga_id``, not to some unrelated manga.
 --
 -- The ``chapter_id`` index is *not* required by the foreign key — the
--- primary-key lookup on ``manga_id`` makes cascade scans O(1) — but is
+-- primary-key lookup on ``manga_id`` makes single-row reads O(1) — but is
 -- added for future queries of the form "which mangas have progress in
 -- this chapter" (e.g. a future "resume from this chapter across all
 -- mangas" feature, or a chapter-level sync endpoint).
+--
+-- The ``(manga_id, chapter_id)`` index supports the FK cascade from
+-- ``chapters``: without it, SQLite would fall back to scanning
+-- ``reading_progress`` on every chapter deletion (via the ``manga_id``
+-- prefix of the PK, then filtering on ``chapter_id`` — fine for one row
+-- per manga, but the composite index lets SQLite do a single seek).
 -- -----------------------------------------------------------------------------
 CREATE TABLE reading_progress (
     manga_id     TEXT    NOT NULL,
@@ -124,3 +141,67 @@ CREATE TABLE reading_progress (
 
 CREATE INDEX idx_reading_progress_chapter_id
     ON reading_progress(chapter_id);
+
+CREATE INDEX idx_reading_progress_manga_chapter
+    ON reading_progress(manga_id, chapter_id);
+
+
+-- -----------------------------------------------------------------------------
+-- page_index bound enforcement
+-- -----------------------------------------------------------------------------
+-- ``page_index`` must be strictly below ``chapters.page_count`` — except
+-- when ``page_count == 0`` (chapter not yet downloaded), in which case only
+-- ``page_index = 0`` is allowed. A CHECK constraint cannot reference
+-- another table in SQLite, and relying solely on
+-- ``LibraryDatabase.set_reading_progress()`` would leave a hole for direct
+-- SQL callers and future bulk imports.
+--
+-- Both triggers fire on the hot path (progress save, typically one click
+-- per user action) but the subquery runs against a PK-indexed lookup on
+-- ``chapters`` — negligible cost.
+--
+-- The parent lookup includes ``manga_id`` in addition to ``chapter_id`` so
+-- the FK-mandated composite is exercised directly and the check cannot
+-- accidentally validate against a chapter belonging to a different manga
+-- (the FK would reject that anyway, but ordering the check first yields a
+-- clearer error message than a raw ``FOREIGN KEY constraint failed``).
+-- -----------------------------------------------------------------------------
+CREATE TRIGGER reading_progress_validate_insert
+BEFORE INSERT ON reading_progress
+WHEN NEW.page_index > 0
+BEGIN
+    SELECT CASE
+        WHEN NEW.page_index >= COALESCE(
+            (
+                SELECT page_count FROM chapters
+                WHERE id = NEW.chapter_id
+                  AND manga_id = NEW.manga_id
+            ),
+            0
+        )
+        THEN RAISE(
+            ABORT,
+            'reading_progress.page_index exceeds chapter page_count'
+        )
+    END;
+END;
+
+CREATE TRIGGER reading_progress_validate_update
+BEFORE UPDATE OF page_index, chapter_id, manga_id ON reading_progress
+WHEN NEW.page_index > 0
+BEGIN
+    SELECT CASE
+        WHEN NEW.page_index >= COALESCE(
+            (
+                SELECT page_count FROM chapters
+                WHERE id = NEW.chapter_id
+                  AND manga_id = NEW.manga_id
+            ),
+            0
+        )
+        THEN RAISE(
+            ABORT,
+            'reading_progress.page_index exceeds chapter page_count'
+        )
+    END;
+END;

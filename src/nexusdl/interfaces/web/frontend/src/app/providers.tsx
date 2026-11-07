@@ -137,6 +137,7 @@ import type {
 import type {
   LibraryUpdatedPayload,
   SiteHealthChangedPayload,
+  SiteListResponse,
 } from "../types/manga";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -251,6 +252,38 @@ function normalizeTheme(
     return theme;
   }
   return "system";
+}
+
+/**
+ * Resolve a site id to its display name using the cached sites list.
+ *
+ * The WebSocket payloads (``site.health.changed``, ``download.completed``,
+ * ``download.failed``) carry only the site's ``site_id`` — the backend
+ * resolver that would add a ``site_name`` to those payloads is not yet part
+ * of the wire contract.  Rather than showing raw ids in user-facing
+ * toasts ("mangadex is down"), this helper reads the already-cached sites
+ * list and returns the human-readable name.  When the site is not in the
+ * cache (first load, race), the raw id is returned as a graceful fallback
+ * — a toast with the id is still better than no toast at all.
+ *
+ * A future iteration should add ``site_name`` to both payloads, at which
+ * point this helper becomes a no-op and can be removed.  The function is
+ * kept small and side-effect free so the removal is a single-call-site
+ * change.
+ */
+function resolveSiteName(
+  queryClient: QueryClient,
+  siteId: string,
+): string {
+  const cached = queryClient.getQueryData<SiteListResponse>(["sites"]);
+  if (cached !== undefined) {
+    for (const site of cached.items) {
+      if (site.id === siteId) {
+        return site.name;
+      }
+    }
+  }
+  return siteId;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -393,7 +426,8 @@ function ThemedToaster() {
  * * ``site.health.changed`` — invalidates the ``["sites"]`` query (so the
  *   site list badge refreshes) and shows a toast on down → up transitions
  *   (and up → down, but only once per transition — see the ``previous_health``
- *   guard).
+ *   guard).  The site id is resolved to its display name via the cached
+ *   sites list so the toast reads "MangaDex" rather than "mangadex".
  * * ``download.completed`` — a success toast with the manga title.  The
  *   title is read from the downloads store, which the hook's built-in
  *   wiring has already updated by the time this callback runs.
@@ -424,6 +458,12 @@ function WebSocketBridge() {
           const payload = event.payload as SiteHealthChangedPayload;
           void queryClient.invalidateQueries({ queryKey: ["sites"] });
 
+          // Resolve the display name from the cached sites list so the
+          // toast reads "MangaDex" rather than "mangadex".  A missing
+          // site (first load, race) falls back to the raw id, which is
+          // still better than no toast at all.
+          const siteName = resolveSiteName(queryClient, payload.site_id);
+
           // Only notify on transitions that the user can act on:
           //  * down → not down: site came back online (positive)
           //  * not down → down: site went down (negative)
@@ -435,12 +475,12 @@ function WebSocketBridge() {
             payload.current_health === "healthy" &&
             payload.previous_health !== "healthy"
           ) {
-            toast.success(`${payload.site_id} is back online`);
+            toast.success(`${siteName} is back online`);
           } else if (
             payload.current_health === "down" &&
             payload.previous_health !== "down"
           ) {
-            toast.error(`${payload.site_id} is down`);
+            toast.error(`${siteName} is down`);
           }
           break;
         }

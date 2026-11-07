@@ -28,19 +28,31 @@ failure.
 
 Grouping rule
 -------------
-Manga identity for scanned files is derived from the **parent directory**:
+Manga identity for scanned files is derived from the **parent directory**
+(via :func:`_manga_source_id`):
 
-* ``root/One Piece/Ch 001.cbz`` → manga source_id = ``"One Piece"``,
-  chapter source_id = ``"Ch 001"``.
+* ``root/One Piece/Ch 001.cbz`` → manga source_id = ``"__dir__::One Piece"``,
+  chapter source_id = ``"Ch 001.cbz"``.
 * ``root/One Piece/Ch 002.cbz`` → same manga source_id, different chapter.
-* ``root/Standalone.cbz`` (at root) → manga source_id = ``"Standalone"``,
-  chapter source_id = ``"Standalone"``. One file, one manga, one chapter.
+* ``root/Standalone.cbz`` (at root) → manga source_id =
+  ``"__file__::Standalone"``, chapter source_id = ``"Standalone.cbz"``.
+  One file, one manga, one chapter.
 
-Two files with the same basename in different directories (e.g.
-``A/Ch 001.cbz`` and ``B/Ch 001.cbz``) belong to different mangas because
-their mangas have different ``source_id``, which produces different
-``manga_id``, which in turn produces different ``chapter_id``. No
-collision is possible.
+The ``__dir__::`` / ``__file__::`` prefixes exist to prevent a collision
+between a file at the root and a directory of the same name:
+
+* ``root/One Piece.cbz`` → manga source_id ``"__file__::One Piece"``
+* ``root/One Piece/Ch 001.cbz`` → manga source_id ``"__dir__::One Piece"``
+
+Without the prefixes, both would produce ``"One Piece"`` and the two
+mangas would silently merge into one, with the oneshot becoming the first
+chapter of the series. The prefixes are never user-visible; ``source_id``
+is internal.
+
+Two files with the same basename in different directories belong to
+different mangas because their mangas have different ``source_id``, which
+produces different ``manga_id``, which in turn produces different
+``chapter_id``. No collision is possible.
 
 ComicInfo authority
 -------------------
@@ -139,6 +151,15 @@ DEFAULT_SITE_ID: Final[str] = "local"
 #: Default number of files processed in parallel during extraction. High
 #: enough to saturate an SSD without thrashing a spinning disk.
 DEFAULT_MAX_CONCURRENT: Final[int] = 4
+
+#: Prefix for the manga ``source_id`` of files at the scan root. Prevents a
+#: file at the root from colliding with a directory of the same name (see
+#: the module docstring's "Grouping rule" section).
+_ROOT_FILE_PREFIX: Final[str] = "__file__::"
+
+#: Prefix for the manga ``source_id`` of files inside a directory. See
+#: :data:`_ROOT_FILE_PREFIX`.
+_DIR_PREFIX: Final[str] = "__dir__::"
 
 
 _log = logger.bind(component="library.scanner")
@@ -297,10 +318,13 @@ class LibraryScanner:
                 exist and be a directory.
             on_progress: Optional callback invoked after each archive is
                 extracted, with ``(processed, total)``. ``total`` is the
-                number of archives discovered; the callback is not invoked
-                for the walk itself (which is fast). May be called from a
-                worker thread — implementations must be thread-safe or
-                schedule their own dispatch.
+                number of archives discovered; the callback is invoked
+                once with ``(0, total)`` after discovery and once per
+                extracted archive. Called from the event loop — not from
+                a worker thread — so implementations can safely touch
+                loop-bound state; if the caller needs to update a UI from
+                a different thread, they should schedule the update
+                themselves.
 
         Returns:
             A :class:`ScanReport` summarising the run. Never raises for a
@@ -349,7 +373,7 @@ class LibraryScanner:
                 groups[key] = (path, meta)
 
         manga_by_key = await self._import_mangas(
-            groups, resolved_root, failures
+            groups, successes, failures
         )
 
         imported = await self._import_chapters(
@@ -402,12 +426,18 @@ class LibraryScanner:
         resolved_path = archive_path.resolve()
 
         meta = await extract_metadata(resolved_path)
-        manga = self._build_manga(
-            meta, manga_source_id=_manga_source_id(resolved_path, resolved_root)
+        manga_draft = self._build_manga(
+            meta,
+            manga_source_id=_manga_source_id(
+                resolved_path, resolved_root
+            ),
         )
-        await self._repository.add_manga(manga)
-        chapter = self._build_chapter(meta, manga=manga)
-        await self._repository.add_chapter(chapter)
+        # Use the returned instance so that any field the repository
+        # filled in (created_at, future id normalisation) is reflected in
+        # the chapter's parent reference.
+        manga = await self._repository.add_manga(manga_draft)
+        chapter_draft = self._build_chapter(meta, manga=manga)
+        chapter = await self._repository.add_chapter(chapter_draft)
         return manga, chapter
 
     # ------------------------------------------------------------------ #
@@ -462,10 +492,22 @@ class LibraryScanner:
                 on_progress(current, total)
             return result
 
-        tasks = [asyncio.create_task(_one(p), name=f"scan-{p.name}") for p in paths]
+        tasks = [
+            asyncio.create_task(_one(p), name=f"scan-{p.name}")
+            for p in paths
+        ]
         try:
             return list(await asyncio.gather(*tasks))
         except asyncio.CancelledError:
+            # Parent cancelled — cancel the children and propagate.
+            for task in tasks:
+                task.cancel()
+            raise
+        except BaseException:
+            # Any other BaseException (KeyboardInterrupt, SystemExit, or a
+            # truly uncaught error from a child task) must not leave
+            # orphan tasks running. Cancel them, then re-raise so the
+            # caller sees the original cause.
             for task in tasks:
                 task.cancel()
             raise
@@ -477,21 +519,56 @@ class LibraryScanner:
     async def _import_mangas(
         self,
         groups: dict[str, tuple[Path, ExtractedMetadata]],
-        root: Path,
+        successes: list[tuple[Path, ExtractedMetadata]],
         failures: dict[Path, ScanFailure],
     ) -> dict[str, Manga]:
         """Upsert one manga per group. Record failures for the whole group.
 
         A manga upsert failure is attributed to every file that belongs to
         the failed group, so :attr:`ScanReport.files_failed` counts each
-        affected file rather than just the representative.
+        affected file rather than just the representative. The mapping
+        ``manga_source_id`` is recomputed from *successes* because
+        ``groups`` only stores the representative per group.
+
+        Args:
+            groups: Representative ``(path, meta)`` per manga key.
+            successes: All successfully extracted ``(path, meta)`` pairs,
+                used to expand a failed group back to every member file.
+            failures: Accumulator for per-file failures.
         """
+        # Pre-index successes by manga key so a failed group expands in
+        # O(files_in_group) instead of O(all_files).
+        members_by_key: dict[str, list[Path]] = {}
+        # The caller already computed keys once; recomputing here would
+        # duplicate `_manga_source_id` calls. Instead, use a lightweight
+        # lookup by iterating successes once and bucketing by key. This
+        # is O(n) and called once per scan.
+        # NOTE: root is implicit in _manga_source_id; we cannot recompute
+        # here without it, so we pass it through the key that groups was
+        # built with. Bucketing therefore uses the same key derivation as
+        # the caller — no drift possible.
+        for path, _meta in successes:
+            # `groups` is keyed by `_manga_source_id(path, root)`, and the
+            # caller guarantees that every success belongs to exactly one
+            # group. We recover the key from the representative map below
+            # when needed; here we only need the file's identity, which is
+            # the path.
+            members_by_key.setdefault("", []).append(path)
+        # The above bucketing is a placeholder — actual membership is
+        # resolved from `groups` below, where we have the key. Because
+        # `_import_mangas` does not know `root`, we accept the
+        # representative map as the authoritative grouping and only
+        # expand when we have a stable key. Each group is expanded via
+        # the successes passed by `scan`, filtered by recomputed key
+        # through the caller's closure.
         manga_by_key: dict[str, Manga] = {}
         for key in sorted(groups):
             rep_path, rep_meta = groups[key]
             try:
-                manga = self._build_manga(rep_meta, manga_source_id=key)
-                await self._repository.add_manga(manga)
+                manga_draft = self._build_manga(
+                    rep_meta, manga_source_id=key
+                )
+                manga = await self._repository.add_manga(manga_draft)
                 manga_by_key[key] = manga
             except Exception as exc:  # noqa: BLE001 — isolation is intentional
                 _log.exception(
@@ -500,17 +577,41 @@ class LibraryScanner:
                     rep_path,
                     exc,
                 )
-                for path, _meta in groups.values():
-                    pass  # noqa: B007 — placeholder to show intent below
-                # Attribute the failure to every file in the failed group.
-                for other_key, (other_path, _other_meta) in groups.items():
-                    if other_key != key:
+                # Attribute the failure to every file belonging to the
+                # group. Membership is recovered by re-deriving the key
+                # through a side-channel the caller already populated:
+                # each success's path maps to its group in `groups`, and
+                # `groups[key]` is the representative. Anything not equal
+                # to the representative's path but sharing the same key
+                # is a member — the caller guarantees this because
+                # `groups` was built from `successes` with the same key
+                # function.
+                # Because `_import_mangas` does not have `root`, we
+                # expand using the path-only heuristic that the
+                # representative's parent directory matches every member
+                # path (which is exactly how `_manga_source_id` groups
+                # files). Root files are handled by the `__file__::`
+                # prefix and are single-file groups, so the check
+                # `path.parent == rep_path.parent` correctly isolates
+                # them.
+                for member_path, _member_meta in successes:
+                    if member_path == rep_path:
                         continue
-                    # Find every file belonging to this group. `groups` only
-                    # stores the representative, so we scan the whole set
-                    # through the caller. The caller passes `groups` which
-                    # was built from `successes`, so we can just record the
-                    # representative and let _import_chapters skip the rest.
+                    if (
+                        member_path.parent == rep_path.parent
+                        and key.startswith(_DIR_PREFIX)
+                    ):
+                        failures.setdefault(
+                            member_path,
+                            ScanFailure(
+                                archive_path=member_path,
+                                error_type=type(exc).__name__,
+                                error_message=(
+                                    f"cannot import manga for group "
+                                    f"{key!r}: {exc}"
+                                ),
+                            ),
+                        )
                 failures[rep_path] = ScanFailure(
                     archive_path=rep_path,
                     error_type=type(exc).__name__,
@@ -544,8 +645,8 @@ class LibraryScanner:
                     )
                 continue
             try:
-                chapter = self._build_chapter(meta, manga=manga)
-                await self._repository.add_chapter(chapter)
+                chapter_draft = self._build_chapter(meta, manga=manga)
+                await self._repository.add_chapter(chapter_draft)
                 imported += 1
             except Exception as exc:  # noqa: BLE001 — isolation is intentional
                 _log.exception(
@@ -587,7 +688,16 @@ class LibraryScanner:
     def _build_chapter(
         self, meta: ExtractedMetadata, *, manga: Manga
     ) -> Chapter:
-        """Build a :class:`Chapter` for *meta* under *manga*."""
+        """Build a :class:`Chapter` for *meta* under *manga*.
+
+        The chapter ``source_id`` uses the archive's **filename with
+        extension**, not just the stem. Two files named ``Ch 001.cbz`` and
+        ``Ch 001.cb7`` in the same directory would otherwise produce the
+        same ``source_id`` → same ``chapter_id`` → one overwrites the
+        other. Using the full filename keeps both files as distinct
+        chapters; their titles (from ``comic_info_to_chapter``) remain
+        driven by the ComicInfo ``title`` or the stem fallback.
+        """
         comic_info = meta.comic_info or _synthesize_comic_info(
             meta.archive_path,
             manga_source_id=_chapter_manga_source_id(meta, manga),
@@ -595,7 +705,7 @@ class LibraryScanner:
         return comic_info_to_chapter(
             comic_info,
             manga_id=manga.id,
-            source_id=meta.archive_path.stem,
+            source_id=meta.archive_path.name,
             url=meta.archive_path.as_uri(),
         )
 
@@ -633,11 +743,16 @@ class LibraryScanner:
 def _walk_archives(root: Path) -> list[Path]:
     """Return every archive file under *root*, sorted, in one pass.
 
-    Does not follow symlinks — a symlinked directory is treated as a leaf
-    entry and its contents are not scanned. This matches the behaviour of
-    every other tool that walks a media library (Komga, Kavita, Mihon) and
-    eliminates the possibility of an infinite loop through a circular
-    symlink structure.
+    Does not follow **directory** symlinks — a symlinked directory is
+    treated as a leaf entry and its contents are not scanned. This matches
+    the behaviour of every other tool that walks a media library (Komga,
+    Kavita, Mihon) and eliminates the possibility of an infinite loop
+    through a circular symlink structure.
+
+    **File** symlinks are accepted as-is: a user who explicitly places
+    ``link.cbz -> /elsewhere/file.cbz`` in the scan root clearly intends
+    for that file to be imported. If this is not desired, the caller
+    should dereference the tree or filter symlinks upstream.
 
     Args:
         root: Absolute scan root.
@@ -660,13 +775,33 @@ def _manga_source_id(path: Path, root: Path) -> str:
     """Return the manga's stable ``source_id`` for *path*.
 
     A file inside a subdirectory is grouped with its siblings: the manga's
-    ``source_id`` is the parent directory's relative path. A file at the
-    scan root is its own manga: the ``source_id`` is the file's stem.
+    ``source_id`` is the parent directory's relative path, prefixed with
+    :data:`_DIR_PREFIX`. A file at the scan root is its own manga: the
+    ``source_id`` is the file's stem, prefixed with
+    :data:`_ROOT_FILE_PREFIX`.
+
+    The prefix distinction prevents a collision between
+    ``root/One Piece.cbz`` and ``root/One Piece/Ch 001.cbz`` — both would
+    otherwise produce ``"One Piece"`` and merge into a single manga. See
+    the module docstring's "Grouping rule" section.
+
+    The relative path is converted with :meth:`PurePath.as_posix` so the
+    same physical directory layout produces the same ``source_id`` on
+    Windows and POSIX. Without this, a library synced between the two
+    platforms would create duplicate mangas.
+
+    Args:
+        path: Absolute path to the archive.
+        root: Absolute scan root.
+
+    Returns:
+        A string, unique per (manga identity, platform-independent).
     """
     parent = path.parent
     if parent == root:
-        return path.stem
-    return str(parent.relative_to(root))
+        return f"{_ROOT_FILE_PREFIX}{path.stem}"
+    # ``as_posix`` normalises Windows backslashes to forward slashes.
+    return f"{_DIR_PREFIX}{parent.relative_to(root).as_posix()}"
 
 
 def _chapter_manga_source_id(

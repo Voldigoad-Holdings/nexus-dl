@@ -22,7 +22,9 @@ What `download()` guarantees
 * **Atomic** — the destination is either the previous file or the complete
   new one. A crash or a validation failure leaves the destination
   untouched.
-* **Clean** — the temporary file is always removed, success or failure.
+* **Clean** — the temporary file is always removed, success or failure. A
+  failure to remove the temporary file is logged but never masks the
+  original error.
 * **Validated** — the returned :class:`ValidationResult` has
   ``is_valid=True``; any invalid payload raises
   :class:`~nexusdl.core.exceptions.ImageValidationError` before the rename.
@@ -74,6 +76,7 @@ narrow structural contract — this module never imports the concrete class.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -179,7 +182,10 @@ class ImageDownloadResult:
             :attr:`optimization` is not ``None`` and
             ``optimization.was_optimized`` is ``True``, this is
             ``optimization.optimized_size``; otherwise it is the original
-            downloaded size.
+            downloaded size. The value is captured from a ``stat`` on the
+            temporary file *before* the atomic rename, so it is available
+            even if the destination is modified by an external process
+            immediately after the rename.
         validation: The :class:`~nexusdl.core.image.validator.ValidationResult`
             from validating the downloaded bytes. ``is_valid`` is
             guaranteed ``True``, and ``path`` has been updated from the
@@ -189,7 +195,9 @@ class ImageDownloadResult:
             optimization was requested, or ``None`` when it was not.
             ``optimization.error`` is not ``None`` when optimization was
             attempted but failed — the download still succeeded with the
-            original bytes, and the warning is available here.
+            original bytes **unless a later step (notably the atomic rename)
+            failed**, in which case the exception propagates and this
+            result is never returned.
     """
 
     url: str
@@ -305,6 +313,21 @@ class ImageDownloader:
                         optimization_result.error,
                     )
 
+            # Capture the size *before* the rename, so a concurrent
+            # modification of the destination (external process, antivirus
+            # quarantine, NFS cache) cannot make the result inconsistent
+            # with the bytes we actually produced.
+            try:
+                bytes_written = os.stat(temp).st_size
+            except OSError as exc:
+                # The temp file disappeared between validation and publish.
+                # This should not happen under the worker's ownership of
+                # its own temp_dir, but propagate rather than report a
+                # phantom success.
+                raise OSError(
+                    f"temporary file {temp} disappeared before publish: {exc}"
+                ) from exc
+
             # Atomic publish. From this point on, `temp` no longer exists.
             temp.replace(dest)
 
@@ -321,13 +344,22 @@ class ImageDownloader:
             return ImageDownloadResult(
                 url=url,
                 path=dest,
-                bytes_written=dest.stat().st_size,
+                bytes_written=bytes_written,
                 validation=validation,
                 optimization=optimization_result,
             )
         finally:
             # No-op after a successful rename; cleans up on any failure.
-            temp.unlink(missing_ok=True)
+            # ``unlink`` failures are logged but never mask the original
+            # exception (which is either propagating out of the ``try``
+            # or, on the success path, irrelevant since the operation
+            # already completed).
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError as exc:
+                _log.warning(
+                    "Could not remove temporary file {}: {}", temp, exc
+                )
 
     async def download_bytes(
         self, url: str

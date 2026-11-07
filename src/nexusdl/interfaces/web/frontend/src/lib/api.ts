@@ -37,6 +37,11 @@
  * redirect to login.  The client never retries more than once, so there is
  * no risk of an infinite loop if the backend is misbehaving.
  *
+ * If the retried request still returns ``401`` — a refresh that succeeded
+ * server-side but produced a token the resource still rejects — the client
+ * surfaces ``UNAUTHORIZED`` rather than the generic ``INTERNAL_ERROR``.
+ * This preserves the "session expired" semantics end-to-end.
+ *
  * Errors
  * ------
  * Every failure — transport, HTTP, parse, network — is normalised into a
@@ -208,6 +213,12 @@ export function isKnownErrorCode(value: unknown): value is ApiErrorCode {
  * a form that can be correlated with the backend's log, and the ``details``
  * field carries structured data specific to the failure (e.g. a field name
  * for ``VALIDATION_ERROR``, a site id for ``SITE_UNAVAILABLE``).
+ *
+ * ``cause`` is stored on the instance directly when the running engine
+ * does not support ``ErrorOptions.cause`` (Node < 16.9, Safari < 15).  The
+ * assignment is harmless when the option is supported too: the option's
+ * value and the explicit assignment produce the same property.  This keeps
+ * the class usable from tests that run on older runtimes.
  */
 export class NexusApiError extends Error {
   /** The standard or raw backend error code. */
@@ -218,6 +229,8 @@ export class NexusApiError extends Error {
   public readonly details: Record<string, unknown>;
   /** Server-side request id, or ``null`` when not available. */
   public readonly request_id: string | null;
+  /** The original exception, when the error originated below the HTTP layer. */
+  public override readonly cause: unknown;
 
   constructor(
     message: string,
@@ -229,12 +242,13 @@ export class NexusApiError extends Error {
       cause?: unknown;
     },
   ) {
-    super(message, { cause: options.cause });
+    super(message);
     this.name = "NexusApiError";
     this.code = options.code;
     this.status = options.status;
     this.details = options.details ?? {};
     this.request_id = options.request_id ?? null;
+    this.cause = options.cause;
   }
 }
 
@@ -570,10 +584,23 @@ function defaultGetRefreshToken(): string | null {
  *
  * Used as the default ``onTokenRefreshed`` handler.  The auth store will
  * override this with an implementation that also updates in-memory state.
+ *
+ * Returns ``true`` when the tokens were written, ``false`` when the
+ * ``localStorage`` write failed (privacy mode, quota exceeded, storage
+ * disabled for the site).  **A ``false`` return does not mean the login
+ * failed** — the credentials are valid and the access token is still
+ * usable in memory for the current page session.  Callers that want to
+ * surface "your session will not survive a reload" to the user can branch
+ * on this boolean; callers that do not care can ignore it.
+ *
+ * The previous version of this function returned ``void`` and silently
+ * swallowed storage failures — which made the ``try/catch`` around it in
+ * the login page a no-op.  The boolean return restores the ability for
+ * the caller to react.
  */
-export function persistAuthTokens(response: AuthResponse): void {
+export function persistAuthTokens(response: AuthResponse): boolean {
   if (typeof window === "undefined") {
-    return;
+    return false;
   }
   try {
     window.localStorage.setItem(ACCESS_TOKEN_STORAGE_KEY, response.access_token);
@@ -581,9 +608,9 @@ export function persistAuthTokens(response: AuthResponse): void {
       REFRESH_TOKEN_STORAGE_KEY,
       response.refresh_token,
     );
+    return true;
   } catch {
-    // Ignore — the tokens still work for the current page session; a
-    // subsequent reload will simply lose the session.
+    return false;
   }
 }
 
@@ -675,6 +702,31 @@ function parseErrorEnvelope(
       : {};
   const request_id = typeof e.request_id === "string" ? e.request_id : null;
   return { code, message, details, request_id };
+}
+
+/**
+ * Map an HTTP status to a fallback :data:`ApiErrorCode`.
+ *
+ * Used when the response body has no parseable error envelope.  Keeping
+ * the mapping in one place means the raw-401-still-becomes-UNAUTHORIZED
+ * invariant is enforced uniformly rather than being spelled out at every
+ * call site.
+ */
+function statusToFallbackCode(status: number): string {
+  switch (status) {
+    case 401:
+      return "UNAUTHORIZED";
+    case 403:
+      return "FORBIDDEN";
+    case 404:
+      return "NOT_FOUND";
+    case 422:
+      return "VALIDATION_ERROR";
+    case 429:
+      return "RATE_LIMIT_EXCEEDED";
+    default:
+      return "INTERNAL_ERROR";
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1098,7 +1150,9 @@ export class NexusApiClient {
    *  4. On ``401`` (and when ``skipRefresh`` is false), attempt a
    *     single-flight refresh and retry **once**.
    *  5. On any other non-2xx status, parse the error envelope and throw
-   *     :class:`NexusApiError`.
+   *     :class:`NexusApiError`.  A 401 with no parseable envelope maps to
+   *     ``UNAUTHORIZED`` regardless of ``skipRefresh``, so a raw status
+   *     never leaks as ``INTERNAL_ERROR``.
    *  6. On success, parse the JSON body (or return ``undefined`` for
    *     ``204 No Content``).
    */
@@ -1174,11 +1228,15 @@ export class NexusApiClient {
             envelope.request_id ?? response.headers.get("X-Request-ID"),
         });
       }
-      // No parseable envelope — fall back to the status text.
+      // No parseable envelope — fall back to the status text, but still
+      // map the status to a semantic code so that a raw 401 or 403 does
+      // not surface as ``INTERNAL_ERROR`` to the caller.  This matters
+      // for ``skipRefresh`` calls (auth endpoints, health probes) where
+      // the caller legitimately wants to react to the underlying status.
       throw new NexusApiError(
         `HTTP ${response.status} ${response.statusText || "error"}`,
         {
-          code: "INTERNAL_ERROR",
+          code: statusToFallbackCode(response.status),
           status: response.status,
           request_id: response.headers.get("X-Request-ID"),
         },
@@ -1291,15 +1349,25 @@ export class NexusApiClient {
    * persisted via ``onTokenRefreshed``), ``false`` on failure.  Never
    * throws — the caller decides what to do with the failure (typically:
    * propagate a 401).
+   *
+   * The in-flight promise is stored in ``_refreshPromise`` so that
+   * concurrent 401s reuse it, and reset in a ``finally`` so that a future
+   * refresh attempt starts from a clean slate — including when
+   * ``_doRefresh`` were ever changed to reject.
    */
   private _tryRefresh(): Promise<boolean> {
     if (this._refreshPromise !== null) {
       return this._refreshPromise;
     }
-    this._refreshPromise = this._doRefresh();
-    return this._refreshPromise.finally(() => {
-      this._refreshPromise = null;
+    const promise = this._doRefresh().finally(() => {
+      // Reset only if we are still the owning attempt.  A nested call
+      // that started before us finished must not clear our slot.
+      if (this._refreshPromise === promise) {
+        this._refreshPromise = null;
+      }
     });
+    this._refreshPromise = promise;
+    return promise;
   }
 
   private async _doRefresh(): Promise<boolean> {
@@ -1309,7 +1377,16 @@ export class NexusApiClient {
     }
     try {
       const response = await this.refresh({ refresh_token: refreshToken });
-      this._onTokenRefreshed(response);
+      // ``onTokenRefreshed`` is a user-supplied callback.  A callback that
+      // throws must not turn a successful refresh into a session failure
+      // — the new token is already valid server-side, and the caller is
+      // better served by continuing with it than by being logged out.
+      try {
+        this._onTokenRefreshed(response);
+      } catch (callbackErr) {
+        // eslint-disable-next-line no-console
+        console.error("onTokenRefreshed threw:", callbackErr);
+      }
       return true;
     } catch {
       return false;
@@ -1361,6 +1438,15 @@ export function getApiClient(
 ): NexusApiClient {
   if (_singleton === null) {
     _singleton = new NexusApiClient(options ?? {});
+  } else if (options !== undefined) {
+    // Documented behaviour is "ignores options", but a silent ignore is a
+    // debugging trap: warn so a developer who expected reconfiguration
+    // sees the reason it did not happen.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "getApiClient: singleton already initialised; options were ignored. " +
+        "Call resetApiClient() first if you need a differently configured client.",
+    );
   }
   return _singleton;
 }
@@ -1384,5 +1470,13 @@ export function resetApiClient(): void {
  * ``getApiClient().getManga(id)``.  The instance is constructed lazily
  * (the constructor performs no I/O), so importing this module in an SSR
  * context is safe.
+ *
+ * **Test note.**  Because this export is evaluated at module load, a test
+ * that wants to inject a custom ``fetchImpl`` must ``resetApiClient()``
+ * **before** the first import of this module.  Tests that import it
+ * indirectly (via another module) should call ``resetApiClient()`` in a
+ * ``beforeEach`` and use ``getApiClient(customOptions)`` afterwards,
+ * ignoring the pre-built ``api`` export.  The eager export exists for
+ * ergonomics in application code, not for test configurability.
  */
 export const api: NexusApiClient = getApiClient();

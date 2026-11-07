@@ -35,6 +35,21 @@ instantiation). The loader therefore performs an explicit structural check
 errors. Static conformance is enforced by ``mypy --strict`` on each plugin
 author's code.
 
+Why ``name`` and ``version`` are ``ClassVar``
+---------------------------------------------
+Both attributes are declared ``ClassVar[str]`` because they are class-level
+constants, not instance state:
+
+* The loader's discovery step (:func:`_find_plugin_class`) inspects the
+  class *before* instantiation — ``hasattr(plugin_cls, "name")`` must be
+  ``True``. A plugin that assigns ``self.name = "…"`` in ``__init__``
+  fails discovery, and ``ClassVar`` is what makes that failure visible to
+  ``mypy --strict`` at the plugin author's code, not just at runtime.
+* The contract says the values are immutable — they must match the
+  manifest, and the manifest is validated once. Instance-level mutation
+  would break the loader's assumption that a plugin's identity cannot
+  change after ``on_load``.
+
 See :mod:`nexusdl.plugins.hooks` for the canonical list of hook names and
 their sync/async flavour. This module does not duplicate that information;
 it only declares the two mandatory hook signatures.
@@ -43,7 +58,7 @@ it only declares the two mandatory hook signatures.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -107,7 +122,11 @@ class PluginContext:
             Plugins that perform network I/O reuse this session rather than
             opening their own client, so shared rate limiting, caching,
             circuit breaking, and cookie management all apply to their
-            requests too.
+            requests too. **A plugin that declares network dependencies in
+            its manifest should check this field is not ``None`` at the top
+            of ``on_load`` and raise a clear error if it is** — a
+            ``NoneType`` ``AttributeError`` deep inside a request is much
+            harder to diagnose than an explicit ``PluginError`` at startup.
     """
 
     logger: Logger
@@ -170,13 +189,17 @@ class NexusPlugin(Protocol):
         name: Plugin identifier, matching ``^[a-z][a-z0-9_-]*$`` and the
             ``name:`` field of the manifest. The loader cross-checks both
             values; a mismatch aborts the load with
-            :class:`~nexusdl.core.exceptions.PluginError`.
+            :class:`~nexusdl.core.exceptions.PluginError`. Declared
+            ``ClassVar`` because the loader inspects the **class** before
+            instantiation — a plugin whose ``name`` is only set in
+            ``__init__`` fails discovery.
         version: Plugin version, matching the ``version:`` field of the
-            manifest. Cross-checked the same way.
+            manifest. Cross-checked the same way. Declared ``ClassVar`` for
+            the same reason as :attr:`name`.
     """
 
-    name: str
-    version: str
+    name: ClassVar[str]
+    version: ClassVar[str]
 
     def on_load(self, context: PluginContext) -> None:
         """Receive the plugin context and initialize state.

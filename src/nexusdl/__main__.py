@@ -97,13 +97,14 @@ corresponding ``NEXUSDL_*`` env vars, which
 :class:`nexusdl.core.config.Settings` reads at construction time:
 
     nexusdl web --host 0.0.0.0      → NEXUSDL_API_HOST=0.0.0.0
+    nexusdl web --host=0.0.0.0      → NEXUSDL_API_HOST=0.0.0.0
     nexusdl web --port 9000         → NEXUSDL_API_PORT=9000
+    nexusdl web --port=9000         → NEXUSDL_API_PORT=9000
 
 Translated flags are **consumed** — they are removed from the argv
 forwarded to the web launcher, so the launcher only sees its own
-arguments.  (Before this change they were forwarded but harmlessly
-ignored; the fix makes the behaviour explicit and keeps the launcher's
-argv clean.)
+arguments.  Both ``--flag value`` and ``--flag=value`` forms are
+supported (uvicorn itself accepts both, and users mix them freely).
 
 Two common uvicorn flags are **not** supported by this launcher because
 they require the ``uvicorn --factory`` invocation form:
@@ -160,7 +161,8 @@ _RESERVED: Final[frozenset[str]] = frozenset(_DISPATCH.keys())
 #: ``nexusdl web`` flag → env var translations.  Applied **before** the
 #: web launcher runs so that ``Settings()`` (constructed inside
 #: ``main()``) sees the overrides.  Translated flags are **consumed** (not
-#: forwarded to the launcher).
+#: forwarded to the launcher).  Both ``--flag value`` and ``--flag=value``
+#: forms are recognised; see :func:`_consume_web_flags`.
 _WEB_FLAG_TO_ENV: Final[dict[str, str]] = {
     "--host": "NEXUSDL_API_HOST",
     "--port": "NEXUSDL_API_PORT",
@@ -197,6 +199,16 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = list(argv if argv is not None else sys.argv[1:])
 
+    # Snapshot ``os.environ`` so that :func:`_consume_web_flags` mutations
+    # (which translate ``--host`` / ``--port`` into ``NEXUSDL_API_*`` env
+    # vars) are undone when ``main`` returns.  Without this snapshot, a
+    # host that calls ``main`` twice in the same process (test runners,
+    # REPL exploration, chained dispatch) inherits the first call's env
+    # overrides in the second.  Restoration is best-effort: keys that did
+    # not exist before are deleted, keys that existed are restored to
+    # their prior value.
+    _env_snapshot = dict(os.environ)
+
     try:
         return _dispatch(args)
     except KeyboardInterrupt:
@@ -218,6 +230,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         sys.stderr.write(f"{code}\n")
         return 1
+    finally:
+        # Restore the environment snapshot.  ``finally`` guarantees this
+        # even on SystemExit / KeyboardInterrupt / BrokenPipeError.
+        _restore_env(_env_snapshot)
 
 
 # ===========================================================================
@@ -286,7 +302,7 @@ def _run_module(dotted: str, *, argv: list[str], prog: str) -> int:
     transitive dependency is missing" is preserved in the error
     reporting: a missing module points the operator at the dispatch
     table; a missing transitive dep points at the ``[extra]`` install
-    hint.  See :func:`_report_missing_extra`.
+    hint.  See :func:`_report_missing_import`.
 
     Args:
         dotted: Dotted module path to run as ``__main__``.
@@ -306,38 +322,89 @@ def _run_module(dotted: str, *, argv: list[str], prog: str) -> int:
         # Strategy 1 — import and call ``main()`` if present.
         try:
             module = importlib.import_module(dotted)
-        except ModuleNotFoundError as exc:
-            # ``exc.name == dotted`` → the module itself is missing.
-            # ``exc.name`` anything else → a transitive dep is missing.
-            return _report_missing_extra(dotted, exc)
+        except ImportError as exc:
+            # ``ImportError`` (broader than ``ModuleNotFoundError``) is
+            # caught here on purpose: a partially-initialised module or
+            # a missing symbol also deserves the ``[extra]`` hint
+            # rather than a raw traceback for a user-facing command.
+            return _report_missing_import(dotted, exc)
 
         main_fn = getattr(module, "main", None)
         if callable(main_fn):
-            code = main_fn()
-            return 0 if code is None else int(code)
+            return _coerce_exit_code(main_fn())
 
         # Strategy 2 — fall back to running the module as ``__main__``
         # so its ``if __name__ == "__main__":`` block executes.
         try:
             runpy.run_module(dotted, run_name="__main__", alter_sys=False)
             return 0
-        except ModuleNotFoundError as exc:
-            return _report_missing_extra(dotted, exc)
+        except ImportError as exc:
+            return _report_missing_import(dotted, exc)
     finally:
         # ``finally`` guarantees restoration even on SystemExit /
         # KeyboardInterrupt — no leaked global state across dispatches.
         sys.argv = old_argv
 
 
+def _coerce_exit_code(result: object) -> int:
+    """Normalise whatever a sub-interface's ``main()`` returned into an int.
+
+    * ``None`` → ``0`` (conventional success).
+    * ``int`` → returned as-is.
+    * ``str`` → treated as an error message: printed to stderr, exit ``1``.
+      This matches the Python convention for ``sys.exit("message")`` and
+      is what several sub-interfaces use for user-facing failures.
+    * Anything else → ``ValueError`` (surfaced as an internal error;
+      we do not silently coerce unknown types to ``0`` or ``1``).
+    """
+    if result is None:
+        return 0
+    if isinstance(result, int):
+        return result
+    if isinstance(result, str):
+        sys.stderr.write(f"{result}\n")
+        return 1
+    raise ValueError(
+        f"sub-interface main() returned {type(result).__name__!r}, "
+        f"expected None, int, or str"
+    )
+
+
+def _restore_env(snapshot: dict[str, str]) -> None:
+    """Restore ``os.environ`` to ``snapshot``.
+
+    Keys present in ``snapshot`` are restored to their prior value; keys
+    absent from ``snapshot`` but present in ``os.environ`` (added since)
+    are deleted.  Best-effort — if restoring raises (which should not
+    happen for the plain string→string mapping ``os.environ`` is), the
+    exception is swallowed rather than masking the exit code.
+    """
+    try:
+        # Delete new keys.
+        for key in list(os.environ.keys()):
+            if key not in snapshot:
+                del os.environ[key]
+        # Restore prior values.
+        for key, value in snapshot.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
+    except Exception:
+        # Restoration is best-effort; do not mask the actual exit code.
+        pass
+
+
 def _consume_web_flags(args: list[str]) -> list[str]:
     """Translate web flags into env vars and remove them from ``args``.
 
-    Returns a **new** list with ``--host <addr>`` and ``--port <n>``
+    Returns a **new** list with ``--host <addr>`` / ``--port <n>``
     consumed (translated into ``NEXUSDL_API_HOST`` / ``NEXUSDL_API_PORT``
-    and removed from the returned argv).  Unsupported flags
-    (``--reload``, ``--workers``) are also removed and reported via a
-    hint on stderr — the current web launcher reads from ``Settings``,
-    so they cannot take effect through it.
+    and removed from the returned argv).  Both ``--flag value`` and
+    ``--flag=value`` forms are recognised — uvicorn accepts both and
+    users mix them freely.
+
+    Unsupported flags (``--reload``, ``--workers``) are also removed and
+    reported via a hint on stderr — the current web launcher reads from
+    ``Settings``, so they cannot take effect through it.
 
     Other flags are passed through untouched, which matches the previous
     behaviour: the web launcher ignores unknown flags by design.
@@ -347,25 +414,49 @@ def _consume_web_flags(args: list[str]) -> list[str]:
 
     i = 0
     while i < len(args):
-        flag = args[i]
-        target_env = _WEB_FLAG_TO_ENV.get(flag)
+        arg = args[i]
 
-        if target_env is not None and i + 1 < len(args):
+        # ``--flag=value`` form.  Check before the space-separated form
+        # because a user can send ``--port=9000 --host=127.0.0.1`` and
+        # the space form must not consume the ``=`` payload.
+        flag_eq, sep, value_eq = arg.partition("=")
+        if sep and flag_eq in _WEB_FLAG_TO_ENV:
+            target_env = _WEB_FLAG_TO_ENV[flag_eq]
+            if not value_eq:
+                sys.stderr.write(
+                    f"nexusdl web: {flag_eq} requires a value "
+                    f"(e.g. `{flag_eq}=...`).\n"
+                )
+                return out  # stop parsing, error already reported
+            os.environ[target_env] = value_eq
+            i += 1
+            continue
+
+        # ``--flag value`` form.
+        target_env = _WEB_FLAG_TO_ENV.get(arg)
+        if target_env is not None:
+            if i + 1 >= len(args):
+                sys.stderr.write(
+                    f"nexusdl web: {arg} requires a value "
+                    f"(e.g. `{arg} <value>`).\n"
+                )
+                return out  # stop parsing, error already reported
             os.environ[target_env] = args[i + 1]
             i += 2
             continue
 
-        if flag in _WEB_UNSUPPORTED_FLAGS:
-            unsupported.append(flag)
+        # Unsupported flags.
+        if arg in _WEB_UNSUPPORTED_FLAGS:
+            unsupported.append(arg)
             # Also drop the next token if it looks like the flag's value
             # (``--workers 4`` → drop ``4``; ``--reload`` → no value).
-            if flag == "--workers" and i + 1 < len(args):
+            if arg == "--workers" and i + 1 < len(args):
                 i += 2
             else:
                 i += 1
             continue
 
-        out.append(flag)
+        out.append(arg)
         i += 1
 
     if unsupported:
@@ -427,6 +518,7 @@ Global options:
 Web flags:
     --host <addr>             Bind address (default: 0.0.0.0).
     --port <n>                Bind port (default: 8000).
+    Both `--flag value` and `--flag=value` forms are accepted.
 
 For multi-worker production deployments, use uvicorn directly:
 
@@ -454,7 +546,7 @@ Documentation:
 # Error reporting
 # ===========================================================================
 
-def _report_missing_extra(dotted: str, exc: ModuleNotFoundError) -> int:
+def _report_missing_import(dotted: str, exc: ImportError) -> int:
     """Report a missing module or missing transitive dependency.
 
     Two cases, two messages — the distinction matters because the fix is
@@ -468,7 +560,11 @@ def _report_missing_extra(dotted: str, exc: ModuleNotFoundError) -> int:
       module exists but imports something that is not installed.  The
       hint points at the relevant ``[extra]``.
     """
-    if exc.name == dotted:
+    # ``ImportError`` subclasses carry a ``name`` attribute; a bare
+    # ``ImportError`` from ``from X import Y`` has ``name == "X"`` and
+    # ``exc.name != dotted`` — the [extra] hint still applies.
+    exc_name = getattr(exc, "name", None)
+    if exc_name == dotted:
         sys.stderr.write(
             f"\nnexusdl: cannot start {dotted!r} — the module does not "
             f"exist in the installed tree.\n"

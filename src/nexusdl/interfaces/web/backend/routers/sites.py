@@ -28,12 +28,13 @@ three lines, no other file changes.
 """
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, NoReturn
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import ConfigDict, Field
 
 from nexusdl.core.models.enums import Language, UserRole
+from nexusdl.core.models.site import SiteConfig
 
 from ..dependencies import CurrentUser, ServicesDep
 from ..schemas.common import QueryParams
@@ -61,8 +62,12 @@ class SiteListQueryParams(QueryParams):
     * ``include_adult`` — per-request opt-in / opt-out:
         - ``None`` (default): use the server policy (``allow_adult``).
         - ``false``: filter adult sites out, even if the server allows them.
-        - ``true``: opt in — only honored when the server policy allows it,
-          otherwise the request is rejected with 403 (see the router).
+        - ``true``: opt in — **only when the server policy allows it**.
+          If the server policy forbids adult content and the caller
+          still requests ``include_adult=true``, the request is rejected
+          with **403** (see :func:`_resolve_include_adult`). This is a
+          deliberate loud failure: silently downgrading to ``false``
+          would let a misconfigured client hide its own bug.
     * ``include_disabled`` — admin-only. Non-admin callers get the normal
       (enabled) list even if they pass ``true``. Admin callers can see
       disabled sites to re-enable them from settings.
@@ -81,9 +86,11 @@ class SiteListQueryParams(QueryParams):
     )
     include_adult: bool | None = Field(
         default=None,
-        description="``null`` = server policy. ``false`` = hide adult "
-                    "sites. ``true`` = include adult sites (only honored "
-                    "if the server policy permits it).",
+        description=(
+            "``null`` = server policy. ``false`` = hide adult sites. "
+            "``true`` = include adult sites — **rejected with 403** "
+            "when the server policy forbids adult content."
+        ),
     )
     include_disabled: bool = Field(
         default=False,
@@ -251,7 +258,7 @@ async def _get_visible_site(
     site_id: str,
     payload: CurrentUser,
     services: ServicesDep,
-) -> object:
+) -> SiteConfig:
     """Return the site if the caller is allowed to see it, else 404.
 
     Combines three visibility rules:
@@ -263,6 +270,15 @@ async def _get_visible_site(
     A single 404 is raised for **all** rejection reasons — the caller
     cannot distinguish "does not exist" from "not authorized", which
     prevents enumeration of adult or disabled sites.
+
+    Defensive ``getattr(site, "<field>", default)`` accesses are used for
+    ``adult`` and ``disabled`` because not every registry implementation
+    is guaranteed to expose them as first-class attributes (``adult`` is
+    documented on ``SiteConfig``, ``disabled`` is derived from
+    ``sites.yaml`` and may or may not be materialised on the object). A
+    missing attribute is treated as ``False`` — the permissive default
+    that matches the current registry contract where a site is visible
+    unless explicitly flagged.
     """
     site = await services.registry.get_site(site_id)
     if site is None:
@@ -284,8 +300,15 @@ async def _get_visible_site(
     return site
 
 
-def _raise_not_found(site_id: str) -> None:
-    """Raise the standard 404 for a hidden or missing site."""
+def _raise_not_found(site_id: str) -> NoReturn:
+    """Raise the standard 404 for a hidden or missing site.
+
+    Declared ``NoReturn`` so callers relying on the raise (e.g.
+    :func:`_get_visible_site`) get proper type narrowing under
+    ``mypy --strict`` — without this, the ``site`` variable would stay
+    ``SiteConfig | None`` after the ``if site is None`` guard, and any
+    downstream ``site.attr`` access would be flagged.
+    """
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=error_response(

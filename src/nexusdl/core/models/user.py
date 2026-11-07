@@ -41,11 +41,14 @@ Model invariants
 ----------------
 :meth:`__post_init__` enforces the invariants that the database schema
 already enforces (matching ``CHECK`` constraints and ``NOT NULL`` columns)
-plus two semantic invariants (``created_at <= updated_at`` and tz-aware
-timestamps) that catch integration bugs at construction time rather than
-at serialisation time. Every check is cheap; every check is worth the
-trouble because a ``User`` with a malformed field is far more expensive
-to debug later in the pipeline.
+plus three semantic invariants (``created_at <= updated_at``,
+``last_login_at >= created_at``, tz-aware timestamps) that catch
+integration bugs at construction time rather than at serialisation time.
+
+The timestamp checks tolerate a small forward/backward clock skew
+(:data:`_MAX_CLOCK_SKEW_SECONDS`) because real deployments import
+:class:`User` rows from other systems and occasionally suffer NTP drift.
+A skew beyond the tolerance is a real inconsistency and is rejected.
 
 Dependency graph (no cycles)::
 
@@ -61,7 +64,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
 from nexusdl.core.models.enums import UserRole
@@ -85,6 +88,12 @@ _REDACTED_HASH: Final[str] = "***"
 #: same numeric literal here makes the correspondence obvious to a reader
 #: comparing model and schema.
 _UUID_STRING_LENGTH: Final[int] = 36
+
+#: Tolerance applied to timestamp-ordering checks. Real deployments import
+#: users from other systems and occasionally suffer NTP drift; a couple of
+#: seconds of skew is not a data-integrity bug. Anything beyond this
+#: threshold means the row is genuinely inconsistent.
+_MAX_CLOCK_SKEW_SECONDS: Final[int] = 5
 
 
 def _utcnow() -> datetime:
@@ -132,18 +141,21 @@ class User:
             :meth:`to_public_dict` when serialising, never ``vars()`` or
             ``asdict()``, both of which expose this field.
         role: The user's role, from :class:`~nexusdl.core.models.enums.UserRole`.
-            :attr:`UserRole.GUEST` is reserved for anonymous requests and
-            is never expected in a persisted row; :attr:`UserRole.USER` is
-            the default for newly-registered accounts.
+            The model does not restrict which roles may be persisted — that
+            policy belongs to the repository / auth layer. In particular,
+            :attr:`UserRole.GUEST` is typically used for anonymous requests
+            that are never persisted, but the model does not enforce it.
         is_active: Whether the account can authenticate. Deactivating a
             user (``is_active=False``) preserves the row and its history;
             deleting it is a separate operation.
         created_at: Timezone-aware UTC timestamp of account creation.
         updated_at: Timezone-aware UTC timestamp of the most recent change
-            to any mutable field. Must be ``>= created_at``.
+            to any mutable field. Must be ``>= created_at`` (tolerating
+            :data:`_MAX_CLOCK_SKEW_SECONDS`).
         last_login_at: Timezone-aware UTC timestamp of the most recent
             successful login, or ``None`` for an account that has never
-            logged in.
+            logged in. Must be ``>= created_at`` when present (tolerating
+            :data:`_MAX_CLOCK_SKEW_SECONDS`).
     """
 
     id: str
@@ -162,17 +174,20 @@ class User:
     def __post_init__(self) -> None:
         """Validate field types and cross-field invariants.
 
-        Two categories of check:
+        Three categories of check:
 
         * **Type checks** — reject a string where an enum is expected, an
           ``int`` where a ``bool`` is expected, a naive ``datetime`` where
           a tz-aware one is required. These catch integration bugs at the
           boundary between the persistence layer and the domain.
         * **Value checks** — reject empty required strings, an id of the
-          wrong length, and ``created_at > updated_at``. These mirror the
+          wrong length, and inverted timestamps. These mirror the
           schema's ``CHECK`` and ``NOT NULL`` constraints so a malformed
           :class:`User` can never reach a repository that would otherwise
           raise an opaque ``IntegrityError``.
+        * **Semantic ordering** — ``created_at <= updated_at`` and
+          ``last_login_at >= created_at``, both tolerating a small clock
+          skew (see :data:`_MAX_CLOCK_SKEW_SECONDS`).
 
         Raises:
             TypeError: If a field has the wrong Python type (e.g.
@@ -230,9 +245,11 @@ class User:
                 raise ValueError(
                     f"User.{field_name} must be timezone-aware"
                 )
-        if self.created_at > self.updated_at:
+        skew = timedelta(seconds=_MAX_CLOCK_SKEW_SECONDS)
+        if self.updated_at + skew < self.created_at:
             raise ValueError(
-                "User.created_at must be <= User.updated_at "
+                "User.created_at must be <= User.updated_at (tolerating "
+                f"{_MAX_CLOCK_SKEW_SECONDS}s clock skew) "
                 f"({self.created_at.isoformat()} > "
                 f"{self.updated_at.isoformat()})"
             )
@@ -245,6 +262,13 @@ class User:
             if self.last_login_at.tzinfo is None:
                 raise ValueError(
                     "User.last_login_at must be timezone-aware"
+                )
+            if self.last_login_at + skew < self.created_at:
+                raise ValueError(
+                    "User.last_login_at must be >= User.created_at "
+                    f"(tolerating {_MAX_CLOCK_SKEW_SECONDS}s clock skew) "
+                    f"({self.last_login_at.isoformat()} < "
+                    f"{self.created_at.isoformat()})"
                 )
 
     # ------------------------------------------------------------------ #

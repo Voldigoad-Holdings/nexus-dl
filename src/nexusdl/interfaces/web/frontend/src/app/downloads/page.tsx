@@ -37,6 +37,15 @@
  *   clicked, the URL updates via ``router.replace`` so the back button
  *   does not create a history entry for every tab click.
  *
+ * Action callback safety
+ * ----------------------
+ * The action callbacks passed to :class:`DownloadItem` are wrapped so
+ * that a rejected promise from :func:`~../hooks/useDownload.useDownload`
+ * does not become an unhandled rejection.  The download hook's actions
+ * are ``Promise<void>`` and reject on API failure; the ``fireAndLog``
+ * helper catches and logs at developer level, which is the same pattern
+ * used on the home page.
+ *
  * URL synchronisation
  * -------------------
  * ``useSearchParams()`` requires a Suspense boundary in Next.js 14, so the
@@ -64,7 +73,13 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useCallback, useEffect, useMemo, useRef } from "react";
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+} from "react";
 
 import { DownloadItem } from "../../components/DownloadItem";
 import { useDownload } from "../../hooks/useDownload";
@@ -120,6 +135,25 @@ function isFilterTabId(value: string | null): value is FilterTab["id"] {
  */
 function assertNeverTab(value: never): never {
   throw new Error(`Unhandled filter tab: ${String(value)}`);
+}
+
+/**
+ * Fire an async callback and swallow any rejection, logging it at
+ * developer level.
+ *
+ * The download actions exposed by :func:`~../../hooks/useDownload.useDownload`
+ * (`pause`, `resume`, `cancel`, `remove`) are ``Promise<void>`` and
+ * **can reject** when the API call fails.  A bare ``void promise`` in a
+ * React event handler does **not** catch the rejection, which produces an
+ * unhandled promise rejection in the console.  The user-facing error path
+ * is already wired through the store; this helper only ensures the
+ * rejection is visible to a developer instead of disappearing silently.
+ */
+function fireAndLog(promise: Promise<unknown>): void {
+  void promise.catch((err: unknown) => {
+    // eslint-disable-next-line no-console
+    console.error("DownloadsPage: download action rejected:", err);
+  });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -265,6 +299,27 @@ function DownloadsBody() {
       downloads.clearFinished();
     }
   }, [downloads.clearFinished]);
+
+  // Action callbacks are wrapped so a rejected promise is logged rather
+  // than surfacing as an unhandled rejection.  Each callback is stable
+  // across renders because it depends only on the corresponding store
+  // action, which is itself a stable reference.
+  const handlePause = useCallback(
+    (id: string) => fireAndLog(downloads.pause(id)),
+    [downloads.pause],
+  );
+  const handleResume = useCallback(
+    (id: string) => fireAndLog(downloads.resume(id)),
+    [downloads.resume],
+  );
+  const handleCancel = useCallback(
+    (id: string) => fireAndLog(downloads.cancel(id)),
+    [downloads.cancel],
+  );
+  const handleRemove = useCallback(
+    (id: string) => fireAndLog(downloads.remove(id)),
+    [downloads.remove],
+  );
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 p-4 sm:p-6 lg:p-8">
@@ -491,18 +546,10 @@ function DownloadsBody() {
             <DownloadItem
               key={task.id}
               task={task}
-              onPause={(id) => {
-                void downloads.pause(id);
-              }}
-              onResume={(id) => {
-                void downloads.resume(id);
-              }}
-              onCancel={(id) => {
-                void downloads.cancel(id);
-              }}
-              onRemove={(id) => {
-                void downloads.remove(id);
-              }}
+              onPause={handlePause}
+              onResume={handleResume}
+              onCancel={handleCancel}
+              onRemove={handleRemove}
             />
           ))}
       </section>
@@ -595,8 +642,13 @@ function ConnectionPill({
  * A single stat card in the top strip.
  *
  * Rendered as a ``<button>`` because every card filters the list when
- * clicked — the icons and count are inside the button, which is the
- * correct accessible structure for a single-action tile.
+ * clicked.  The active state is communicated through ``aria-current="true"``
+ * rather than ``aria-pressed``: the four cards form a **single-selection
+ * filter group**, not four independent toggles, and ``aria-current`` is
+ * the ARIA-recommended signal for "the currently active item in a group of
+ * related items".  A screen reader announces "Current: Active: 3" rather
+ * than "Pressed: Active: 3", which matches the UI's behaviour — clicking
+ * again does not deselect.
  */
 function StatCard({
   label,
@@ -627,7 +679,7 @@ function StatCard({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      aria-pressed={active}
+      aria-current={active ? "true" : undefined}
       aria-label={`${label}: ${value}. ${active ? "Currently active filter." : "Click to filter."}`}
       className={cn(
         "group flex flex-col items-start gap-1 rounded-lg border p-3",
@@ -748,10 +800,18 @@ function EmptyState({
  * Matches the real page's structure — header, four stat cards, tabs and
  * three loading rows — so there is no layout shift when the real content
  * replaces the fallback.
+ *
+ * The outer ``<div aria-busy="true">`` signals the loading state to
+ * assistive technology without relying on the ``animate-pulse`` animation
+ * (which is purely visual and is disabled under
+ * ``prefers-reduced-motion``).
  */
 function DownloadsPageFallback() {
   return (
-    <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 p-4 sm:p-6 lg:p-8">
+    <div
+      className="mx-auto flex w-full max-w-5xl flex-col gap-6 p-4 sm:p-6 lg:p-8"
+      aria-busy="true"
+    >
       <div className="space-y-2">
         <div className="h-9 w-40 animate-pulse rounded bg-muted" />
         <div className="h-4 w-64 animate-pulse rounded bg-muted" />

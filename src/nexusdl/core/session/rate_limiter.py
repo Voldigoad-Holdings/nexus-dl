@@ -262,9 +262,12 @@ class RateLimiter:
             advance time deterministically without sleeping.
 
     Raises:
-        ValueError: If ``rate_per_second <= 0``, ``burst < 1``, or
-            ``burst`` is present but not an integer. All three are
-            programming errors at the composition root; failing at
+        TypeError: If ``burst`` is provided and is not an integer (and
+            not ``None``). An explicit ``burst`` is a programmatic
+            declaration — a non-integer value is a bug, not a
+            recoverable condition.
+        ValueError: If ``rate_per_second <= 0`` or ``burst < 1``. Both
+            are programming errors at the composition root; failing at
             construction time makes them one-line fixes rather than
             subtle runtime surprises.
     """

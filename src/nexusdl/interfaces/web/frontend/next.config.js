@@ -67,17 +67,34 @@ if (!apiBaseUrl) {
 //                                 so 'unsafe-inline' is required.
 //                                 'unsafe-eval' is only added in dev for
 //                                 webpack's eval-based source maps.
+//
+//                                 NOTE: this means XSS protection from CSP
+//                                 is *partial*: an injected inline script
+//                                 could still execute. A future iteration
+//                                 will switch to nonce-based CSP (a
+//                                 middleware that generates a per-request
+//                                 nonce and Next.js auto-injecting it into
+//                                 hydration scripts). Until then,
+//                                 'unsafe-inline' is a documented
+//                                 compromise, not an oversight.
 //   style-src                   — TailwindCSS + Radix UI use inline styles.
 //   img-src                     — manga covers come from 60+ arbitrary
 //                                 external sites; only image fetching is
-//                                 opened to https/http. Everything else
-//                                 stays locked to 'self'.
+//                                 opened to https (and http in dev for
+//                                 local testing). Everything else stays
+//                                 locked to 'self'.
 //   font-src                    — self-hosted fonts + data: URIs.
 //   connect-src                 — same-origin for the API proxy, ws/wss for
 //                                 the WebSocket. The proxy makes both
 //                                 same-origin from the browser's perspective;
 //                                 the ws/wss scheme qualifiers are needed
 //                                 because 'self' does not cover WS schemes.
+//   worker-src                  — Service Workers, Web Workers, and the
+//                                 Playwright/FlareSolverr pools run
+//                                 same-origin only.
+//   manifest-src                — /manifest.json is same-origin.
+//   media-src                   — future-proofing for audio/video playback
+//                                 from the backend (currently unused).
 //   frame-ancestors 'none'      — defense-in-depth alongside X-Frame-Options.
 //   base-uri 'self'             — prevent <base> tag injection attacks.
 //   form-action 'self'          — prevent form submission to foreign origins.
@@ -92,9 +109,21 @@ const cspDirectives = [
   "default-src 'self'",
   scriptSrc,
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob: https: http:",
+  // In production, only HTTPS covers are needed — the http: entry exists
+  // solely to let ``next dev`` load covers from a local backend or from
+  // a misconfigured test site. Shipping ``http:`` in production opens a
+  // SSRF surface through the Next.js image optimizer: an attacker who can
+  // influence a manga's cover_url could point ``next/image`` at an
+  // internal address (e.g. ``http://169.254.169.254/``) and have the
+  // server fetch it on their behalf.
+  isProduction
+    ? "img-src 'self' data: blob: https:"
+    : "img-src 'self' data: blob: https: http:",
   "font-src 'self' data:",
   "connect-src 'self' ws: wss:",
+  "worker-src 'self'",
+  "manifest-src 'self'",
+  "media-src 'self' https:",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",
@@ -104,6 +133,47 @@ if (isProduction) {
   cspDirectives.push("upgrade-insecure-requests");
 }
 const contentSecurityPolicy = cspDirectives.join("; ") + ";";
+
+// ---------------------------------------------------------------------------
+// Permissions-Policy
+// ---------------------------------------------------------------------------
+// The application uses none of these browser APIs. Denying them up front
+// means an injected script cannot silently access them either. The list is
+// deliberately broad: it is cheaper to deny a new feature than to notice
+// months later that a compromised dependency enabled it.
+const permissionsPolicy = [
+  "accelerometer=()",
+  "ambient-light-sensor=()",
+  "autoplay=()",
+  "battery=()",
+  "bluetooth=()",
+  "browsing-topics=()",
+  "camera=()",
+  "display-capture=()",
+  "document-domain=()",
+  "encrypted-media=()",
+  "fullscreen=(self)",
+  "geolocation=()",
+  "gyroscope=()",
+  "hid=()",
+  "idle-detection=()",
+  "interest-cohort=()",
+  "magnetometer=()",
+  "microphone=()",
+  "midi=()",
+  "otp-credentials=()",
+  "payment=()",
+  "picture-in-picture=()",
+  "publickey-credentials-create=()",
+  "publickey-credentials-get=()",
+  "screen-wake-lock=()",
+  "serial=()",
+  "speaker-selection=()",
+  "usb=()",
+  "web-share=()",
+  "window-management=()",
+  "xr-spatial-tracking=()",
+].join(", ");
 
 // ---------------------------------------------------------------------------
 // Next.js config
@@ -148,6 +218,12 @@ const nextConfig = {
   // Strip ``console.*`` calls from the production bundle. The frontend uses
   // ``sonner`` for user-visible notifications; anything logged to the
   // console in development is developer-only noise in production.
+  //
+  // ``debug`` is intentionally excluded as well: ``lib/ws.ts`` guards
+  // ``console.debug`` calls behind the ``debug`` option (which is ``false``
+  // by default), so stripping them from the bundle removes the last
+  // non-user-facing output from production while keeping the code
+  // unchanged for development.
   compiler: {
     removeConsole: isProduction
       ? { exclude: ["error", "warn"] }
@@ -158,16 +234,21 @@ const nextConfig = {
   // Images
   // -----------------------------------------------------------------------
   // Manga covers come from 60+ external sites, so the domain allowlist
-  // cannot be enumerated in advance. ``hostname: "**"`` allows any host;
-  // restricting to https and http keeps the risk surface to image-fetching
-  // only (``img-src`` in the CSP has the same shape). Next.js still runs
-  // the cover through its optimizer (resize, WebP/AVIF conversion, cache),
-  // which is what makes the library grid fast.
+  // cannot be enumerated in advance. Next.js still runs the cover through
+  // its optimizer (resize, WebP/AVIF conversion, cache), which is what
+  // makes the library grid fast.
+  //
+  // In production, only ``https:`` is allowed: an ``http:`` cover URL from
+  // a compromised parser could be used as an SSRF primitive through the
+  // image optimizer (fetching internal services on the server side). In
+  // development, ``http:`` is enabled so local covers work.
   images: {
-    remotePatterns: [
-      { protocol: "https", hostname: "**" },
-      { protocol: "http", hostname: "**" },
-    ],
+    remotePatterns: isProduction
+      ? [{ protocol: "https", hostname: "**" }]
+      : [
+          { protocol: "https", hostname: "**" },
+          { protocol: "http", hostname: "**" },
+        ],
     formats: ["image/avif", "image/webp"],
   },
 
@@ -229,7 +310,7 @@ const nextConfig = {
           },
           {
             key: "Permissions-Policy",
-            value: "camera=(), microphone=(), geolocation=(), payment=()",
+            value: permissionsPolicy,
           },
           {
             key: "X-DNS-Prefetch-Control",
@@ -238,7 +319,7 @@ const nextConfig = {
           // HSTS is only sent in production, and only via HTTPS. The
           // ``preload`` directive opts this origin into the HSTS preload
           // list once the operator submits it — the header itself is
-            // harmless if they choose not to.
+          // harmless if they choose not to.
           ...(isProduction
             ? [
                 {

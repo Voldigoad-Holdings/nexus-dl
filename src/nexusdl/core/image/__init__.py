@@ -65,7 +65,7 @@ For the lower-level stages:
         raise NexusDLError(validation.error or "invalid image")
 
     await optimize_file(path)                    # in place
-    await convert(path, target, ConversionOptions(target_format="webp"))
+    await convert(path, path.with_suffix(".webp"), ConversionOptions(target_format="webp"))
 
 The structural protocol ``HttpSessionProtocol`` (defined in
 ``downloader.py``) is deliberately **not** re-exported. It exists only as
@@ -75,12 +75,14 @@ need to name the protocol.
 
 Lazy loading
 ------------
-All seventeen exports are resolved through PEP 562's ``__getattr__``
-mechanism. Importing ``nexusdl.core.image`` **does not import any
+Eighteen of the twenty exports are resolved through PEP 562's
+``__getattr__`` mechanism. The two remaining exports are the introspection
+helpers (:func:`list_symbols`, :func:`get_symbol`), defined directly in
+this module. Importing ``nexusdl.core.image`` **does not import any
 submodule**.
 
 This matters less here than for :mod:`nexusdl.core.downloader` (whose
-eager imports pulled in ``httpx``, ``hishelf``, ``img2pdf``, and
+eager imports pulled in ``httpx``, ``hishel``, ``img2pdf``, and
 ``py7zr``) because **PIL dominates the cost** - once PIL is loaded
 (~30-50 ms), the four image submodules together add only ~5-10 ms. Still,
 the principle is the same: a consumer of ``validate_bytes`` should not
@@ -89,7 +91,8 @@ whole :mod:`~nexusdl.core.downloader.retry` infrastructure), and a
 future submodule with a heavy extra (``avif`` via ``pyav``, ``heif`` via
 ``pillow-heif``, etc.) will not penalize existing importers.
 
-Concrete impact:
+Illustrative impact (numbers approximate, measured on a warm filesystem
+cache; exact timings vary by platform and Pillow version):
 
 ========================================  =========  =========
 Scenario                                   Before     After
@@ -171,6 +174,57 @@ __all__ = [
 
 
 # ===========================================================================
+# Introspection helpers
+# ===========================================================================
+#
+# Defined before ``__getattr__`` and ``_LAZY`` so they are always bound in
+# ``globals()`` — ``__getattr__`` is only invoked for names that are *not*
+# already present, so these bypass the lazy registry entirely.
+
+def list_symbols() -> list[str]:
+    """Return the sorted list of top-level lazy exports.
+
+    Useful for parametrized tests (``@pytest.mark.parametrize("name",
+    list_symbols())``), schema registries, and tooling that needs to
+    enumerate the image pipeline's public surface without importing every
+    submodule.
+
+    The two introspection helpers (:func:`list_symbols`, :func:`get_symbol`)
+    are part of ``__all__`` but are **not** included in the returned list:
+    they are defined directly in this module and do not live in any
+    submodule.
+    """
+    return sorted(_LAZY.keys())
+
+
+def get_symbol(name: str) -> Any:
+    """Return the image-pipeline symbol registered under ``name``.
+
+    Equivalent to ``getattr(package, name)`` but with a clearer error
+    message when the name is unknown. Convenient for dynamic lookups
+    (parametrized tests, composition-root builders that resolve a symbol
+    from a config string, image-pipeline inspectors).
+
+    Both the submodule exports (resolved lazily through :func:`__getattr__`)
+    and the two introspection helpers (defined in this module) are
+    accepted.
+
+    Raises:
+        KeyError: If ``name`` is not a public image export.
+    """
+    if name in ("list_symbols", "get_symbol"):
+        return globals()[name]
+    if name not in _LAZY:
+        available = ", ".join(sorted(_LAZY.keys()))
+        raise KeyError(
+            f"Unknown image symbol {name!r}. Available: {available}. "
+            f"Every other symbol lives in its specific submodule - import "
+            f"from 'nexusdl.core.image.<submodule>' directly."
+        )
+    return __getattr__(name)
+
+
+# ===========================================================================
 # Lazy import registry
 # ===========================================================================
 #
@@ -201,6 +255,19 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ImageDownloadResult": ("downloader", "ImageDownloadResult"),
     "ImageDownloader": ("downloader", "ImageDownloader"),
 }
+
+
+# Sanity check: ``__all__`` must be exactly the union of the lazy registry
+# and the two helpers defined in this module. A mismatch means someone
+# added a symbol to one place and forgot the other — silent divergence that
+# only surfaces at runtime as ``AttributeError`` or ``ImportError`` in a
+# specific import path.
+_INTROSPECTION_HELPERS = frozenset({"list_symbols", "get_symbol"})
+assert set(__all__) == set(_LAZY) | _INTROSPECTION_HELPERS, (
+    f"__all__ / _LAZY mismatch: "
+    f"extra in __all__={set(__all__) - set(_LAZY) - _INTROSPECTION_HELPERS}, "
+    f"extra in _LAZY={set(_LAZY) - set(__all__)}"
+)
 
 
 # ===========================================================================
@@ -242,6 +309,13 @@ if TYPE_CHECKING:
 # Lazy loader
 # ===========================================================================
 
+#: Root module names of the optional dependencies that a missing import
+#: might refer to. Compared against ``exc.name.split(".")[0]`` so that a
+#: missing submodule (``PIL._imaging``) is attributed to the correct
+#: top-level package.
+_OPTIONAL_DEPENDENCY_ROOTS: frozenset[str] = frozenset({"PIL", "Pillow"})
+
+
 def __getattr__(name: str) -> Any:
     """Resolve a public image-pipeline symbol on first access (PEP 562).
 
@@ -267,6 +341,9 @@ def __getattr__(name: str) -> Any:
             or when the submodule does not define the requested name.
             ``AttributeError`` - rather than ``ImportError`` - is required
             by PEP 562 so that ``hasattr`` works.
+        ImportError: When the import failure is specifically a missing
+            Pillow dependency. The original :class:`ModuleNotFoundError` is
+            chained as ``__cause__``.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -290,8 +367,11 @@ def __getattr__(name: str) -> Any:
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
     except ModuleNotFoundError as exc:
-        # Optional dependency missing from the image pipeline.
-        if exc.name in {"PIL", "Pillow"}:
+        # Optional dependency missing from the image pipeline. Compare on
+        # the **root** module name so that a missing submodule (``PIL._imaging``)
+        # is attributed to the correct top-level package.
+        missing_root = exc.name.split(".")[0] if exc.name else None
+        if missing_root in _OPTIONAL_DEPENDENCY_ROOTS:
             raise ImportError(
                 f"{name!r} requires Pillow. "
                 f"Install it with: pip install 'nexusdl[core]' "
@@ -305,7 +385,7 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(
             f"The image submodule {submodule_basename!r} does not define "
             f"{attr_name!r}. This is a package-internal inconsistency - "
-            f"nexusdl.core.image.__all__ and the submodules are out of "
+            f"nexusdl.core.image._LAZY and the submodules are out of "
             f"sync."
         ) from None
 
@@ -321,51 +401,18 @@ def __dir__() -> list[str]:
     Python's default :func:`dir` implementation collects a module's
     ``__dict__`` and, when the module defines ``__getattr__``, calls it
     with each candidate name to decide what to display. Because none of
-    the seventeen exports are present in ``__dict__`` at import time, an
+    the lazy exports are present in ``__dict__`` at import time, an
     unmodified :func:`dir` would not list them - the package would appear
     empty in a REPL.
 
-    The returned list is :data:`__all__` plus the standard module dunders
-    a user typically expects to see.
+    The returned list is :data:`__all__`, the module dunders, and any
+    attribute already bound in ``globals()`` (whether via a resolved lazy
+    import or via external assignment). This matches Python's contract
+    that ``__dir__`` should report everything accessible through
+    ``getattr``.
     """
     return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+        set(globals().keys())
+        | set(__all__)
+        | {"__all__", "__doc__", "__name__", "__package__"}
     )
-
-
-# ===========================================================================
-# Introspection helpers
-# ===========================================================================
-
-def list_symbols() -> list[str]:
-    """Return the sorted list of top-level lazy exports.
-
-    Useful for parametrized tests (``@pytest.mark.parametrize("name",
-    list_symbols())``), schema registries, and tooling that needs to
-    enumerate the image pipeline's public surface without importing every
-    submodule.
-    """
-    # Only the seventeen public exports, not the introspection helpers
-    # themselves - otherwise ``list_symbols`` would include itself.
-    return sorted(_LAZY.keys())
-
-
-def get_symbol(name: str) -> Any:
-    """Return the image-pipeline symbol registered under ``name``.
-
-    Equivalent to ``getattr(package, name)`` but with a clearer error
-    message when the name is unknown. Convenient for dynamic lookups
-    (parametrized tests, composition-root builders that resolve a symbol
-    from a config string, image-pipeline inspectors).
-
-    Raises:
-        KeyError: If ``name`` is not a public image export.
-    """
-    if name not in _LAZY:
-        available = ", ".join(sorted(_LAZY.keys()))
-        raise KeyError(
-            f"Unknown image symbol {name!r}. Available: {available}. "
-            f"Every other symbol lives in its specific submodule - import "
-            f"from 'nexusdl.core.image.<submodule>' directly."
-        )
-    return getattr(__import__(__name__, fromlist=[name]), name)

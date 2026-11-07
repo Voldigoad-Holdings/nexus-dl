@@ -292,8 +292,14 @@ packages = ["src/nexusdl"]
 
 # Le frontend Next.js ne doit JAMAIS être dans le wheel Python.
 # Il est distribué séparément (npm / pnpm) ou inclus dans l'image Docker web.
+#
+# ``exclude`` is resolved relative to the **wheel root**, not the
+# filesystem.  Because ``packages = ["src/nexusdl"]`` strips the
+# ``src/`` prefix, the pattern below must start with ``/nexusdl/…``
+# (not ``/src/nexusdl/…``).  A leading slash anchors the pattern at the
+# wheel root, which is what hatchling expects.
 exclude = [
-    "src/nexusdl/interfaces/web/frontend",
+    "/nexusdl/interfaces/web/frontend",
 ]
 
 # ────────────────────────────────────────────────────────────────────
@@ -451,13 +457,15 @@ select = [
 ]
 ignore = [
     "E501",    # line length (géré par formatter)
-    # ``S101`` (assert) is left ignored at the *global* level because
-    # non-test backend code shipped in ``src/nexusdl/core/`` and the
-    # parsers may use ``assert`` for invariant checks.  Removing this
-    # would force a full audit of every such file — a change this
-    # iteration does not undertake.  Tests re-ignore ``S101`` explicitly
-    # via ``per-file-ignores`` below, which documents intent.
-    "S101",
+    # ``S101`` (assert) is ignored **only for tests and for the two
+    # explicitly-declared source paths** via ``per-file-ignores`` below.
+    # It is NOT in this global ignore list: ``python -O`` strips every
+    # ``assert`` statement, so a production ``assert`` is a silent no-op
+    # that can mask an invariant check. Any production ``assert`` must
+    # be an explicit ``if ...: raise`` instead. The previous version of
+    # this file ignored ``S101`` globally; that has been reverted here
+    # as a security fix. Source files that genuinely need an ``assert``
+    # (none today) must be listed explicitly in ``per-file-ignores``.
     "S311",    # random non-crypto (jitter retry)
     "PLR0913", # too many arguments (used by mixins / public APIs)
     "PLR0915", # too many statements (used by config / composition roots)
@@ -470,6 +478,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Tests use ``assert`` freely — that is the whole point of pytest.
+# They also often call unused-argument helpers, which ``ARG`` would
+# reject in production code but accepts here.
 "tests/**" = ["S", "ARG", "PLR2004", "PT011"]
 "scripts/**" = ["S", "T201", "PLR2004"]
 "src/nexusdl/parsers/**" = ["S105", "S106"]
@@ -596,7 +607,14 @@ isolated_build = true
 skip_missing_interpreters = true
 
 [testenv]
-extras = dev, cli
+extras = dev, cli, web
+# ``web`` is required for the FastAPI tests under ``tests/integration/web``
+# to even import — without it, ``import fastapi`` would fail with
+# ``ModuleNotFoundError`` and the entire web test directory would be
+# silently skipped.  ``gui`` is intentionally **not** installed here:
+# it pulls in Tkinter, which requires a display server on Linux and
+# breaks CI runners. The GUI tests are run separately (or via
+# ``xvfb-run`` on Linux), not in the default matrix.
 commands =
     pytest {posargs}
 

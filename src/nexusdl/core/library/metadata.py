@@ -45,12 +45,19 @@ in-place single-entry update, and even the formats that support appending
 a new file would leave the old ``ComicInfo.xml`` as a duplicate. Rebuilding
 is the only correct behaviour, and it comes with a cost:
 
-* **CBZ / CBT** — entries are streamed from source to destination, so peak
-  memory is one entry at a time (tens of KiB for typical manga pages).
+* **CBZ / CBT** — entries are streamed from source to destination in
+  fixed-size chunks, so peak memory is a single chunk (tens of KiB),
+  not a full entry or the full archive.
 * **CB7** — :mod:`py7zr`'s API forces materializing the entire archive in
-  memory. A 500 MB CB7 will consume 500 MB of RAM to update its metadata.
-  This is a hard limitation of the library; the caller is informed via the
-  :meth:`write_comic_info` docstring and can gate on file size if desired.
+  memory. A 500 MB CB7 will consume ~500 MB of RAM (plus wrapper
+  overhead) to update its metadata. This is a hard limitation of the
+  library; the caller is informed via the :meth:`write_comic_info`
+  docstring and can gate on file size if desired.
+
+**TAR compression is preserved.** The rebuild detects the source
+compression (none / gzip / bzip2 / xz) from the archive's magic bytes and
+writes the destination with the same compression. A ``.cbt`` that was
+gzipped stays gzipped after a metadata update.
 
 All writes are atomic: the rebuilt archive is written to a sibling
 temporary file, ``fsync``'d, and :meth:`Path.replace`'d onto the original.
@@ -83,6 +90,7 @@ import asyncio
 import hashlib
 import io
 import os
+import shutil
 import tarfile
 import tempfile
 import zipfile
@@ -148,6 +156,11 @@ _EXTENSION_TO_FORMAT: Final[dict[str, ArchiveFormat]] = {
 #: :mod:`nexusdl.core.image.optimizer` and :mod:`nexusdl.core.image.converter`
 #: so a stray temp file is recognisable.
 _TEMP_PREFIX_FMT: Final[str] = ".{name}.meta-"
+
+#: Size of the chunk used to stream entries between archives. 64 KiB
+#: matches Python's default buffer size and provides a good balance
+#: between syscall overhead and peak memory.
+_STREAM_CHUNK_SIZE: Final[int] = 64 * 1024
 
 
 _log = logger.bind(component="library.metadata")
@@ -292,6 +305,8 @@ async def write_comic_info(
     **Cost warning.** CB7 writes load the entire archive into memory —
     see the module docstring.
 
+    **TAR compression is preserved** from the source archive.
+
     Args:
         archive_path: Path to an existing ``.cbz``, ``.cb7``, or ``.cbt``
             file. The file is modified in place.
@@ -345,11 +360,16 @@ def comic_info_to_manga(
         :meth:`~nexusdl.core.library.database.LibraryDatabase.add_manga`.
     """
     manga_id = _make_manga_id(site_id, source_id)
+    # ``Manga.title`` is required and non-empty by downstream contract.
+    # ``series`` is preferred, ``title`` is the fallback, and ``""`` is
+    # the last resort so that the model construction does not fail on an
+    # archive with no ComicInfo at all.
+    title = comic_info.series or comic_info.title or ""
     return Manga(
         id=manga_id,
         site_id=site_id,
         source_id=source_id,
-        title=comic_info.series or comic_info.title,
+        title=title,
         description=comic_info.summary,
         author=comic_info.writer,
         language=_language_from_iso(comic_info.language_iso),
@@ -525,7 +545,11 @@ def _write_comic_info_sync(
 
 
 def _rebuild_zip(path: Path, xml_bytes: bytes) -> None:
-    """Rebuild a ZIP archive with the new ComicInfo.xml, atomically."""
+    """Rebuild a ZIP archive with the new ComicInfo.xml, atomically.
+
+    Entries are streamed in fixed-size chunks — peak memory is
+    :data:`_STREAM_CHUNK_SIZE`, not a full entry.
+    """
     with tempfile.NamedTemporaryFile(
         dir=path.parent,
         prefix=_TEMP_PREFIX_FMT.format(name=path.name),
@@ -541,10 +565,19 @@ def _rebuild_zip(path: Path, xml_bytes: bytes) -> None:
             for info in src.infolist():
                 if _is_comic_info_name(info.filename):
                     continue
-                with src.open(info, "r") as src_entry:
-                    # ``ZipFile.writestr`` accepts a file-like object and
-                    # streams it, so peak memory is one entry at a time.
-                    dst.writestr(info, src_entry.read())
+                if info.is_dir():
+                    # Directories are preserved verbatim. Attempting to
+                    # open them for reading is pointless and would yield
+                    # an empty stream.
+                    dst.writestr(info, b"")
+                    continue
+                with (
+                    src.open(info, "r") as src_entry,
+                    dst.open(info, "w") as dst_entry,
+                ):
+                    shutil.copyfileobj(
+                        src_entry, dst_entry, _STREAM_CHUNK_SIZE
+                    )
             dst.writestr(COMIC_INFO_ENTRY_NAME, xml_bytes)
         _fsync_and_replace(temp_path, path)
     except Exception:
@@ -585,8 +618,41 @@ def _rebuild_sevenzip(path: Path, xml_bytes: bytes) -> None:
         raise
 
 
+def _detect_tar_compression(path: Path) -> str:
+    """Return the ``tarfile`` write mode that matches *path*'s compression.
+
+    Reads the first few bytes of *path* to detect gzip / bzip2 / xz magic
+    numbers. Falls back to uncompressed ``"w"`` when none is found.
+
+    The returned mode is a ``tarfile`` *write* mode (``"w"``, ``"w:gz"``,
+    ``"w:bz2"``, or ``"w:xz"``), suitable for passing as the second
+    argument to :func:`tarfile.open`.
+    """
+    with path.open("rb") as fh:
+        head = fh.read(6)
+    if head.startswith(b"\x1f\x8b"):
+        return "w:gz"
+    if head.startswith(b"BZh"):
+        return "w:bz2"
+    if head.startswith(b"\xfd7zXZ\x00"):
+        return "w:xz"
+    return "w"
+
+
 def _rebuild_tar(path: Path, xml_bytes: bytes) -> None:
-    """Rebuild a TAR archive with the new ComicInfo.xml, atomically."""
+    """Rebuild a TAR archive with the new ComicInfo.xml, atomically.
+
+    Preserves the source archive's compression (none / gzip / bzip2 / xz).
+    Entries are streamed in fixed-size chunks — peak memory is
+    :data:`_STREAM_CHUNK_SIZE`, not a full entry.
+
+    The new ``ComicInfo.xml`` is written in the same session as the
+    preserved entries; the file is never reopened for appending, which
+    would be a source of bugs (TAR end-of-archive handling, compression
+    mode mismatch).
+    """
+    write_mode = _detect_tar_compression(path)
+
     with tempfile.NamedTemporaryFile(
         dir=path.parent,
         prefix=_TEMP_PREFIX_FMT.format(name=path.name),
@@ -597,26 +663,26 @@ def _rebuild_tar(path: Path, xml_bytes: bytes) -> None:
     try:
         with (
             tarfile.open(path, "r:*") as src,
-            tarfile.open(temp_path, "w") as dst,
+            tarfile.open(temp_path, write_mode) as dst,
         ):
             for member in src.getmembers():
                 if _is_comic_info_name(member.name):
                     continue
                 fileobj = src.extractfile(member)
                 if fileobj is None:
-                    # Directory entries and other non-file members.
+                    # Directory entries and other non-file members are
+                    # preserved without a payload.
                     dst.addfile(member)
                     continue
                 # ``tarfile`` streams ``fileobj`` into ``dst`` with the
-                # member's size already declared, so peak memory is one
-                # entry at a time.
+                # member's size already declared, so peak memory is the
+                # library's internal buffer, not the full entry.
                 dst.addfile(member, fileobj)
 
-        # Append the new ComicInfo.xml as a distinct member.
-        info = tarfile.TarInfo(name=COMIC_INFO_ENTRY_NAME)
-        info.size = len(xml_bytes)
-        info.mtime = int(datetime.now(UTC).timestamp())
-        with tarfile.open(temp_path, "a") as dst:
+            # Append the new ComicInfo.xml in the same session.
+            info = tarfile.TarInfo(name=COMIC_INFO_ENTRY_NAME)
+            info.size = len(xml_bytes)
+            info.mtime = int(datetime.now(UTC).timestamp())
             dst.addfile(info, io.BytesIO(xml_bytes))
 
         _fsync_and_replace(temp_path, path)

@@ -45,9 +45,9 @@
  *    bridge between the "token lives in localStorage" model of
  *    :mod:`../lib/api` and the "token is a reactive dependency of the
  *    WebSocket" model of :mod:`../lib/ws`.  It also tears down the
- *    WebSocket singleton on logout.  When the auth store is delivered, this
- *    mechanism is removed — the auth store will make the token reactive
- *    through Zustand and no polling is needed.
+ *    WebSocket singleton on token rotation.  When the auth store is
+ *    delivered, this mechanism is removed — the auth store will make the
+ *    token reactive through Zustand and no polling is needed.
  *
  * Why a sub-component for the WebSocket
  * -------------------------------------
@@ -209,6 +209,10 @@ function createQueryClient(): QueryClient {
             // produce the same result and just delays the error display.
             // The only exception is 408 (Request Timeout), which is a
             // transport-level condition masquerading as a 4xx.
+            // 429 (RATE_LIMIT_EXCEEDED) is *also* excluded from the 4xx
+            // mass exclusion above — retrying it would amplify the
+            // rate-limit window instead of riding it out.  It is folded
+            // into the exclusion automatically because it is a 4xx.
             if (
               error.status >= 400 &&
               error.status < 500 &&
@@ -283,9 +287,15 @@ export function Providers({ children }: ProvidersProps) {
   // Rehydrate persisted user settings on first client mount.  This is the
   // point at which ``localStorage``-persisted preferences become active —
   // before this effect runs, the store returns its defaults (which is what
-  // the server rendered, so there is no hydration mismatch).
+  // the server rendered, so there is no hydration mismatch).  A failure
+  // here (corrupt localStorage, quota exceeded) must not crash the app;
+  // the user simply gets the defaults and the error is visible in the
+  // browser console for debugging.
   useEffect(() => {
-    void rehydrateSettings();
+    void rehydrateSettings().catch((err: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error("Failed to rehydrate settings:", err);
+    });
   }, []);
 
   return (
@@ -500,13 +510,12 @@ function WebSocketBridge() {
  * * Also listens for ``storage`` events (cross-tab changes, instant) and
  *   ``visibilitychange`` events (tab focus, instant for the common case of
  *   returning to the app after a session refresh in another tab).
- * * When the token changes, bumps the returned revision number **and**:
- *   * on transition from authenticated → unauthenticated, calls
- *     :func:`~../lib/ws.resetWebSocketClient` so the singleton is torn down
- *     immediately rather than waiting for the next mount to notice;
- *   * on transition from unauthenticated → authenticated (login), nothing
- *     else is needed — the caller's ``key={revision}`` forces the
- *     WebSocket bridge to re-mount with the new token.
+ * * When the token changes, bumps the returned revision number **and**
+ *   always calls :func:`~../lib/ws.resetWebSocketClient` so the singleton
+ *   is torn down before the bridge re-mounts.  Doing this on *every*
+ *   change (not just logout) also covers the "logout + login as another
+ *   user in under two seconds" case, where the token goes from user A to
+ *   user B without ever passing through ``null``.
  *
  * The hook is **self-correcting**: a token change detected by the poll and
  * a token change detected by a ``storage`` event both converge on the same
@@ -547,19 +556,15 @@ function useTokenRevision(): number {
         return;
       }
 
-      const wasAuthenticated =
-        currentToken !== null && currentToken.length > 0;
-      const isAuthenticated = next !== null && next.length > 0;
+      // The token changed — always tear down the singleton.  This covers
+      // not only logout (auth → null) but also token refresh
+      // (old-token → new-token) and account switching
+      // (user-A-token → user-B-token, which never passes through null).
+      // The bridge re-mounts via ``key={revision}`` and reconnects with
+      // the new token, so the reset must happen *before* that re-mount.
+      resetWebSocketClient();
 
       currentToken = next;
-
-      // Logout detection — tear down the singleton before the bridge
-      // re-mounts, so the WebSocket does not keep running with a token
-      // the user has just discarded.
-      if (wasAuthenticated && !isAuthenticated) {
-        resetWebSocketClient();
-      }
-
       setRevision((value) => value + 1);
     };
 

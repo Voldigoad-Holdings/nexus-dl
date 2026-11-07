@@ -247,10 +247,14 @@ export type SettingsStore = SettingsState & SettingsActions;
  * backend equivalent and default to the values that produce the most
  * intuitive first-run experience.
  *
- * Frozen at the type level: no code path is allowed to mutate the defaults
- * object.  The setters build fresh objects through Zustand's ``set``.
+ * Frozen at **both** the type level and the runtime level: TypeScript's
+ * ``Readonly<>`` prevents accidental mutation in the codebase, and
+ * ``Object.freeze`` enforces the same invariant at runtime for any code
+ * that bypasses the type system (a ``JSON.parse``-produced object spread
+ * into this one, a test using ``as any``, …).  All fields are primitives,
+ * so a shallow freeze is sufficient.
  */
-export const DEFAULT_SETTINGS: Readonly<SettingsState> = {
+export const DEFAULT_SETTINGS: Readonly<SettingsState> = Object.freeze({
   language: "en",
   allow_adult: false,
   default_include_unhealthy: true,
@@ -260,7 +264,90 @@ export const DEFAULT_SETTINGS: Readonly<SettingsState> = {
   library_view: "grid",
   sidebar_collapsed: false,
   web_events_enabled: true,
-};
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Validation helpers (used by ``migrate``)
+// ───────────────────────────────────────────────────────────────────────────
+
+const VALID_LOCALES = new Set<string>(UI_LOCALES);
+const VALID_FORMATS = new Set<string>([
+  "folder",
+  "zip",
+  "cbz",
+  "cb7",
+  "pdf",
+  "cbt",
+]);
+const VALID_PRIORITIES = new Set<string>(["low", "normal", "high"]);
+const VALID_LIBRARY_VIEWS = new Set<string>(["grid", "list"]);
+
+/**
+ * Sanitise a persisted payload against the current schema.
+ *
+ * A ``localStorage`` payload is **untrusted input**: it can be corrupted
+ * by a browser extension, produced by an older version of the app with a
+ * different enum vocabulary, or set by hand in the devtools.  Blindly
+ * spreading it over :data:`DEFAULT_SETTINGS` would copy invalid enum
+ * values into the store, causing downstream type violations that TS
+ * cannot catch (the runtime value is never validated).
+ *
+ * This function keeps every valid field and replaces every invalid one
+ * with its default.  A field that is missing is simply left at the
+ * default — the ``...DEFAULT_SETTINGS`` spread already provides it.
+ *
+ * Called from ``migrate`` on every rehydration, so it also handles the
+ * "user upgraded from a version that had a bug" case.
+ */
+function sanitizePersistedSettings(
+  raw: unknown,
+): Partial<SettingsState> {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  const input = raw as Record<string, unknown>;
+  const out: Partial<SettingsState> = {};
+
+  if (typeof input.language === "string" && VALID_LOCALES.has(input.language)) {
+    out.language = input.language as UILocale;
+  }
+  if (typeof input.allow_adult === "boolean") {
+    out.allow_adult = input.allow_adult;
+  }
+  if (typeof input.default_include_unhealthy === "boolean") {
+    out.default_include_unhealthy = input.default_include_unhealthy;
+  }
+  if (
+    typeof input.default_packaging_format === "string" &&
+    VALID_FORMATS.has(input.default_packaging_format)
+  ) {
+    out.default_packaging_format =
+      input.default_packaging_format as PackagingFormat;
+  }
+  if (
+    typeof input.default_priority === "string" &&
+    VALID_PRIORITIES.has(input.default_priority)
+  ) {
+    out.default_priority = input.default_priority as DownloadPriority;
+  }
+  if (typeof input.default_skip_existing === "boolean") {
+    out.default_skip_existing = input.default_skip_existing;
+  }
+  if (
+    typeof input.library_view === "string" &&
+    VALID_LIBRARY_VIEWS.has(input.library_view)
+  ) {
+    out.library_view = input.library_view as LibraryView;
+  }
+  if (typeof input.sidebar_collapsed === "boolean") {
+    out.sidebar_collapsed = input.sidebar_collapsed;
+  }
+  if (typeof input.web_events_enabled === "boolean") {
+    out.web_events_enabled = input.web_events_enabled;
+  }
+
+  return out;
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Store
@@ -333,34 +420,41 @@ export const useSettingsStore = create<SettingsStore>()(
 
       // Only persist state fields — not action functions, which cannot be
       // serialised and would break ``JSON.parse`` on load.
-      partialize: (state) => ({
-        language: state.language,
-        allow_adult: state.allow_adult,
-        default_include_unhealthy: state.default_include_unhealthy,
-        default_packaging_format: state.default_packaging_format,
-        default_priority: state.default_priority,
-        default_skip_existing: state.default_skip_existing,
-        library_view: state.library_view,
-        sidebar_collapsed: state.sidebar_collapsed,
-        web_events_enabled: state.web_events_enabled,
-      }),
+      //
+      // The explicit list is the contract: a field that is not listed here
+      // is not persisted.  When adding a field to ``SettingsState``, add
+      // it here too — the ``satisfies`` clause below enforces that the key
+      // set matches ``DEFAULT_SETTINGS``, so forgetting a field is a
+      // compile-time error rather than a silent persistence bug.
+      partialize: (state) =>
+        ({
+          language: state.language,
+          allow_adult: state.allow_adult,
+          default_include_unhealthy: state.default_include_unhealthy,
+          default_packaging_format: state.default_packaging_format,
+          default_priority: state.default_priority,
+          default_skip_existing: state.default_skip_existing,
+          library_view: state.library_view,
+          sidebar_collapsed: state.sidebar_collapsed,
+          web_events_enabled: state.web_events_enabled,
+        }) satisfies Record<keyof SettingsState, unknown>,
 
       // Merge any previously persisted payload with the current defaults
       // so that fields added in a future version get their default value
       // rather than being ``undefined``.  Version 1 is the initial version
       // — ``migrate`` is called only on future upgrades and never on a
-      // fresh install.  The guard against a corrupted payload (``null``,
-      // a string, an array) prevents ``spread`` from throwing at load
-      // time, which would break the entire app on next visit.
-      migrate: (persistedState, _fromVersion) => {
-        if (persistedState && typeof persistedState === "object") {
-          return {
-            ...DEFAULT_SETTINGS,
-            ...(persistedState as Partial<SettingsState>),
-          };
-        }
-        return { ...DEFAULT_SETTINGS };
-      },
+      // fresh install.
+      //
+      // ``sanitizePersistedSettings`` rejects every invalid field, so a
+      // payload with e.g. ``language: "xx"`` or
+      // ``default_packaging_format: "cbr"`` falls back to the default for
+      // that field only — the rest of the payload is preserved.  Arrays
+      // and non-objects are rejected wholesale, which used to be a
+      // ``{ ...[], ... }`` crash-waiting-to-happen in the previous version.
+      migrate: (persistedState, _fromVersion) => ({
+        ...DEFAULT_SETTINGS,
+        ...sanitizePersistedSettings(persistedState),
+      }),
     },
   ),
 );
@@ -370,6 +464,18 @@ export const useSettingsStore = create<SettingsStore>()(
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
+ * Module-level flag: has :func:`rehydrateSettings` ever been called?
+ *
+ * Hydration is idempotent (``persist.rehydrate`` is a no-op once the store
+ * has hydrated), but each component that uses :func:`useSettingsHydrated`
+ * calls ``rehydrateSettings()`` in its own effect.  In a page with N such
+ * components, that is N ``localStorage.getItem`` reads plus N promise
+ * allocations for a no-op.  The flag short-circuits this at module level:
+ * the first caller pays, the rest return immediately.
+ */
+let hasBeenTriggered = false;
+
+/**
  * Trigger settings rehydration from ``localStorage`` if it has not yet run.
  *
  * Safe to call repeatedly — subsequent calls are no-ops once hydration has
@@ -377,12 +483,45 @@ export const useSettingsStore = create<SettingsStore>()(
  * effect.  Components that need the persisted values must additionally gate
  * on :func:`useSettingsHydrated` (or accept a first-render flash of
  * defaults).
+ *
+ * A rejection (corrupted payload, quota exceeded, privacy mode) is
+ * reported through the console and re-thrown so that the caller's
+ * ``.catch`` handler sees it.  Swallowing the rejection silently would
+ * leave :func:`useSettingsHydrated` stuck on ``false`` forever, rendering
+ * a skeleton that never resolves.
  */
 export async function rehydrateSettings(): Promise<void> {
   if (useSettingsStore.persist.hasHydrated()) {
     return;
   }
+  if (hasBeenTriggered) {
+    // Another caller already kicked hydration off.  Wait for the same
+    // promise instead of racing a second one — this keeps concurrent
+    // callers in sync without needing a shared promise reference.
+    await waitForHydration();
+    return;
+  }
+  hasBeenTriggered = true;
   await useSettingsStore.persist.rehydrate();
+}
+
+/**
+ * Resolve once the store has finished hydrating.
+ *
+ * Used internally by :func:`rehydrateSettings` when a second caller races
+ * the first — instead of kicking off a second ``rehydrate()``, it simply
+ * awaits the ``onFinishHydration`` event that the first call will emit.
+ */
+function waitForHydration(): Promise<void> {
+  if (useSettingsStore.persist.hasHydrated()) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    const unsubscribe = useSettingsStore.persist.onFinishHydration(() => {
+      unsubscribe();
+      resolve();
+    });
+  });
 }
 
 /**
@@ -406,8 +545,13 @@ export function useSettingsHydrated(): boolean {
 
   useEffect(() => {
     // Trigger rehydration on first mount if not yet done.  This is the
-    // safety net that makes the hook self-sufficient.
-    void rehydrateSettings();
+    // safety net that makes the hook self-sufficient.  A rejection is
+    // logged (rather than silently swallowed) so that a corrupted
+    // localStorage payload is visible in the console.
+    void rehydrateSettings().catch((err: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error("Failed to rehydrate settings:", err);
+    });
 
     // Sync the initial state, in case hydration completed between the
     // render (during which ``hydrated`` was ``false``) and this effect.

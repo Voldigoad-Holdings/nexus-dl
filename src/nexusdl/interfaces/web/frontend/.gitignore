@@ -10,7 +10,6 @@
 # ── Dependencies ────────────────────────────────────────────────────────────
 node_modules/
 .pnpm-store/
-.pnpm-debug.log*
 
 # ── Next.js build output ────────────────────────────────────────────────────
 .next/
@@ -30,10 +29,14 @@ coverage/
 # ── Caches and tool state ───────────────────────────────────────────────────
 .eslintcache
 .stylelintcache
+.prettiercache
 .turbo/
 .swc/
 
 # ── Logs ────────────────────────────────────────────────────────────────────
+# Covers the debug/error logs emitted by every supported package manager.
+# ``.pnpm-debug.log*`` is covered by the ``pnpm-debug.log*`` pattern below
+# and does not need a separate entry.
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -45,6 +48,10 @@ pnpm-debug.log*
 # repository-level .gitignore already excludes .env files globally; these
 # entries document the convention locally and would still apply if this
 # directory were ever extracted into a standalone repository.
+#
+# ``.env.local`` is listed explicitly even though ``.env.*.local`` also
+# matches it: Next.js treats ``.env.local`` specially (highest priority,
+# never committed), and calling it out makes the intent legible.
 .env
 .env.local
 .env.*.local
@@ -64,10 +71,6 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 Desktop.ini
-
-# ── Linter / formatter caches ───────────────────────────────────────────────
-.prettiercache
-.eslintcache
 
 # ── Vercel ──────────────────────────────────────────────────────────────────
 # Even though NexusDL is not deployed on Vercel by default, the ``.vercel``

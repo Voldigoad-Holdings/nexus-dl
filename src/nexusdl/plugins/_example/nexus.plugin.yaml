@@ -70,9 +70,14 @@ min_nexusdl_version: "3.0.0"
 max_nexusdl_version: "4.0.0"
 
 # PEP 440 specifier against the interpreter running NexusDL. Parsed with
-# ``packaging.specifiers.SpecifierSet``. The host project itself requires
-# Python >= 3.12 (see pyproject.toml), so a plugin cannot meaningfully
-# declare anything narrower. Omit the key for "no constraint".
+# ``packaging.specifiers.SpecifierSet``.
+#
+# The host project itself requires Python >= 3.12 (see pyproject.toml), so a
+# plugin targeting this codebase is already guaranteed to run on a recent
+# interpreter. A plugin MAY still narrow the range (e.g. ``">=3.13"``) if it
+# relies on a library feature added in a later interpreter — the host will
+# then refuse to load it on an older Python with a clear error. Omit the key
+# entirely for "no constraint".
 python_requires: ">=3.12"
 
 # --- Declared hooks ---------------------------------------------------------
@@ -102,14 +107,25 @@ python_requires: ">=3.12"
 #     class that carries no-op defaults without paying for dispatch it does
 #     not need.
 #
-# ExamplePlugin (plugin.py) implements all six, so all six are declared.
+# The order below matches ``nexusdl.plugins.hooks.HOOK_SPECS`` (lifecycle
+# order: load → pipeline → unload). It is not enforced by the schema — the
+# manifest parser treats ``hooks:`` as an unordered set — but keeping the
+# two in sync makes the reference manifest directly comparable with the
+# canonical list in the source code.
+#
+# ``on_load`` and ``on_unload`` are listed here for documentation
+# completeness — they are mandatory on ``NexusPlugin`` and are validated by
+# the protocol itself, so listing them is not strictly required. The
+# optional pipeline hooks are the ones whose presence in this list actually
+# changes loader behaviour (they decide whether the loader dispatches to
+# them).
 hooks:
   - on_load
-  - on_unload
   - on_before_download
   - on_after_download
   - on_page_downloaded
   - on_error
+  - on_unload
 
 # --- Dependencies -----------------------------------------------------------
 # PEP 508 requirement strings (``packaging.requirements.Requirement``).

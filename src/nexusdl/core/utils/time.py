@@ -39,10 +39,13 @@ Guiding principles
   clock into the classes they exercise.
 * **Lenient parsing, strict formatting.** :func:`parse_iso` accepts
   every ISO 8601 variant ``datetime.fromisoformat`` handles, plus the
-  ``Z`` suffix, plus date-only strings (treated as UTC midnight). The
-  formatting functions raise on out-of-range input — a broken datetime
-  reaching :func:`format_iso` or :func:`format_duration` is a caller
-  bug, not a condition to silently absorb.
+  ``Z`` suffix, plus date-only strings (treated as UTC midnight).
+  Fractional seconds beyond microseconds are truncated (nanosecond
+  precision is never significant for anything this project measures,
+  and nanosecond strings appear in API responses from Go/Rust
+  services). The formatting functions raise on out-of-range input — a
+  broken datetime reaching :func:`format_iso` or :func:`format_duration`
+  is a caller bug, not a condition to silently absorb.
 
 What this module deliberately does **not** do
 ---------------------------------------------
@@ -82,6 +85,7 @@ utility library without modification.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -139,6 +143,17 @@ SECONDS_PER_WEEK: Final[int] = 604_800
 # (30-day months, 365-day years) for display only — documented at the call
 # site — but a public ``SECONDS_PER_MONTH`` constant would tempt callers
 # into using it for arithmetic, which is wrong. See the module docstring.
+
+
+#: Matches an ISO 8601 fractional-seconds component with more than six
+#: digits (nanosecond precision). Python's ``datetime.fromisoformat``
+#: rejects these with a ``ValueError``; some upstream producers (Go's
+#: ``time.RFC3339Nano``, Rust's chrono) emit them routinely. Truncating
+#: to microseconds is safe: nothing this project measures needs
+#: sub-microsecond precision.
+_NANOSECOND_RE: Final[re.Pattern[str]] = re.compile(
+    r"(\.\d{6})\d+"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -229,8 +244,10 @@ def parse_iso(value: str) -> datetime:
     * ``"2024-01-15T10:30:00+05:30"`` — any offset; converted to UTC.
     * ``"2024-01-15T10:30:00"`` — no offset; treated as UTC.
     * ``"2024-01-15"`` — date-only; treated as UTC midnight.
-    * ``"2024-01-15T10:30:00.123456Z"`` — fractional seconds, any
-      precision up to microseconds.
+    * ``"2024-01-15T10:30:00.123456Z"`` — fractional seconds, up to
+      microseconds.
+    * ``"2024-01-15T10:30:00.123456789Z"`` — nanosecond precision;
+      truncated to microseconds (see the module docstring).
 
     The result is **always** UTC — a ``+05:30`` input is converted, not
     preserved with its offset, so that every datetime in the pipeline is
@@ -267,6 +284,12 @@ def parse_iso(value: str) -> datetime:
     normalised = value.strip()
     if normalised.endswith("Z") or normalised.endswith("z"):
         normalised = normalised[:-1] + "+00:00"
+
+    # Truncate nanosecond precision to microseconds. Python's
+    # ``fromisoformat`` rejects >6 fractional digits, and upstream
+    # producers (Go ``RFC3339Nano``, Rust chrono) emit them regularly.
+    # Nothing this project measures needs sub-microsecond precision.
+    normalised = _NANOSECOND_RE.sub(r"\1", normalised)
 
     try:
         dt = datetime.fromisoformat(normalised)
@@ -462,7 +485,15 @@ def format_duration(seconds: float) -> str:
     if seconds < 10:
         if seconds == int(seconds):
             return f"{int(seconds)}s"
-        return f"{seconds:.1f}s"
+        # ``f"{seconds:.1f}"`` can round 9.96 up to ``"10.0"``, which
+        # reads as "10.0 seconds" — that is jarring next to the integer
+        # format used for 10s and above. When rounding crosses the
+        # boundary, fall back to the integer form so the output stays
+        # consistent.
+        one_decimal = f"{seconds:.1f}"
+        if one_decimal == "10.0":
+            return "10s"
+        return f"{one_decimal}s"
 
     # --- Round once, then compute every unit from the integer --- #
     total = int(round(seconds))
@@ -577,9 +608,9 @@ def format_relative(
         value, unit = int(magnitude // 31_536_000), "year"
 
     # Guard against the ``int()`` floor producing 0 just past a unit
-    # boundary (e.g. magnitude=59.99 → 0 minutes). The correct answer is
-    # "1 minute ago", which the branch above catches only for
-    # magnitude < 60; this keeps the fallback safe.
+    # boundary (e.g. magnitude=3599.9 → 0 hours because 3599.9 // 3600
+    # = 0.0). The correct answer is "1 hour ago", which the branch above
+    # catches only for magnitude ≥ 3600; this keeps the fallback safe.
     if value == 0:
         value = 1
 

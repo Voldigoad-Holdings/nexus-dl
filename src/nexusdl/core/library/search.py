@@ -180,7 +180,8 @@ class PaginatedResult[T]:
     Attributes:
         items: The page's items, in the caller's expected order.
         total: Total number of items matching the query across all pages.
-        page: 1-indexed current page. Always ``1`` for an empty result.
+        page: 1-indexed current page. Always ``1`` for an empty result
+            (``total == 0``), regardless of the requested offset.
         per_page: Page size used for this query (equal to ``limit`` at the
             call site).
         total_pages: ``ceil(total / per_page)``, or ``0`` when ``total``
@@ -403,11 +404,11 @@ class LibrarySearch:
         self._validate_pagination(limit, offset)
 
         if not query.strip():
-            return self._empty_result(limit, offset)
+            return self._empty_result(limit)
 
         fts_query = build_fts_query(query)
         if fts_query is None:
-            return self._empty_result(limit, offset)
+            return self._empty_result(limit)
 
         async with self._session_factory() as session:
             if await self._check_fts5(session):
@@ -432,6 +433,9 @@ class LibrarySearch:
                         exc,
                     )
 
+        # Fallback uses a fresh session: the one above may be in a
+        # partial or rollback-only state after the OperationalError.
+        async with self._session_factory() as session:
             return await self._search_like(
                 session,
                 query,
@@ -461,12 +465,18 @@ class LibrarySearch:
             raise ValueError(f"offset must be >= 0, got {offset}")
 
     @staticmethod
-    def _empty_result(limit: int, offset: int) -> PaginatedResult[Manga]:
-        """Return a :class:`PaginatedResult` with no items and zero total."""
+    def _empty_result(limit: int) -> PaginatedResult[Manga]:
+        """Return an empty :class:`PaginatedResult`.
+
+        ``page`` is forced to ``1`` — an empty result is not "page N of 0"
+        even when the caller asked for a non-zero offset. This keeps the
+        ``has_prev`` / ``has_next`` invariants coherent: an empty result
+        has neither.
+        """
         return PaginatedResult(
             items=(),
             total=0,
-            page=offset // limit + 1,
+            page=1,
             per_page=limit,
             total_pages=0,
         )
@@ -527,7 +537,7 @@ class LibrarySearch:
         total = int(total_result.scalar_one())
 
         if total == 0:
-            return self._empty_result(limit, offset)
+            return self._empty_result(limit)
 
         page_sql = (
             f"SELECT m.* FROM {_FTS_TABLE} "
@@ -572,7 +582,7 @@ class LibrarySearch:
         """Run a substring-AND search against ``mangas`` without FTS5."""
         patterns = build_like_patterns(user_query)
         if not patterns:
-            return self._empty_result(limit, offset)
+            return self._empty_result(limit)
 
         params: dict[str, Any] = {}
         blocks: list[str] = []
@@ -598,7 +608,7 @@ class LibrarySearch:
             (await session.execute(text(count_sql), params)).scalar_one()
         )
         if total == 0:
-            return self._empty_result(limit, offset)
+            return self._empty_result(limit)
 
         page_params = dict(params)
         page_params["limit"] = limit

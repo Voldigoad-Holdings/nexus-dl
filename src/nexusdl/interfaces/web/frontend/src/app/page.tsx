@@ -96,7 +96,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 
 import { DownloadItem } from "../components/DownloadItem";
 import { MangaCard } from "../components/MangaCard";
@@ -150,6 +150,29 @@ function parseAddedAt(value: string | number | null | undefined): number {
   }
   const ts = Date.parse(value);
   return Number.isFinite(ts) ? ts : 0;
+}
+
+/**
+ * Fire an async callback and swallow any rejection, logging it at
+ * developer level.
+ *
+ * The download actions exposed by :func:`~../hooks/useDownload.useDownload`
+ * (`pause`, `resume`, `cancel`, `remove`) are ``Promise<void>`` and
+ * **can reject** when the API call fails.  A bare ``void promise`` in a
+ * React event handler does **not** catch the rejection, which produces an
+ * unhandled promise rejection in the console — a noisy failure mode that
+ * masks real errors and is penalised by every strict CI setup.
+ *
+ * The user-facing error path is already wired: each action's failure is
+ * reflected in the store and, for ``create``, in ``createError``.  This
+ * helper is purely a developer-trace sink so a failed action does not
+ * disappear silently.
+ */
+function fireAndLog(promise: Promise<unknown>): void {
+  void promise.catch((err: unknown) => {
+    // eslint-disable-next-line no-console
+    console.error("HomePage: download action rejected:", err);
+  });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -238,6 +261,28 @@ export default function HomePage() {
     libraryTotal > 0;
 
   // -------------------------------------------------------------------
+  // Action handlers — wrapped in ``useCallback`` so their identity is
+  // stable across re-renders, and passed through ``fireAndLog`` so a
+  // rejected action never becomes an unhandled promise rejection.
+  // -------------------------------------------------------------------
+  const handlePause = useCallback(
+    (id: string) => fireAndLog(downloads.pause(id)),
+    [downloads.pause],
+  );
+  const handleResume = useCallback(
+    (id: string) => fireAndLog(downloads.resume(id)),
+    [downloads.resume],
+  );
+  const handleCancel = useCallback(
+    (id: string) => fireAndLog(downloads.cancel(id)),
+    [downloads.cancel],
+  );
+  const handleRemove = useCallback(
+    (id: string) => fireAndLog(downloads.remove(id)),
+    [downloads.remove],
+  );
+
+  // -------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------
   return (
@@ -307,18 +352,10 @@ export default function HomePage() {
             hasMore={hasMoreDownloads}
             error={downloads.error}
             onRetry={downloads.refetch}
-            onPause={(id) => {
-              void downloads.pause(id);
-            }}
-            onResume={(id) => {
-              void downloads.resume(id);
-            }}
-            onCancel={(id) => {
-              void downloads.cancel(id);
-            }}
-            onRemove={(id) => {
-              void downloads.remove(id);
-            }}
+            onPause={handlePause}
+            onResume={handleResume}
+            onCancel={handleCancel}
+            onRemove={handleRemove}
           />
 
           <RecentlyAddedPanel
@@ -591,9 +628,6 @@ function RecentlyAddedPanel({
 /**
  * The header of an activity panel: title, optional subtitle, and a
  * "View all" link that aligns with the panel's right edge.
- *
- * Extracted so that both panels are visually identical — the only thing
- * that varies between them is the title and the destination of the link.
  */
 function PanelHeader({
   id,
@@ -684,10 +718,6 @@ function ErrorBanner({
 
 /**
  * A small panel-scoped empty state with a call-to-action link.
- *
- * Deliberately smaller than the onboarding block — an empty panel is a
- * normal state in an otherwise-populated dashboard and does not deserve the
- * same visual weight as "you have never used this app".
  */
 function PanelEmpty({
   icon: Icon,
@@ -748,16 +778,6 @@ function PanelEmpty({
 
 /**
  * The full-width onboarding block shown on a **fresh install**.
- *
- * Distinct from :func:`PanelEmpty` because it serves a different purpose:
- * it is not "this panel is empty", it is "you have not started using
- * NexusDL yet".  That is a moment that warrants a single, unmissable call
- * to action, not three small ones.
- *
- * The three steps are deliberately abstract — "search", "add", "download"
- * — rather than describing specific sites, because NexusDL supports sixty
- * of them and the site a user cares about varies.  What stays constant is
- * the workflow.
  */
 function OnboardingState() {
   return (
@@ -838,9 +858,6 @@ function OnboardingState() {
 
 /**
  * A single step in the onboarding list.
- *
- * The step number is rendered as a badge so the sequence is visually
- * obvious even though the copy would still be readable as a plain list.
  */
 function OnboardingStep({
   number,
@@ -888,22 +905,12 @@ function OnboardingStep({
 
 /**
  * Skeleton shown while the initial queries are in flight.
- *
- * Mirrors the real layout — four stat cards, two activity panels with
- * three placeholder rows each — so the page does not shift when the real
- * content replaces the skeleton.
- *
- * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
- * is static, so an ``aria-live`` region would never announce anything
- * (screen readers only announce *changes*).  ``aria-busy`` is the correct
- * signal for "content is loading".
  */
 function LoadingSkeleton() {
   return (
     <div className="flex flex-col gap-6" aria-busy="true">
       <span className="sr-only">Loading dashboard…</span>
 
-      {/* Two-column activity split ------------------------------- */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {[0, 1].map((panelIndex) => (
           <div
@@ -913,7 +920,6 @@ function LoadingSkeleton() {
             <div className="h-6 w-40 animate-pulse rounded bg-muted" />
 
             {panelIndex === 0 ? (
-              // Downloads panel skeleton — three row-shaped blocks.
               <>
                 {[0, 1, 2].map((rowIndex) => (
                   <div
@@ -932,7 +938,6 @@ function LoadingSkeleton() {
                 ))}
               </>
             ) : (
-              // Library panel skeleton — a 2×2 grid of card-shaped blocks.
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                 {[0, 1, 2, 3].map((cardIndex) => (
                   <div key={cardIndex} className="flex flex-col gap-2">

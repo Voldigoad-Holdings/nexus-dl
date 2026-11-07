@@ -325,31 +325,6 @@ class ComicInfo(BaseModel):
             return (value,)
         return tuple(value)
 
-    @field_validator("manga")
-    @classmethod
-    def _validate_manga(cls, value: str | None) -> str | None:
-        """Validate the ``manga`` field against ComicRack's four values.
-
-        Accepts ``None``, ``"Yes"``, ``"No"``, ``"YesAndRightToLeft"``,
-        and ``"NoAndRightToLeft"``, case-insensitively. Any other value
-        is passed through unchanged — some readers accept custom values
-        (e.g. ``"YesAndLeftToRight"`` for webtoon-style content), and
-        rejecting them would break round-trip for archives produced by
-        those tools.
-        """
-        return value
-
-    @field_validator("black_and_white")
-    @classmethod
-    def _validate_black_and_white(cls, value: str | None) -> str | None:
-        """Validate the ``black_and_white`` field.
-
-        ComicRack's schema declares ``"Yes"`` / ``"No"``. As with
-        :attr:`manga`, other values pass through — a round-trip must not
-        reject an archive just because it uses a non-standard value.
-        """
-        return value
-
     # ------------------------------------------------------------------ #
     # Serialization                                                      #
     # ------------------------------------------------------------------ #
@@ -441,8 +416,14 @@ class ComicInfo(BaseModel):
                 f"expected {_ROOT_TAG!r}"
             )
 
-        scalar_map = {xml_tag: model_attr for model_attr, xml_tag in _SCALAR_FIELDS}
-        csv_map = {xml_tag: model_attr for model_attr, xml_tag in _CSV_FIELDS}
+        scalar_map = {
+            xml_tag: model_attr
+            for model_attr, xml_tag in _SCALAR_FIELDS
+        }
+        csv_map = {
+            xml_tag: model_attr
+            for model_attr, xml_tag in _CSV_FIELDS
+        }
 
         kwargs: dict[str, Any] = {}
         pages: list[ComicInfoPage] = []
@@ -513,11 +494,12 @@ def _local_name(tag: str) -> str:
 def _stringify(value: Any) -> str:
     """Convert a scalar model field to its XML text representation.
 
-    ``str`` and ``int`` need no special-casing, but ``bool`` — if a
-    future field is added — would stringify as ``"True"`` / ``"False"``,
-    which is wrong for ComicInfo (which uses ``"Yes"`` / ``"No"``). The
-    model deliberately does not use ``bool`` today; this helper stays
-    straightforward to keep that guarantee obvious.
+    ``str`` and ``int`` need no special-casing. ``bool`` (if a future
+    field is added) must be mapped to the ComicInfo vocabulary —
+    ``"Yes"`` / ``"No"`` — because ``str(True)`` produces ``"True"``,
+    which no reader recognises. The model deliberately does not use
+    ``bool`` today; this helper is written to stay correct if that ever
+    changes.
 
     Args:
         value: A non-``None`` scalar from the model.
@@ -525,6 +507,8 @@ def _stringify(value: Any) -> str:
     Returns:
         The string to write as the element's text.
     """
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
     return str(value)
 
 

@@ -59,18 +59,23 @@
  *
  * Accessibility
  * -------------
- * * Each row is a ``<li>``; the list is a ``<ul>``.  Row content is a
- *   single ``<label>`` wrapping the checkbox and the text, so the whole
- *   row is a click target and the checkbox takes the chapter title as its
- *   accessible name.
+ * * Each row is a ``<li>``; the list is a ``<ul>``.  The checkbox's
+ *   accessible name comes from an explicit ``aria-label={mainLine}``, not
+ *   from the row's concatenated text — the latter would include the
+ *   metadata line and the status label, producing an announcement like
+ *   "Chapter 42 Vol. 3 · 20 pages · Nov 4, 2026 Downloaded" for a single
+ *   checkbox.  The row is still a ``<label>`` so the whole row is a click
+ *   target, but the visible text inside it is marked ``aria-hidden`` to
+ *   keep it out of the accessible name.
+ * * The status icon is ``aria-hidden`` and its descriptive text
+ *   (``"Downloaded"`` / ``"Downloading"`` / ``"Download failed"``) is
+ *   attached to the input via ``aria-describedby``, so a screen reader
+ *   announces the checkbox name first and the status as a description,
+ *   rather than folding the status into the name.
  * * The "N of M selected" counter is ``aria-live="polite"`` and
  *   ``aria-atomic="true"``, so a bulk action announces the resulting count.
  * * Each action button carries an explicit ``aria-label`` that names both
  *   the action and the count (e.g. ``"Download 3 selected chapters"``).
- * * The status icon is ``aria-hidden`` and paired with a ``sr-only`` label
- *   (``"Downloaded"`` / ``"Downloading"`` / ``"Download failed"``) — this
- *   preserves the information for screen readers without relying on colour
- *   alone.
  *
  * No shadcn/ui dependencies
  * -------------------------
@@ -144,41 +149,63 @@ const LANGUAGE_LABELS: Record<Language, string> = {
  * touched does not display a meaningless "not downloaded" icon on every
  * row — the absence of an indicator already conveys that meaning, and the
  * row is visually cleaner.  Every other status gets an icon plus a
- * ``sr-only`` label so that the information is not colour-only.
+ * ``sr-only`` label; the label is exposed to assistive technology through
+ * ``aria-describedby`` on the checkbox, not through the row's label.
  */
-function ChapterStatusIcon({ status }: { status: ChapterStatus }) {
+function ChapterStatusIcon({
+  status,
+  descriptionId,
+}: {
+  status: ChapterStatus;
+  descriptionId: string;
+}) {
   switch (status) {
     case "idle":
       return null;
     case "downloading":
       return (
-        <>
+        <span
+          className="ml-1 inline-flex shrink-0"
+          aria-hidden={false}
+        >
           <Loader2
-            className="h-4 w-4 shrink-0 animate-spin text-blue-500"
+            className="h-4 w-4 animate-spin text-blue-500"
             aria-hidden
           />
-          <span className="sr-only">Downloading</span>
-        </>
+          <span id={descriptionId} className="sr-only">
+            Downloading
+          </span>
+        </span>
       );
     case "downloaded":
       return (
-        <>
+        <span
+          className="ml-1 inline-flex shrink-0"
+          aria-hidden={false}
+        >
           <CheckCircle2
-            className="h-4 w-4 shrink-0 text-emerald-500"
+            className="h-4 w-4 text-emerald-500"
             aria-hidden
           />
-          <span className="sr-only">Downloaded</span>
-        </>
+          <span id={descriptionId} className="sr-only">
+            Downloaded
+          </span>
+        </span>
       );
     case "failed":
       return (
-        <>
+        <span
+          className="ml-1 inline-flex shrink-0"
+          aria-hidden={false}
+        >
           <AlertCircle
-            className="h-4 w-4 shrink-0 text-red-500"
+            className="h-4 w-4 text-red-500"
             aria-hidden
           />
-          <span className="sr-only">Download failed</span>
-        </>
+          <span id={descriptionId} className="sr-only">
+            Download failed
+          </span>
+        </span>
       );
   }
 }
@@ -202,10 +229,11 @@ interface ChapterRowProps {
  * A single chapter row.
  *
  * The row is a ``<label>`` wrapping the checkbox and the visual content,
- * so a click anywhere on the row toggles the checkbox and the checkbox
- * takes its accessible name from the label.  The checkbox is not inside a
- * wrapping ``<div>`` — a native ``<label>`` can only label one control, and
- * adding a nested container would break the click target.
+ * so a click anywhere on the row toggles the checkbox.  The checkbox's
+ * accessible name is an explicit ``aria-label={mainLine}`` — not the
+ * label's concatenated text, which would include the metadata line and
+ * the status.  The status is attached through ``aria-describedby`` so it
+ * is announced *after* the name, not as part of it.
  */
 function ChapterRow({
   chapter,
@@ -215,6 +243,8 @@ function ChapterRow({
   disabled,
   onToggle,
 }: ChapterRowProps) {
+  const descriptionId = useId();
+
   // Title fallback chain: prefer the source title, then a synthetic
   // "Chapter N", then the raw id.  This handles chapters whose site
   // publishes neither a title nor a number (rare, but possible on
@@ -264,6 +294,14 @@ function ChapterRow({
           checked={selected}
           onChange={() => onToggle(chapter.id)}
           disabled={disabled}
+          // The accessible name is the chapter's main line only.  The
+          // label's concatenated text would include the metadata line and
+          // the status badge, producing "Chapter 42 Vol. 3 · 20 pages ·
+          // Nov 4, 2026 Downloaded" for a single checkbox.
+          aria-label={mainLine}
+          aria-describedby={
+            status !== "idle" ? descriptionId : undefined
+          }
           className={cn(
             "mt-0.5 h-4 w-4 shrink-0 cursor-pointer rounded accent-primary",
             "focus-visible:outline-none focus-visible:ring-2",
@@ -271,7 +309,14 @@ function ChapterRow({
             "focus-visible:ring-offset-background",
           )}
         />
-        <div className="min-w-0 flex-1">
+        <div
+          className="min-w-0 flex-1"
+          // The visual text is not part of the accessible name — the
+          // input's ``aria-label`` above is.  Marking this ``aria-hidden``
+          // keeps a screen reader from reading the same string twice
+          // (once as the label content, once as the input's name).
+          aria-hidden
+        >
           <p
             className="truncate text-sm font-medium"
             title={mainLine}
@@ -284,7 +329,10 @@ function ChapterRow({
             </p>
           )}
         </div>
-        <ChapterStatusIcon status={status} />
+        <ChapterStatusIcon
+          status={status}
+          descriptionId={descriptionId}
+        />
       </label>
     </li>
   );
@@ -546,7 +594,15 @@ export function ChapterList({
       if (numberB === null) return -1;
       return numberA - numberB;
     });
-    void onDownloadSelected(ordered);
+    // ``onDownloadSelected`` may be ``async`` (the typical wiring passes
+    // ``useDownload.create``), and its rejection is handled by the
+    // parent's own ``createError`` state.  Swallowing the rejection here
+    // prevents an unhandled promise rejection in the console; the parent
+    // still gets the error through its state, so the UI is not silent.
+    void Promise.resolve(onDownloadSelected(ordered)).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error("ChapterList: onDownloadSelected rejected:", err);
+    });
   };
 
   const toggleSort = (): void => {

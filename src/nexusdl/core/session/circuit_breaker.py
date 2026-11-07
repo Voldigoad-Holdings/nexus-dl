@@ -58,6 +58,31 @@ is used because :meth:`CircuitBreaker.stats` refreshes the state machine
 ``_open_locked`` / ``reset`` do the same. A plain ``Lock`` would
 self-deadlock on those re-entrant paths.
 
+Half-open slot discipline
+-------------------------
+Every successful :meth:`CircuitBreaker.allow_request` in HALF_OPEN
+**reserves a slot** (``_half_open_in_flight += 1``). Every
+:meth:`CircuitBreaker.record_success` and
+:meth:`CircuitBreaker.record_failure` in HALF_OPEN **releases** the
+slot (``_half_open_in_flight -= 1``). A record call that arrives with
+no reserved slot — a caller bug, e.g. one that skipped
+``allow_request()`` — is treated as follows:
+
+* :meth:`record_failure` **still re-opens the breaker** (the failure is
+  real, and continuing to send traffic to a site that just failed in
+  HALF_OPEN is wrong), but logs at ``DEBUG`` so the bug is discoverable.
+* :meth:`record_success` **is ignored for the half-open success
+  counter**. It does not increment ``_half_open_successes`` because we
+  cannot attribute the success to a reserved trial slot; incrementing
+  it would allow the breaker to close from a caller bug alone. The
+  caller is logged at ``DEBUG``. In practice a caller that forgot
+  ``allow_request()`` is a bug in the pipeline, and the fail-safe
+  behaviour is to not trust its "success" for closing the breaker.
+
+Both branches are the same discipline: unreported state is never
+trusted. In CLOSED and OPEN the slot counters are irrelevant, so those
+branches skip the check.
+
 Half-open concurrency limitation
 --------------------------------
 The ``half_open_max_attempts > 1`` configuration has **subtle
@@ -292,7 +317,7 @@ class CircuitBreaker:
 
     Every method is synchronous and thread-safe. See the module
     docstring for the full contract, the reason ``RLock`` is used, the
-    config defaults, and the half-open concurrency limitation.
+    config defaults, and the half-open slot discipline.
 
     Example:
         >>> breaker = CircuitBreaker(failure_threshold=3, name="mangadex")
@@ -466,6 +491,15 @@ class CircuitBreaker:
         counter but does not change state — a success while OPEN means
         the caller raced the transition (rare); the OPEN timer is the
         authority.
+
+        **Half-open slot discipline.** A success in HALF_OPEN with no
+        reserved slot (``_half_open_in_flight == 0``) indicates a caller
+        bug — the pipeline skipped :meth:`allow_request` before the
+        request. Such a success is **not** counted toward the
+        half-open success threshold, because we cannot attribute it to
+        a reserved trial slot; counting it would let a caller bug alone
+        close the breaker. The bug is logged at ``DEBUG`` so the trace
+        points at the call site.
         """
         with self._lock:
             self._total_successes += 1
@@ -475,8 +509,16 @@ class CircuitBreaker:
             if self._state == "open":
                 return
             # half_open
-            if self._half_open_in_flight > 0:
-                self._half_open_in_flight -= 1
+            if self._half_open_in_flight <= 0:
+                _log.debug(
+                    "CircuitBreaker {!r}: record_success() in half_open "
+                    "with no in-flight slot; caller did not call "
+                    "allow_request() first. Success is not counted "
+                    "toward the half-open threshold.",
+                    self._name,
+                )
+                return
+            self._half_open_in_flight -= 1
             self._half_open_successes += 1
             if self._half_open_successes >= self._half_open_success_threshold:
                 self._transition_to_closed_locked()
@@ -489,6 +531,13 @@ class CircuitBreaker:
         frees the trial slot and immediately re-opens the breaker. In
         OPEN, the call is recorded in the cumulative counter but does
         not extend the cooldown — the breaker is already down.
+
+        **Half-open slot discipline.** A failure in HALF_OPEN with no
+        reserved slot (``_half_open_in_flight == 0``) indicates a caller
+        bug — the pipeline skipped :meth:`allow_request` before the
+        request. The failure is **still processed** (the failure is
+        real and re-opening is the correct response), but the bug is
+        logged at ``DEBUG`` so the trace points at the call site.
         """
         with self._lock:
             self._total_failures += 1

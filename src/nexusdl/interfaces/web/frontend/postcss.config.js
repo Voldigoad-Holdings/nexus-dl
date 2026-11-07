@@ -15,14 +15,40 @@
  * internal pipeline for non-Tailwind CSS, so adding them here would
  * duplicate work and diverge from the shadcn/ui baseline.
  *
+ * Plugin format
+ * -------------
+ * The plugins are declared as an **array with explicit ``require()``
+ * calls**, not as an object (``{ tailwindcss: {}, autoprefixer: {} }``).
+ *
+ * The object form still works under PostCSS 8 thanks to a compatibility
+ * shim, but it is **deprecated** and PostCSS 9 removes it. It also relies
+ * on ``postcss-load-config``'s implicit module resolution, which produces
+ * a cryptic error if a plugin is ever missing from ``node_modules``. The
+ * array form fails immediately with a clear ``Cannot find module`` and is
+ * the format TailwindCSS's own documentation recommends.
+ *
+ * Nesting
+ * -------
+ * ``tailwindcss/nesting`` is **not** included. The project's
+ * ``globals.css`` does not use nested ``&`` syntax, and shadcn/ui's own
+ * components do not require it either (they use ``@apply`` on flat
+ * selectors). If a future component needs CSS nesting, add the plugin to
+ * the array **before** ``tailwindcss``:
+ *
+ *     require("tailwindcss/nesting"),
+ *     require("tailwindcss"),
+ *
  * The file is CommonJS (``module.exports``) because Next.js loads PostCSS
  * config synchronously during the build, before any ESM loader is set up.
+ * If the project ever adopts ``"type": "module"`` in ``package.json``,
+ * rename this file to ``postcss.config.mjs`` and switch to
+ * ``export default { plugins: [...] }``.
  *
  * @type {import('postcss-load-config').Config}
  */
 module.exports = {
-  plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
-  },
+  plugins: [
+    require("tailwindcss"),
+    require("autoprefixer"),
+  ],
 };

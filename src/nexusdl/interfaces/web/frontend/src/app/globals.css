@@ -44,10 +44,16 @@
  * Performance
  * -----------
  * The body background gradient is the only always-on visual cost.  It is
- * a pair of radial gradients with ``background-attachment: fixed`` — the
- * GPU handles this essentially for free on any modern browser, but the
- * ``prefers-reduced-motion`` block below still disables every animation
- * for users who ask for it.
+ * a pair of radial gradients rendered by a ``body::before`` pseudo-element
+ * pinned with ``position: fixed`` rather than by ``background-attachment:
+ * fixed`` on the body — Safari (including iOS) does not honour
+ * ``background-attachment: fixed`` and would scroll the gradients with
+ * the page.  The pseudo-element approach works on every browser and lets
+ * us layer the gradient *under* the app content with a single ``z-index``
+ * instead of relying on the body's stacking context.
+ *
+ * ``prefers-reduced-motion`` still disables every animation for users who
+ * ask for it.
  *
  * Accessibility
  * -------------
@@ -201,10 +207,30 @@
   body {
     @apply bg-background text-foreground;
     min-height: 100dvh;
-    /* The signature neon glow — two radial gradients, one in each
-       neon hue, anchored to the top and to the bottom-right.  Very
-       low alpha so the body still reads as near-black; the effect is
-       felt more than seen. */
+    /* ``position: relative`` creates the stacking context that the
+       ``body::before`` gradient layer below anchors to.  It also
+       gives any absolutely positioned child (toasts, dialogs) a
+       well-defined containing block. */
+    position: relative;
+    /* The gradient lives on the pseudo-element, not on ``body``
+       itself: ``background-attachment: fixed`` is a no-op on Safari
+       (including iOS), which would scroll the glow with the page.
+       The pseudo-element uses ``position: fixed`` instead and works
+       on every browser. */
+    background-color: hsl(var(--background));
+  }
+
+  /* The signature neon glow — two radial gradients, one in each
+     neon hue, anchored to the top and to the bottom-right.  Rendered
+     by a fixed-position pseudo-element so it stays put on scroll on
+     every browser (notably Safari, which ignores
+     ``background-attachment: fixed`` on the body). */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
     background-image:
       radial-gradient(
         ellipse 80% 50% at 50% -20%,
@@ -216,7 +242,6 @@
         hsl(var(--neon-glow-secondary) / 0.10),
         transparent
       );
-    background-attachment: fixed;
   }
 
   /* Selection uses the primary neon hue. */
@@ -266,7 +291,10 @@
   }
 
   /* Autofill — without this, Chrome paints a white / yellow
-     rectangle over the dark theme. */
+     rectangle over the dark theme.  ``-webkit-box-shadow`` is the
+     modern replacement for the old ``transition: background-color
+     5000s`` hack: it recolours the autofill background without the
+     long-running transition. */
   input:-webkit-autofill,
   input:-webkit-autofill:hover,
   input:-webkit-autofill:focus,
@@ -275,7 +303,6 @@
   textarea:-webkit-autofill:focus {
     -webkit-text-fill-color: hsl(var(--foreground));
     -webkit-box-shadow: 0 0 0 1000px hsl(var(--background)) inset;
-    transition: background-color 5000s ease-in-out 0s;
   }
 
   /* ``prefers-reduced-motion`` — respect the user's system setting.
@@ -499,6 +526,12 @@
     color: black !important;
   }
 
+  /* The gradient layer is decorative — remove it from print output
+     so it does not interfere with the white background. */
+  body::before {
+    display: none !important;
+  }
+
   .neon-text,
   .neon-text-secondary,
   .neon-border,
@@ -508,7 +541,11 @@
     border-color: #ccc !important;
   }
 
-  a[href]::after {
+  /* Only append the URL for *external* links.  Internal ``<Link>``
+     hrefs are relative paths and would just clutter the page; the
+     reader already sees the link text. */
+  a[href^="http"]::after,
+  a[href^="//"]::after {
     content: " (" attr(href) ")";
     font-size: 0.85em;
     color: #666;

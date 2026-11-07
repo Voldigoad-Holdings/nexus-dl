@@ -10,9 +10,10 @@
  *    query parameter so that an authentication middleware can bounce an
  *    unauthenticated visitor to ``/auth/login?next=/library`` and resume
  *    there after login.  The value is **sanitised** by
- *    :func:`sanitizeRedirect` to reject absolute URLs and
- *    protocol-relative paths — a login page is a classic open-redirect
- *    target, and this is not negotiable.
+ *    :func:`sanitizeRedirect` to reject absolute URLs, protocol-relative
+ *    paths, and percent-encoded / whitespace-normalised bypasses — a
+ *    login page is a classic open-redirect target, and this is not
+ *    negotiable.
  * 2. **Submit the credentials.**  On submit the form calls
  *    :meth:`~../../../lib/api.NexusApiClient.login`.  The API client
  *    already normalises every failure to :class:`NexusApiError`, so the
@@ -43,15 +44,18 @@
  * -------------
  * * Every field has a visible ``<label>``, not just a placeholder.
  * * Submit errors are surfaced in a ``role="alert"`` block that is
- *   programmatically focusable (``tabIndex={-1}``) and focused on error,
- *   so a screen-reader user hears the message without having to hunt for
- *   it.
+ *   programmatically focusable (``tabIndex={-1}``) and focused on every
+ *   *new* error occurrence (a monotonic ``errorSeq`` counter is used so
+ *   that re-emitting the same message still re-announces it).
  * * Per-field errors use ``aria-invalid`` plus ``aria-describedby``
  *   pointing at the message, so the reason is announced alongside the
- *   field.
+ *   field.  Focus goes to the *first* invalid field, not blindly to
+ *   email.
  * * The password reveal toggle is an ``aria-pressed`` button with an
  *   explicit ``aria-label`` that describes its action.
  * * ``autoComplete`` hints let password managers fill the form correctly.
+ * * No ``autoFocus``: on mobile it pops the virtual keyboard before the
+ *   user can read the form, and it fights the error-focus effect.
  */
 import { AlertCircle, Eye, EyeOff, Loader2, LogIn } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -79,15 +83,40 @@ const DEFAULT_REDIRECT = "/";
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
+ * Decode a raw ``?next=`` value *once* and normalise it for safety checks.
+ *
+ * ``decodeURIComponent`` is called defensively: a malformed escape
+ * sequence (``%zz``) throws, and a login page must never crash on a
+ * hostile query string.  On failure we return the raw value unchanged so
+ * the subsequent checks still see something to reject.
+ */
+function decodeRedirect(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/**
  * Return a **safe** redirect target for the given raw ``?next=`` value.
  *
- * Only same-origin absolute paths are accepted:
+ * Only same-origin absolute paths are accepted.  The check is performed
+ * on the *decoded* value so that percent-encoded bypasses
+ * (``/%5Cevil``, ``/%09/evil``) and whitespace-normalised bypasses
+ * (``/\\t/evil``, ``/\n/evil``) are rejected alongside the plain
+ * ``//evil`` and ``/\\evil`` forms.
  *
- * * the value must start with ``/``;
- * * it must **not** start with ``//`` (protocol-relative URL — an attacker
- *   could otherwise redirect to ``//evil.example``);
- * * it must **not** start with ``/\`` (some browsers normalise
- *   ``/\evil.example`` to ``//evil.example``).
+ * Rules:
+ *
+ * * the decoded value must start with ``/``;
+ * * it must **not** start with ``//`` (protocol-relative URL — an
+ *   attacker could otherwise redirect to ``//evil.example``);
+ * * it must **not** start with ``/\\`` (some browsers normalise
+ *   ``/\\evil.example`` to ``//evil.example``);
+ * * it must not contain a control character or backslash anywhere in
+ *   the first path segment, since browsers strip tabs/newlines and
+ *   treat backslashes as slashes during URL parsing.
  *
  * Anything else collapses to :data:`DEFAULT_REDIRECT`.
  */
@@ -95,10 +124,17 @@ function sanitizeRedirect(raw: string | null): string {
   if (raw === null) {
     return DEFAULT_REDIRECT;
   }
-  if (!raw.startsWith("/")) {
+  const decoded = decodeRedirect(raw);
+  if (!decoded.startsWith("/")) {
     return DEFAULT_REDIRECT;
   }
-  if (raw.startsWith("//") || raw.startsWith("/\\")) {
+  if (decoded.startsWith("//") || decoded.startsWith("/\\")) {
+    return DEFAULT_REDIRECT;
+  }
+  // Reject control chars and backslashes anywhere in the value: the
+  // browser would strip/normalise them, which is exactly the class of
+  // bypass we are defending against.
+  if (/[\u0000-\u001f\u007f\\]/.test(decoded)) {
     return DEFAULT_REDIRECT;
   }
   return raw;
@@ -129,6 +165,25 @@ function describeLoginError(error: NexusApiError): string {
     default:
       return error.message || "Sign-in failed. Please try again.";
   }
+}
+
+/**
+ * Normalise anything thrown by :func:`api.login` into a
+ * :class:`NexusApiError`.
+ *
+ * Kept as a standalone helper so the ``catch`` block stays exhaustive
+ * and so the exact constructor shape is validated in one place.
+ */
+function toNexusApiError(err: unknown): NexusApiError {
+  if (err instanceof NexusApiError) {
+    return err;
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new NexusApiError(message, {
+    code: "INTERNAL_ERROR",
+    status: 0,
+    cause: err,
+  });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -168,26 +223,38 @@ function LoginForm() {
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // Monotonic counter: bumped every time a *new* submit error is
+  // produced.  The focus effect depends on this counter rather than on
+  // the message string, so re-emitting the same message (e.g. the user
+  // retries with the same wrong password) still re-announces it to
+  // screen readers.  (B5)
+  const [errorSeq, setErrorSeq] = useState(0);
   const [emailError, setEmailError] = useState<string | null>(null);
   const [passwordError, setPasswordError] = useState<string | null>(null);
 
   const errorRef = useRef<HTMLDivElement>(null);
   const emailRef = useRef<HTMLInputElement>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
+  // Synchronous re-entrancy lock.  ``isSubmitting`` is a React state and
+  // therefore only reflects after the next render — a fast double-submit
+  // (Enter twice, or click + Enter) could otherwise fire two logins.
+  // (B11)
+  const inFlightRef = useRef(false);
 
-  // Move focus to the error banner whenever a submit failure occurs, so
-  // that a screen-reader user is taken directly to the message instead of
-  // having to tab back through the whole form.
+  // Move focus to the error banner whenever a *new* submit failure
+  // occurs, so that a screen-reader user is taken directly to the
+  // message instead of having to tab back through the whole form.
   useEffect(() => {
-    if (submitError !== null) {
+    if (errorSeq > 0) {
       errorRef.current?.focus();
     }
-  }, [submitError]);
+  }, [errorSeq]);
 
   async function handleSubmit(
     event: FormEvent<HTMLFormElement>,
   ): Promise<void> {
     event.preventDefault();
-    if (isSubmitting) {
+    if (inFlightRef.current || isSubmitting) {
       return;
     }
 
@@ -198,22 +265,25 @@ function LoginForm() {
 
     // Client-side validation.  The backend validates too, but a network
     // round-trip to say "email is required" is a poor experience.
-    let hasError = false;
+    // Note: ``type="email"`` is non-functional here because the form is
+    // ``noValidate`` — this is intentional (custom validation path).
+    let firstInvalidRef: HTMLInputElement | null = null;
     if (email.trim().length === 0) {
       setEmailError("Email is required.");
-      hasError = true;
+      firstInvalidRef = emailRef.current;
     }
     if (password.length === 0) {
       setPasswordError("Password is required.");
-      hasError = true;
+      firstInvalidRef = firstInvalidRef ?? passwordRef.current;
     }
-    if (hasError) {
-      // Focus the first invalid field — there is no error banner yet,
-      // and the user's job is to fix a specific input.
-      emailRef.current?.focus();
+    if (firstInvalidRef !== null) {
+      // Focus the *first* invalid field — there is no error banner yet,
+      // and the user's job is to fix a specific input.  (B3)
+      firstInvalidRef.focus();
       return;
     }
 
+    inFlightRef.current = true;
     setIsSubmitting(true);
 
     try {
@@ -221,27 +291,48 @@ function LoginForm() {
         email: email.trim(),
         password,
       });
-      persistAuthTokens(response);
+
+      // Persist tokens first.  If this throws (quota exceeded, private
+      // mode, …) the credentials are still valid server-side; we must
+      // not surface a misleading "invalid credentials" message.  (B8)
+      try {
+        persistAuthTokens(response);
+      } catch (persistErr) {
+        // eslint-disable-next-line no-console
+        console.error("Failed to persist auth tokens:", persistErr);
+        setSubmitError(
+          "Signed in, but your session could not be saved in this " +
+            "browser. Please enable storage for this site and try again.",
+        );
+        setErrorSeq((n) => n + 1);
+        inFlightRef.current = false;
+        setIsSubmitting(false);
+        return;
+      }
+
       // ``replace`` (not ``push``) — after logging in, the user must not
       // be able to go "back" to the login page.
       router.replace(redirectTarget);
       // ``refresh`` so that any server-rendered state (middleware,
       // server components that read the new cookie) re-evaluates.
       router.refresh();
+      // If the navigation above actually unmounts us, ``isSubmitting``
+      // staying ``true`` is fine.  But if the navigation fails (middleware
+      // loop, route not found, network error during RSC fetch), we stay
+      // mounted — and a form stuck in ``isSubmitting`` with no feedback
+      // is a dead end.  Release the lock unconditionally on the next
+      // macrotask so the user can retry.  (B2)
+      window.setTimeout(() => {
+        inFlightRef.current = false;
+        setIsSubmitting(false);
+      }, 0);
     } catch (err) {
-      const apiError =
-        err instanceof NexusApiError
-          ? err
-          : new NexusApiError(
-              err instanceof Error ? err.message : String(err),
-              { code: "INTERNAL_ERROR", status: 0, cause: err },
-            );
+      const apiError = toNexusApiError(err);
       setSubmitError(describeLoginError(apiError));
+      setErrorSeq((n) => n + 1);
+      inFlightRef.current = false;
       setIsSubmitting(false);
     }
-    // On success we deliberately leave ``isSubmitting`` true — the
-    // component is about to be unmounted by the navigation, and
-    // re-enabling the button for a fraction of a frame would flicker.
   }
 
   return (
@@ -314,13 +405,17 @@ function LoginForm() {
               type="email"
               name="email"
               autoComplete="email"
-              autoFocus
               required
               value={email}
               onChange={(event) => {
                 setEmail(event.target.value);
                 if (emailError !== null) {
                   setEmailError(null);
+                }
+                // Clear the banner as soon as the user edits either
+                // field — it is stale feedback at that point.  (B6)
+                if (submitError !== null) {
+                  setSubmitError(null);
                 }
               }}
               disabled={isSubmitting}
@@ -353,6 +448,7 @@ function LoginForm() {
             </label>
             <div className="relative">
               <input
+                ref={passwordRef}
                 id={passwordId}
                 type={showPassword ? "text" : "password"}
                 name="password"
@@ -363,6 +459,9 @@ function LoginForm() {
                   setPassword(event.target.value);
                   if (passwordError !== null) {
                     setPasswordError(null);
+                  }
+                  if (submitError !== null) {
+                    setSubmitError(null);
                   }
                 }}
                 disabled={isSubmitting}

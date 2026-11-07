@@ -125,6 +125,34 @@ const LIBRARY_STALE_TIME_MS = 30_000;
 const RECENT_ITEMS_LIMIT = 5;
 
 // ───────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse an ISO date string (or numeric timestamp) into epoch milliseconds.
+ *
+ * The library endpoint is not guaranteed to return ISO-8601 with a fixed
+ * timezone, and ``String.prototype.localeCompare`` would silently mis-order
+ * any other format (``"15/01/2024"`` vs ``"16/01/2024"`` sorts wrong, and
+ * even ISO strings without a leading zero compare wrong under some
+ * locales).  Parsing through ``Date`` is the only robust option.
+ *
+ * Returns ``0`` for a malformed value so that the sort is stable and never
+ * throws — the panel simply shows the entries in the order the backend
+ * returned them.
+ */
+function parseAddedAt(value: string | number | null | undefined): number {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : 0;
+  }
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Page
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -161,11 +189,14 @@ export default function HomePage() {
   const libraryTotal = libraryQuery.data?.total ?? 0;
 
   // Most recent downloads — ``useDownload`` already sorts by ``created_at``
-  // descending, so taking a prefix is enough.
+  // descending, so taking a prefix is enough.  Keep the *full* length
+  // available to the panel so it can decide whether to show the "View all"
+  // link without having to re-read the store.
   const recentDownloads = useMemo<DownloadTask[]>(
     () => downloads.tasks.slice(0, RECENT_ITEMS_LIMIT),
     [downloads.tasks],
   );
+  const hasMoreDownloads = downloads.tasks.length > RECENT_ITEMS_LIMIT;
 
   // Most recently added library entries.  Sorted client-side so the
   // dashboard does not depend on the backend's ordering guarantee for a
@@ -173,7 +204,7 @@ export default function HomePage() {
   const recentLibrary = useMemo<LibraryEntry[]>(() => {
     const items = libraryQuery.data?.items ?? [];
     return [...items]
-      .sort((a, b) => b.added_at.localeCompare(a.added_at))
+      .sort((a, b) => parseAddedAt(b.added_at) - parseAddedAt(a.added_at))
       .slice(0, RECENT_ITEMS_LIMIT);
   }, [libraryQuery.data]);
 
@@ -233,7 +264,7 @@ export default function HomePage() {
           tone="primary"
           href="/downloads?status=active"
           isLoading={!downloads.isInitialized}
-          error={null}
+          error={downloads.error}
         />
         <StatCard
           label="Completed"
@@ -242,7 +273,7 @@ export default function HomePage() {
           tone="success"
           href="/downloads?status=completed"
           isLoading={!downloads.isInitialized}
-          error={null}
+          error={downloads.error}
         />
         <StatCard
           label="Library"
@@ -273,6 +304,7 @@ export default function HomePage() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
           <RecentDownloadsPanel
             tasks={recentDownloads}
+            hasMore={hasMoreDownloads}
             error={downloads.error}
             onRetry={downloads.refetch}
             onPause={(id) => {
@@ -406,10 +438,11 @@ function StatCard({
  * * **Error with no data** — a scoped error banner with a retry button.
  * * **Empty** — a small empty block with a link to ``/search``.
  * * **Populated** — the recent tasks, followed by a "View all" link when
- *   there are more than the panel shows.
+ *   ``hasMore`` is true (i.e. the store holds more than the panel shows).
  */
 function RecentDownloadsPanel({
   tasks,
+  hasMore,
   error,
   onRetry,
   onPause,
@@ -418,6 +451,7 @@ function RecentDownloadsPanel({
   onRemove,
 }: {
   tasks: readonly DownloadTask[];
+  hasMore: boolean;
   error: NexusApiError | null;
   onRetry: () => Promise<void>;
   onPause: (taskId: string) => void;
@@ -425,8 +459,6 @@ function RecentDownloadsPanel({
   onCancel: (taskId: string) => void;
   onRemove: (taskId: string) => void;
 }) {
-  const hasMore = tasks.length >= RECENT_ITEMS_LIMIT;
-
   return (
     <section
       aria-labelledby="recent-downloads-heading"
@@ -860,14 +892,15 @@ function OnboardingStep({
  * Mirrors the real layout — four stat cards, two activity panels with
  * three placeholder rows each — so the page does not shift when the real
  * content replaces the skeleton.
+ *
+ * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
+ * is static, so an ``aria-live`` region would never announce anything
+ * (screen readers only announce *changes*).  ``aria-busy`` is the correct
+ * signal for "content is loading".
  */
 function LoadingSkeleton() {
   return (
-    <div
-      className="flex flex-col gap-6"
-      aria-busy="true"
-      aria-live="polite"
-    >
+    <div className="flex flex-col gap-6" aria-busy="true">
       <span className="sr-only">Loading dashboard…</span>
 
       {/* Two-column activity split ------------------------------- */}

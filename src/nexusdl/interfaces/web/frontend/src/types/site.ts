@@ -50,7 +50,7 @@
 // Duplication is avoided by construction: a re-export does not create a
 // second definition — it is the same symbol, re-surfaced.
 
-import type { Site, SiteHealth } from "./manga";
+import type { Language, Site, SiteHealth } from "./manga";
 
 export type {
   Site,
@@ -92,8 +92,15 @@ export interface SiteFilterState {
    * alias, case-insensitively.  Empty string means "no text filter".
    */
   query: string;
-  /** Restrict the visible sites to these languages.  Empty means "all". */
-  languages: ReadonlyArray<string>;
+  /**
+   * Restrict the visible sites to these languages.  Empty means "all".
+   *
+   * Typed as :type:`Language` rather than ``string`` so that the value
+   * flows straight into :type:`~./manga.SearchRequest.languages` without a
+   * cast and so that an invalid language can never reach the UI state in
+   * the first place.
+   */
+  languages: ReadonlyArray<Language>;
   /**
    * Restrict the visible sites to these ids.  Empty means "all".
    *
@@ -173,8 +180,10 @@ export type SiteHealthTone = "ok" | "warn" | "bad" | "neutral";
  * them a ``Map`` avoids an O(n) ``find`` per row in the search results,
  * which for a 60-site catalogue × 100-result page is measurable.
  *
- * Modelled as ``ReadonlyMap`` rather than an object so that callers
- * cannot accidentally mutate the cache.
+ * ``ReadonlyMap`` is a **compile-time** immutability guarantee only — the
+ * runtime object is a regular ``Map``, and a caller that deliberately
+ * casts through ``any`` can still mutate it.  Consumers that respect the
+ * type system cannot, which is the invariant this type enforces.
  */
 export type SiteIndex = ReadonlyMap<string, Site>;
 
@@ -194,8 +203,13 @@ export type SiteIndex = ReadonlyMap<string, Site>;
  *  - ``down``     → ``"bad"``      (red)
  *  - ``unknown``  → ``"neutral"``  (grey)
  *
- * This is the single place the mapping is written.  A theme redesign
- * changes one function, not every badge in the app.
+ * The ``default`` arm handles the case where a future backend adds a new
+ * ``SiteHealth`` value and the frontend has not been rebuilt yet — a
+ * neutral badge is a correct, non-crashing fallback.  This is deliberate:
+ * a ``never`` exhaustiveness check would require updating this function at
+ * the same time as the type, which defeats the purpose of having a
+ * fallback at all.  A type-unsafe value therefore degrades the badge to
+ * grey instead of breaking the page.
  */
 export function siteHealthTone(health: SiteHealth): SiteHealthTone {
   switch (health) {
@@ -206,6 +220,7 @@ export function siteHealthTone(health: SiteHealth): SiteHealthTone {
     case "down":
       return "bad";
     case "unknown":
+    default:
       return "neutral";
   }
 }

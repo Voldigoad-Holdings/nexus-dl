@@ -74,6 +74,12 @@ All exports are **lazy** via PEP 562 (``__getattr__``). Importing
 ``nexusdl.interfaces.web.backend`` never imports FastAPI, Pydantic,
 python-jose, or any submodule. Symbols are resolved on first attribute
 access and cached in ``globals()``.
+
+The lazy loader intentionally catches ``ImportError`` — not just
+``ModuleNotFoundError`` — so that a partially initialized submodule (a
+missing symbol, a circular import resolved differently across Python
+versions) also gets the ``[web]`` install hint instead of a raw
+traceback with an ambiguous message.
 """
 from __future__ import annotations
 
@@ -88,6 +94,13 @@ except Exception:  # pragma: no cover - defensive fallback
     __version__ = "3.0.0"
 
 #: HTTP API contract version (independent from the package version).
+#:
+#: Duplicated here (rather than imported from
+#: :mod:`~nexusdl.interfaces.web.backend.schemas.responses`) to keep this
+#: package's import cost at zero when only the version is requested. The
+#: value is kept in sync with ``schemas/responses.py::API_VERSION`` by
+#: hand; if the API contract is ever bumped, both constants must change
+#: together.
 API_VERSION: str = "v1"
 
 
@@ -215,6 +228,12 @@ if TYPE_CHECKING:
 def __getattr__(name: str) -> Any:
     """Resolve a public symbol on first access (PEP 562).
 
+    The catch is intentionally broadened from ``ModuleNotFoundError`` to
+    ``ImportError`` — a partially-initialized submodule (missing symbol,
+    circular import that resolves differently across Python versions)
+    also deserves the ``[web]`` install hint rather than a raw
+    traceback with an ambiguous message.
+
     Raises:
         AttributeError: If ``name`` is not a known public symbol.
         ImportError: If the symbol's module cannot be imported because
@@ -237,7 +256,9 @@ def __getattr__(name: str) -> Any:
 
     try:
         module = importlib.import_module(f".{submodule}", __name__)
-    except ModuleNotFoundError as exc:
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose — see the ``Loading strategy`` docstring section.
         if exc.name in {
             "fastapi",
             "pydantic",
@@ -260,8 +281,14 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Expose the full public API to ``dir()``, IDEs and tab-completion."""
-    return sorted(list(globals().keys()) + list(__all__))
+    """Expose the full public API to ``dir()``, IDEs and tab-completion.
+
+    Uses a **set** union so that symbols already cached in ``globals()``
+    by :func:`__getattr__` are not listed twice (a plain list
+    concatenation would produce duplicates once the symbol has been
+    accessed).
+    """
+    return sorted(set(globals()) | set(__all__))
 
 
 # --- Introspection ---------------------------------------------------------
@@ -282,6 +309,12 @@ def get_symbol(name: str) -> Any:
     message when the name is unknown. Convenient for dynamic lookups
     (config-driven hosts, plugins, parametrized tests).
 
+    The lookup goes through :func:`__getattr__` so the resolution is
+    cached in ``globals()`` and subsequent calls do not pay the
+    ``importlib`` overhead again — and so a missing optional dependency
+    surfaces as an :class:`ImportError` with the ``[web]`` hint, not a
+    raw ``ModuleNotFoundError``.
+
     Raises:
         KeyError: If ``name`` is not a registered symbol.
     """
@@ -290,4 +323,4 @@ def get_symbol(name: str) -> Any:
         raise KeyError(
             f"Unknown symbol {name!r}. Available: {available}"
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    return __getattr__(name)

@@ -63,6 +63,23 @@ Two things the registry does not provide:
   The resolver is a callback so this module never imports the parser
   package (rule R1).
 
+The ``iter_disabled`` contract
+------------------------------
+:func:`iter_disabled` yields the *canonical id* of every disabled entry,
+**regardless of the entry's shape**. The ``disabled_sites`` section
+accepts two documented forms (identical to
+:meth:`~nexusdl.core.registry.site_registry.SiteRegistry._build_disabled`):
+
+* A bare string — ``- batoto`` — the simple form.
+* A mapping — ``- {id: batoto, reason: "..."}`` — the documented form,
+  where ``reason`` is preserved in the YAML as a human-readable comment
+  and ignored by both this loader and the registry.
+
+Yielding the id (never the mapping) keeps the return type
+``Iterator[str]`` for both forms. It also preserves the parity with the
+registry's own ``_build_disabled``, so the future refactor of
+``site_registry.py`` (documented above) remains a straight substitution.
+
 Pure vs I/O
 -----------
 The public API is split by whether it touches the filesystem:
@@ -90,7 +107,6 @@ Dependency graph (no cycles)::
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from importlib.resources import files as _resource_files
@@ -171,10 +187,16 @@ class ParserClassIssue:
     reason: str
 
     def __str__(self) -> str:
-        """Return ``sites[<index>].parser_class (<class>) <reason>``."""
+        """Return ``sites[<index>].parser_class (<class>) <reason>``.
+
+        Newlines in :attr:`reason` (a resolver that reports a multi-line
+        exception) are flattened to spaces so a CI report stays one line
+        per issue.
+        """
+        flat = self.reason.replace("\n", " ").strip()
         return (
             f"sites[{self.index}].parser_class "
-            f"({self.parser_class!r}): {self.reason}"
+            f"({self.parser_class!r}): {flat}"
         )
 
 
@@ -281,13 +303,21 @@ def parse_sites_document(text: str) -> Mapping[str, Any]:
         level.
 
     Raises:
-        ConfigError: If the YAML is syntactically invalid, or its
-            top-level value is not a mapping (a list, a string, or
-            ``None`` — none of which a sites document may be).
+        ConfigError: If the YAML is syntactically invalid (including a
+            pathologically nested document that exceeds Python's
+            recursion limit — PyYAML raises ``RecursionError`` for
+            those, and we surface it as a YAML error), or its top-level
+            value is not a mapping (a list, a string, or ``None`` — none
+            of which a sites document may be).
     """
     try:
         document = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
+        # ``RecursionError`` is raised by PyYAML for pathologically
+        # nested documents; treating it as a YAML parse failure keeps
+        # the ConfigError contract intact for the caller (an editor-
+        # controlled file, or a malicious one, must not crash the
+        # caller with an uncaught RecursionError).
         raise ConfigError(
             f"invalid YAML in sites configuration: {exc}"
         ) from exc
@@ -452,7 +482,22 @@ def iter_categories(
 def iter_disabled(
     document: Mapping[str, Any],
 ) -> Iterator[str]:
-    """Yield every entry in the ``disabled_sites`` section, in order.
+    """Yield the canonical site id of every ``disabled_sites`` entry.
+
+    Both documented entry forms are accepted and normalized to the id:
+
+    * A bare string — ``- batoto`` — yields ``"batoto"``.
+    * A mapping — ``- {id: batoto, reason: "..."}`` — yields ``"batoto"``;
+      ``reason`` is ignored here (it is a human comment, not a policy).
+
+    This dual-form acceptance mirrors
+    :meth:`~nexusdl.core.registry.site_registry.SiteRegistry._build_disabled`
+    exactly, so the future refactor of ``site_registry.py`` documented
+    above is a straight substitution. A caller that wants the mapping
+    entries with their ``reason`` fields uses :func:`iter_sites`-style
+    inspection of the raw document (there is no higher-level accessor
+    because no call site needs one — reasons are for editors, not
+    runtime).
 
     Does **not** filter entries that name an unknown site — a tool that
     wants to warn about stale entries does so by comparing against
@@ -470,8 +515,9 @@ def iter_disabled(
         Each disabled site id, in document order.
 
     Raises:
-        ConfigError: If the section is not a list, or contains a
-            non-string entry.
+        ConfigError: If the section is not a list, contains a non-string
+            non-mapping entry, or contains a mapping without a string
+            ``id`` key.
     """
     raw = document.get(_KEY_DISABLED_SITES) or ()
     if not isinstance(raw, (list, tuple)):
@@ -479,13 +525,34 @@ def iter_disabled(
             f"{_KEY_DISABLED_SITES!r} must be a list, got "
             f"{type(raw).__name__}"
         )
-    for raw_id in raw:
-        if not isinstance(raw_id, str):
+    for entry in raw:
+        yield _extract_disabled_id(entry)
+
+
+def _extract_disabled_id(entry: Any) -> str:
+    """Extract the canonical site id from a ``disabled_sites`` entry.
+
+    Accepts a bare string or a mapping with a string ``id`` key. Any
+    other shape raises :class:`ConfigError`.
+
+    Kept private — the public contract is ``iter_disabled -> Iterator[str]``,
+    not the extraction rule. A caller that wants to validate a raw entry
+    manually reads ``document.get("disabled_sites")``.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, Mapping):
+        site_id = entry.get("id")
+        if not isinstance(site_id, str):
             raise ConfigError(
-                f"{_KEY_DISABLED_SITES} entries must be strings, got "
-                f"{type(raw_id).__name__}"
+                f"{_KEY_DISABLED_SITES} entry has a non-string 'id': "
+                f"{site_id!r}"
             )
-        yield raw_id
+        return site_id
+    raise ConfigError(
+        f"{_KEY_DISABLED_SITES} entries must be strings or mappings "
+        f"with an 'id' key, got {type(entry).__name__}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -503,6 +570,16 @@ def check_parser_classes(
     ``parser_class`` string. A resolver that returns ``None`` means the
     class resolved successfully; any other return value is treated as a
     human-readable failure reason.
+
+    **The resolver contract is: return a ``str | None``, never raise.**
+    A resolver is expected to catch its own ``ImportError`` /
+    ``AttributeError`` / ``ValueError`` and turn it into a message; that
+    is why the callback shape ``(str) -> str | None`` is used instead of
+    a plain ``import_module`` (which raises). If a misbehaving resolver
+    *does* raise, :func:`check_parser_classes` still produces a usable
+    :class:`ParserClassIssue` (the exception is captured and flattened
+    into ``reason``), so a single resolver bug does not crash a CI run —
+    but a well-behaved resolver never reaches that path.
 
     The resolver is a **callback**, not a direct import, so this module
     never imports the parser package (rule R1). Callers choose the
@@ -537,7 +614,7 @@ def check_parser_classes(
             and reports issues rather than raising.
         resolver: Callable that takes a ``"module:ClassName"`` string
             and returns ``None`` on success, or a reason string on
-            failure.
+            failure. Must not raise; see the contract above.
 
     Returns:
         A list of :class:`ParserClassIssue`, in document order. Empty
@@ -564,9 +641,12 @@ def check_parser_classes(
             # A resolver is contractually expected to catch its own
             # exceptions and return a reason. If it does not, we still
             # produce a usable issue rather than propagating a resolver
-            # bug up the stack.
+            # bug up the stack — but the message flags it as a
+            # **resolver contract violation**, not an import failure,
+            # so a CI log does not misattribute the bug to the site.
             reason = (
-                f"resolver raised {type(exc).__name__}: {exc}"
+                f"resolver contract violation "
+                f"({type(exc).__name__}): {exc}"
             )
         if reason is not None:
             issues.append(

@@ -132,7 +132,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 from pydantic import SecretStr
 
-from nexusdl.core.exceptions import CookieEncryptionError, LibraryError
+from nexusdl.core.exceptions import CookieEncryptionError
 
 
 __all__ = [
@@ -376,7 +376,6 @@ class CookieManager:
         "_clock",
         "_env_cookies",
         "_fernet",
-        "_key",
         "_lock",
         "_path",
         "_refresh_threshold",
@@ -414,7 +413,6 @@ class CookieManager:
                 f"cryptography.fernet.Fernet.generate_key().decode()"
             ) from exc
 
-        self._key: SecretStr = key
         self._fernet: Fernet = fernet
         self._path: Path = path
         self._clock: Callable[[], float] = clock
@@ -605,10 +603,25 @@ class CookieManager:
             )
             temp_path = Path(raw_temp)
             try:
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(ciphertext)
-                    fh.flush()
-                    os.fsync(fh.fileno())
+                # ``os.fdopen`` can raise ``MemoryError`` or similar
+                # before the ``with`` block establishes the buffered
+                # stream. If that happens, the raw ``fd`` from
+                # ``mkstemp`` would leak until the GC finalises it.
+                # ``try/except BaseException`` with an explicit
+                # ``os.close`` in the failure branch closes the fd
+                # unconditionally; the normal path lets the ``with``
+                # block close it.
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(ciphertext)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                except BaseException:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    raise
                 # chmod BEFORE replace: the final path must never be
                 # visible with default umask. On POSIX a failure here
                 # is fatal (see docstring); on Windows it is a
@@ -616,7 +629,10 @@ class CookieManager:
                 _chmod_owner_only(temp_path)
                 temp_path.replace(self._path)
             except (OSError, CookieEncryptionError):
-                temp_path.unlink(missing_ok=True)
+                _safe_unlink(temp_path)
+                raise
+            except BaseException:
+                _safe_unlink(temp_path)
                 raise
 
             _log.debug(
@@ -1092,6 +1108,19 @@ def _chmod_owner_only(path: Path) -> None:
             type(exc).__name__,
             exc,
         )
+
+
+def _safe_unlink(path: Path) -> None:
+    """Best-effort removal of *path*, never raising.
+
+    Used in the exception-handling paths of :meth:`CookieManager.save` so
+    that a failure to clean up a temp file (permissions, FS read-only)
+    does not replace the exception the caller actually needs to see.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- #

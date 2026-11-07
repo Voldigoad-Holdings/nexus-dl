@@ -54,16 +54,21 @@
  * value-trio:
  *
  * * `aria-valuemin` = `0`
- * * `aria-valuemax` = `max`
- * * `aria-valuenow` = `value` (omitted when indeterminate, per ARIA)
+ * * `aria-valuemax` = `100` when indeterminate (the ARIA default), `max`
+ *   otherwise
+ * * `aria-valuenow` = `value` (omitted when indeterminate, per ARIA —
+ *   this is what marks the bar as "busy, unknown progress")
  * * `aria-valuetext` = `valueText` if provided, else `${percent}%`
+ *   (omitted when indeterminate)
  * * `aria-label` = `ariaLabel` if provided, else `label`
  * * `aria-busy` = `true` when indeterminate
  *
- * The percentage text shown next to a visible label is purely visual —
- * assistive technology hears the same value through `aria-valuenow` /
- * `aria-valuetext`.  This avoids the double-announcement that would occur
- * if the text were also in the accessible name.
+ * The percentage text shown next to a visible label is **decorative**:
+ * assistive technology hears the value through `aria-valuenow` /
+ * `aria-valuetext`, and the visible text is marked `aria-hidden` so it
+ * does not contribute to the progressbar's accessible name (the name is
+ * `label` / `ariaLabel` only).  This avoids double-announcing the
+ * percentage.
  *
  * When `valueText` is not provided and no `label` is set, the progressbar
  * has no accessible name.  That is acceptable inside a `DownloadItem`
@@ -113,6 +118,16 @@ const VARIANT_CLASSES = {
   warning: "bg-amber-500",
   danger: "bg-red-500",
 } as const;
+
+/**
+ * ARIA default ``aria-valuemax`` value.
+ *
+ * The ARIA 1.2 spec defines ``100`` as the default for a progressbar.  We
+ * set it explicitly when the bar is indeterminate — the element must
+ * still have a valid ``aria-valuemax`` in that state, and using the spec
+ * default is the least surprising choice.
+ */
+const ARIA_DEFAULT_VALUEMAX = 100;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Types
@@ -252,9 +267,14 @@ export function ProgressBar({
     !Number.isFinite(max) ||
     max <= 0;
 
+  // In the determinate branch, ``value`` is guaranteed to be a finite
+  // ``number`` by the ``isIndeterminate`` guard above.  TypeScript cannot
+  // see through the composite boolean, so the cast makes the narrowing
+  // explicit at the call site of ``clampNumber`` (which accepts a plain
+  // ``number``).
   const clampedValue = isIndeterminate
     ? 0
-    : clampNumber(value, 0, max);
+    : clampNumber(value as number, 0, max);
 
   const percent = isIndeterminate ? 0 : (clampedValue / max) * 100;
 
@@ -267,8 +287,17 @@ export function ProgressBar({
   // Build the display / aria text.
   // -------------------------------------------------------------------
   const displayValue = valueText ?? `${roundedPercent}%`;
-  const ariaValueText = isIndeterminate ? undefined : (valueText ?? `${roundedPercent}%`);
+  const ariaValueText = isIndeterminate
+    ? undefined
+    : (valueText ?? `${roundedPercent}%`);
   const accessibleLabel = ariaLabel ?? label;
+
+  // ``aria-valuemax`` must always be a valid number on a ``progressbar``
+  // — omitting it is a spec violation even in indeterminate mode, where
+  // ARIA defines 100 as the default.  ``aria-valuenow`` is the field that
+  // signals indeterminate (its absence), so that one is legitimately
+  // omitted.
+  const ariaValueMax = isIndeterminate ? ARIA_DEFAULT_VALUEMAX : max;
 
   const showHeader = label !== undefined || (showValue && !isIndeterminate);
 
@@ -277,10 +306,27 @@ export function ProgressBar({
       {showHeader && (
         <div className="mb-1.5 flex items-center justify-between gap-2 text-xs">
           {label !== undefined && (
-            <span className="truncate text-muted-foreground">{label}</span>
+            <span
+              // The label is decorative when ``ariaLabel`` is provided:
+              // the progressbar's accessible name is already set.  Marking
+              // the visible span ``aria-hidden`` prevents a screen reader
+              // from reading the same string twice (once as the label,
+              // once as the name via ``aria-label``).
+              aria-hidden={ariaLabel !== undefined || undefined}
+              className="truncate text-muted-foreground"
+            >
+              {label}
+            </span>
           )}
           {showValue && !isIndeterminate && (
-            <span className="shrink-0 font-mono tabular-nums text-foreground">
+            <span
+              // The value text is announced through ``aria-valuetext`` on
+              // the progressbar itself; the visible text is purely
+              // visual, so it is hidden from assistive technology to
+              // avoid double-announcement.
+              aria-hidden
+              className="shrink-0 font-mono tabular-nums text-foreground"
+            >
               {displayValue}
             </span>
           )}
@@ -290,7 +336,7 @@ export function ProgressBar({
       <div
         role="progressbar"
         aria-valuemin={0}
-        aria-valuemax={isIndeterminate ? undefined : max}
+        aria-valuemax={ariaValueMax}
         aria-valuenow={isIndeterminate ? undefined : clampedValue}
         aria-valuetext={ariaValueText}
         aria-label={accessibleLabel}

@@ -116,7 +116,7 @@ Dependency graph (no cycles)::
 
     core.models.enums  ──►  core.config
     pydantic, pydantic-settings, platformdirs, PyYAML,
-    cryptography (Fernet key generation in bootstrap)
+    cryptography (Fernet key generation in bootstrap only — imported lazily)
 
 No dependency on any other ``nexusdl.core`` module — this file is a
 **leaf** on the project side and sits at the top of the domain
@@ -134,7 +134,6 @@ from typing import Any, Final, Literal
 
 import platformdirs
 import yaml
-from cryptography.fernet import Fernet
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -518,11 +517,21 @@ class StorageSection(_Section):
             default is computed under ``platformdirs.user_data_path`` so
             a fresh install works without configuration.
         temporary_dir: Directory for per-chapter temp directories during
-            a download. ``None`` (the default) means "use
-            ``downloads_dir``" — the temp directory lives next to the
-            final output, so the packager's rename is a no-op
-            cross-filesystem move. A caller with a dedicated fast
-            scratch volume sets this explicitly.
+            a download. ``None`` (the default) means "use the parent
+            directory of the target output" — the temp directory lives
+            next to the final output, so the packager's rename is a
+            no-op cross-filesystem move.
+
+            .. note::
+
+               **The current ``worker.py`` does not read this field.**
+               ``DownloadWorker._create_temp_dir`` uses
+               ``target.parent`` unconditionally. A deployment that
+               sets this field to a fast scratch volume gets no
+               benefit today. This is a known gap between the config
+               schema and the worker implementation; fixing it is
+               scheduled for the next time ``worker.py`` is opened.
+               A caller that relies on this field should not.
     """
 
     downloads_dir: Path = Field(
@@ -779,10 +788,10 @@ class ImageSection(_Section):
             re-encode. ``85`` is the same visually-lossless default.
     """
 
-    model_config = ConfigDict(
-        frozen=True,
-        extra="forbid",
-        str_strip_whitespace=True,
+    # Merge with the base config rather than replacing it — a future
+    # addition to ``_Section.model_config`` must propagate to this
+    # subclass too. ``ConfigDict`` is a plain dict, so ``|`` works.
+    model_config = _Section.model_config | ConfigDict(
         populate_by_name=True,
     )
 
@@ -1099,6 +1108,19 @@ class PluginsSection(_Section):
         data_dir: Root directory for per-plugin data directories. When
             ``None``, the loader falls back to
             ``platformdirs.user_data_path(_APP_NAME) / "plugins"``.
+
+            .. note::
+
+               This is **not** the same conceptual root as
+               :attr:`PathsSection.plugins_dir`. That field is the
+               root directory of *installed plugins*; this field is
+               the root directory of *per-plugin data*. They happen to
+               default to the same path today, which is an ambiguity
+               to resolve when the plugin loader is next opened — a
+               plugin that writes its own data inside its install
+               directory is harder to distinguish from a plugin
+               installation than it should be.
+
         install_dir: Directory the plugin *installer* writes to when
             the user installs a plugin from a file. ``None`` (the
             default) means "use the first entry in :attr:`dirs`". A
@@ -1462,11 +1484,16 @@ class _PackageYamlSource(PydanticBaseSettingsSource):
                 / _DEFAULT_YAML_FILENAME
             )
             text = resource.read_text(encoding="utf-8")
-        except (ModuleNotFoundError, FileNotFoundError, OSError):
+        except (
+            ModuleNotFoundError,
+            FileNotFoundError,
+            OSError,
+            UnicodeDecodeError,
+        ):
             return {}
         try:
             data = yaml.safe_load(text)
-        except yaml.YAMLError:
+        except (yaml.YAMLError, RecursionError, ValueError):
             return {}
         if not isinstance(data, dict):
             return {}
@@ -1509,7 +1536,12 @@ class _UserYamlSource(PydanticBaseSettingsSource):
         try:
             with self._path.open("r", encoding="utf-8") as fh:
                 data = yaml.safe_load(fh)
-        except (OSError, yaml.YAMLError):
+        except (
+            OSError,
+            yaml.YAMLError,
+            RecursionError,
+            ValueError,
+        ):
             return {}
         if not isinstance(data, dict):
             return {}
@@ -1761,6 +1793,12 @@ def generate_env_content() -> str:
         explaining the file, followed by the three ``NEXUSDL_*``
         assignments in the format the loader reads.
     """
+    # Imported lazily — only ``bootstrap_env_file`` needs the
+    # cryptography package, and keeping the import out of the module
+    # top-level lets ``nexusdl.core.config`` load without pulling in
+    # the Fernet implementation on a code path that only reads config.
+    from cryptography.fernet import Fernet
+
     return (
         "# NexusDL secrets — generated by `nexusdl admin init`.\n"
         "# Never commit this file to version control.\n"
@@ -1813,11 +1851,13 @@ def bootstrap_env_file(
     path.write_text(generate_env_content(), encoding="utf-8")
     try:
         os.chmod(path, 0o600)
-    except OSError as exc:
-        # Non-POSIX filesystems may reject the chmod; the write itself
-        # already succeeded, and the secrets are still in the file.
-        # The operator's filesystem permissions are their own concern,
-        # but the failure should be visible, not silently swallowed.
+    except (OSError, NotImplementedError) as exc:
+        # Non-POSIX filesystems may reject the chmod, and some Windows
+        # configurations raise NotImplementedError rather than OSError.
+        # The write itself already succeeded, and the secrets are still
+        # in the file. The operator's filesystem permissions are their
+        # own concern, but the failure should be visible, not silently
+        # swallowed.
         warnings.warn(
             f"Could not set 0600 permissions on {path}: {exc}",
             stacklevel=2,

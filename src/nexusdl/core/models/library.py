@@ -3,7 +3,7 @@
 This module is the **canonical home** for the value objects that describe
 library state: reading progress and library-wide statistics. Both are pure
 data structures — no I/O, no logging, no SQLAlchemy, no dependency beyond
-:mod:`nexusdl.core.models.enums` (for none) and the standard library.
+the standard library.
 
 The one thing that lives here that also exists elsewhere
 --------------------------------------------------------
@@ -23,16 +23,44 @@ The plan is:
    After it, :meth:`LibraryDatabase.get_reading_progress` returns this
    module's class.
 
-The two classes are structurally identical (same fields, same construction
-arguments), so a caller switching from one to the other sees no behaviour
-change. ``isinstance`` checks **mixing** the two would return ``False`` for
-the wrong class; that is exactly the bug the consolidation removes, and it
-is why this file's docstring leads with the issue rather than burying it.
+**The two classes are structurally identical but their validation differs.**
+The inline class in ``database.py`` accepts any argument without checking —
+it has ``__slots__`` and an ``__init__`` but no ``__post_init__``. This
+class validates every field (non-empty strings, non-negative
+``page_index``, tz-aware ``updated_at``). The consequence for the
+consolidation is:
+
+* After consolidation, a caller that was passing structurally-invalid
+  values (e.g. ``page_index=-1``) to the *inline* class will start
+  receiving :class:`ValueError`. That is intentional — the inline class
+  was silently accepting invalid data.
+* ``isinstance(x, ReadingProgress)`` will only return ``True`` for the
+  consolidated class **after** the import swap. Today, ``isinstance``
+  checks that mix the two — importing from ``database`` in one place and
+  from ``models.library`` in another — return ``False`` for the wrong
+  class. That is exactly the bug the consolidation removes, and it is why
+  this docstring leads with the issue rather than burying it.
+
+Until consolidation, callers should import :class:`ReadingProgress` from
+**one** module only — prefer this one, which will survive the swap.
 
 :class:`LibraryStats` is entirely new — no duplication. It exists so the
 CLI (``nexusdl library stats``), the web dashboard, and the health-check
 endpoint all render aggregate library numbers from a single, well-typed
 value object rather than each summing the same columns in ad-hoc SQL.
+
+Invariants and what the model does **not** enforce
+--------------------------------------------------
+:class:`LibraryStats` documents the invariant
+``manga_count == 0 ⇒ chapter_count == 0 and page_count == 0`` but does
+**not** enforce it. Reason: the aggregate query that will populate this
+object reads the three tables independently, and a concurrent writer can
+make the three counts momentarily inconsistent (a chapter being inserted
+while the manga row already exists, or vice-versa during a delete). A
+strict check at construction would turn a transient race into a spurious
+:class:`ValueError`. Consumers that need the invariant can check
+:attr:`LibraryStats.is_empty` and validate the derived counts at their
+level if they care.
 
 Dependency graph (no cycles)::
 
@@ -74,6 +102,13 @@ class ReadingProgress:
     query time from ``page_index == chapter.page_count - 1``. Storing a
     completion flag would go stale whenever a chapter's page count was
     corrected.
+
+    **Note on the duplicate definition in ``database.py``.** That class is
+    structurally identical but skips validation entirely (no
+    ``__post_init__``). This class is the canonical, validating version;
+    the consolidation plan is documented in the module docstring.
+    ``isinstance`` checks that mix the two classes return ``False`` for the
+    wrong class until the import swap is performed.
 
     Attributes:
         manga_id: The manga this progress belongs to. Matches
@@ -195,6 +230,16 @@ class LibraryStats:
     timestamp. The invariants enforced at construction are exactly the ones
     the underlying aggregates can guarantee: never negative, never naive.
 
+    **The zero-manga invariant is documented but not enforced.** A library
+    with ``manga_count == 0`` should have ``chapter_count == 0`` and
+    ``page_count == 0`` (the schema's foreign keys enforce the relation),
+    but the three counts in this object are computed independently and a
+    concurrent writer can make them momentarily inconsistent. A strict
+    check at construction would turn a transient race into a spurious
+    ``ValueError``. Consumers that need the invariant should check
+    :attr:`is_empty` and verify the derived counts at their level if they
+    care.
+
     Attributes:
         manga_count: Total number of manga rows in the library.
         chapter_count: Total number of chapter rows in the library.
@@ -262,8 +307,10 @@ class LibraryStats:
         """``True`` iff the library contains no mangas.
 
         A library with ``manga_count == 0`` necessarily has zero chapters
-        and zero pages (the schema enforces the relationship), so checking
-        the manga count alone is sufficient and unambiguous.
+        and zero pages in a quiescent state (the schema's foreign keys
+        enforce the relationship). This property checks only the manga
+        count — see the class docstring for why the model does not
+        additionally validate the other two counts against it.
         """
         return self.manga_count == 0
 

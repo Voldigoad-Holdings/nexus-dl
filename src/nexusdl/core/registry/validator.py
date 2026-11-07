@@ -175,8 +175,13 @@ class SiteSchemaIssue:
         The default ``__repr__`` includes the schema path and validator
         name, which is noisy in a CLI. This ``__str__`` produces exactly
         the shape a report wants.
+
+        Newlines in :attr:`message` (which :mod:`jsonschema` emits for
+        some ``anyOf`` failures) are flattened to spaces so that a
+        multi-line message renders as a single CLI line.
         """
-        return f"{self.yaml_path}: {self.message}"
+        flat = self.message.replace("\n", " ").strip()
+        return f"{self.yaml_path}: {flat}"
 
 
 # --------------------------------------------------------------------------- #
@@ -395,10 +400,29 @@ class SitesValidator:
         # inspect ``ValidationError.context`` directly by calling
         # ``self._validator.iter_errors`` — that is deliberately not
         # exposed here to keep the public surface small.
-        errors = sorted(
-            self._validator.iter_errors(document),
-            key=_error_sort_key,
-        )
+        #
+        # A misbehaving validator (a schema that ``check_schema``
+        # accepted but ``iter_errors`` chokes on — a jsonschema bug or a
+        # malformed schema that slipped through the version-dependent
+        # check) must not propagate a raw exception to the caller who is
+        # merely trying to validate a YAML file. Surface it as a single
+        # ``SiteSchemaIssue``.
+        try:
+            raw_errors = list(self._validator.iter_errors(document))
+        except Exception as exc:
+            _log.exception("JSON Schema validator failed unexpectedly")
+            yield SiteSchemaIssue(
+                yaml_path=_ROOT_PATH,
+                message=(
+                    f"schema validator failed unexpectedly: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                schema_path=_ROOT_PATH,
+                validator="internal_error",
+            )
+            return
+
+        errors = sorted(raw_errors, key=_error_sort_key)
         for error in errors:
             yield self._to_issue(error)
 
@@ -434,7 +458,12 @@ class SitesValidator:
 
         try:
             document = yaml.safe_load(raw_text)
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, RecursionError) as exc:
+            # ``RecursionError`` is raised by PyYAML for pathologically
+            # nested documents (an attacker-controlled YAML can easily
+            # exceed the recursion limit). Treat it as a YAML error:
+            # the caller passed an unparseable document, and refusing
+            # it is the correct response.
             raise ConfigError(
                 f"invalid YAML in {path}: {exc}"
             ) from exc
@@ -495,6 +524,11 @@ def _error_sort_key(
     each segment to ``(kind_rank, value)`` — ``0`` for ints, ``1`` for
     strings — giving a total order across mixed paths.
 
+    ``bool`` values are coerced to their ``int`` equivalent before the
+    path is built (``True`` → ``1``, ``False`` → ``0``) so that a
+    pathological schema that uses boolean keys does not produce a
+    mixed ``(0, True)`` / ``(0, 3)`` comparison tuple.
+
     Args:
         error: The validation error to key.
 
@@ -503,7 +537,9 @@ def _error_sort_key(
     """
     segments: list[tuple[int, Any]] = []
     for segment in error.absolute_path:
-        if isinstance(segment, int):
+        if isinstance(segment, bool):
+            segments.append((0, int(segment)))
+        elif isinstance(segment, int):
             segments.append((0, segment))
         else:
             segments.append((1, str(segment)))

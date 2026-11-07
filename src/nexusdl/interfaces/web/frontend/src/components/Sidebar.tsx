@@ -142,11 +142,14 @@ const NAV_ITEMS: readonly NavItem[] = [
  * Return ``true`` when *item* should be rendered as the active link for
  * *pathname*.
  *
- * ``usePathname()`` is typed as ``string | null`` in Next.js 14 — it is
- * ``null`` only in edge cases (e.g. during some static-rendering fallbacks)
- * and treating it as "no route" is the safe behaviour.  The prefix boundary
- * check uses ``item.href + "/"`` rather than a bare ``startsWith`` so that
- * ``/searching`` does not match ``/search``.
+ * In Next.js 14 App Router, ``usePathname()`` returns ``string`` — not
+ * ``string | null`` (the nullable signature was a Pages Router legacy and
+ * was removed).  The defensive ``null`` guard is kept anyway so that a
+ * future downgrade or a test harness that stubs the hook with ``null``
+ * does not crash the component; it costs nothing at runtime.
+ *
+ * The prefix boundary check uses ``item.href + "/"`` rather than a bare
+ * ``startsWith`` so that ``/searching`` does not match ``/search``.
  */
 function isActive(pathname: string | null, item: NavItem): boolean {
   if (pathname === null) {

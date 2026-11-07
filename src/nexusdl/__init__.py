@@ -14,7 +14,8 @@ canonical path:
 
 * :mod:`nexusdl.core`       - the domain: models, downloader, packaging,
   library, session, registry, events, config, compliance, exceptions,
-  utils. Never imports from the layers below.
+  utils. It never imports from the adapter layers (``parsers``,
+  ``plugins``, ``interfaces``); it is the innermost hexagon.
 * :mod:`nexusdl.parsers`    - the site adapters (adapters secondaires):
   the sixty-plus concrete parsers plus the reusable mixins that most of
   them delegate to. Depends only on :mod:`nexusdl.core`.
@@ -76,6 +77,15 @@ The version string lives in :mod:`nexusdl.version` - the single source of
 truth - and is re-exported here so that ``nexusdl.__version__`` and
 ``nexusdl.version.__version__`` always agree.
 
+**Import cost.** The one eager import below
+(``from nexusdl.version import __version__``) loads
+:mod:`nexusdl.version`, a single-constant module with no third-party
+dependencies. It is the **only** thing loaded by ``import nexusdl``;
+no core symbol, no Pydantic schema, no FastAPI app. A caller that only
+wants the version pays for one trivial module load; a caller that needs
+more imports the specific subpackage directly and pays for exactly that
+subpackage.
+
 Where to go next
 ----------------
 * To use NexusDL programmatically: import a specific subpackage
@@ -87,7 +97,7 @@ Where to go next
 
   .. code-block:: shell
 
-      # Single worker, dev mode
+      # Single worker (dev, staging, or small deployments)
       nexusdl web
 
       # Multi-worker production (canonical deployment pattern)
@@ -100,6 +110,17 @@ Where to go next
   Playwright pool), which is the only safe multi-worker pattern. A
   module-level ``app`` instance is deliberately not exposed for exactly
   this reason.
+
+  **Multi-worker caveat.** The per-worker rate-limit store is
+  :class:`~nexusdl.interfaces.web.backend.middleware.rate_limit.InMemoryRateLimitStore`
+  by default — each worker counts its own requests, so the effective
+  global limit is ``N_workers × per_worker_limit``. Deployments that
+  need a **global** limit (auth brute-force protection, expensive
+  download quotas) must provide a shared store (Redis) via
+  ``RateLimitConfig(store=...)``. Similarly, the default
+  :class:`~nexusdl.interfaces.web.backend.security.InMemoryRevocationStore`
+  is per-worker; JWT revocation requires a shared store in multi-worker
+  deployments. Both are documented in the respective modules.
 
 * To write a plugin: see :mod:`nexusdl.plugins`.
 * To add a parser: see :mod:`nexusdl.parsers` and its shipped mixins.

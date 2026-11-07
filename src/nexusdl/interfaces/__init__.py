@@ -105,6 +105,17 @@ raised as :class:`AttributeError` — required by PEP 562 so that
 original exception chained as ``__cause__`` so the operator sees the real
 reason in a traceback.
 
+Dunder access
+-------------
+Standard dunders (``__wrapped__``, ``__path__``, ``__file__``, …) are
+interrogated by the import machinery, by ``pickle``, by ``copy``, by
+``inspect`` and by every framework that touches a module (Pytest,
+IPython, mypy's runtime helpers, …).  When one of those probes asks for a
+dunder, the answer must be the plain Python ``AttributeError`` — a long
+explanatory message about interface names is not just unhelpful, it can
+break tooling that pattern-matches on ``str(exc)``.  The custom message
+is reserved for *real* attribute lookups that miss.
+
 Which interface should a caller use?
 ------------------------------------
 * ``from nexusdl.interfaces import cli`` — scripted, headless, terminal
@@ -192,6 +203,19 @@ def __getattr__(name: str) -> Any:
             correctly.  The original exception is chained as ``__cause__``
             so the real reason is visible in a traceback.
     """
+    # Dunders are probed by the import machinery, by ``pickle``, by
+    # ``copy``, by ``inspect``, and by every framework that touches a
+    # module.  When one of those probes asks for ``__wrapped__``,
+    # ``__path__``, ``__file__`` or any other standard dunder, the
+    # answer must be the plain Python ``AttributeError`` — a long
+    # explanatory message about interface names is not just unhelpful, it
+    # can break tooling that pattern-matches on ``str(exc)``.  The custom
+    # message is reserved for *real* attribute lookups that miss.
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
     if name not in __all__:
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}. "
@@ -274,10 +298,26 @@ def __dir__() -> list[str]:
     2. It guarantees the same output even if a future refactor changes how
        ``__all__`` is built or removes it entirely.
 
-    The result is the union of everything actually present in the module's
-    namespace (dunders, ``TYPE_CHECKING``, ``Any``, ``__all__`` itself,
-    and any subpackage already imported) plus the still-unimported
-    subpackages declared in ``__all__``.  Ordering is alphabetical for
-    stability across Python versions.
+    The result is the union of:
+
+    * the three public subpackage names from :data:`__all__`;
+    * the names already imported (``cli`` / ``gui`` / ``web`` after first
+      access) — these are already covered by ``__all__``, so no
+      duplication occurs;
+    * the standard module dunders a user typically expects to see.
+
+    **Internal module-level names are filtered out on purpose.**
+    ``TYPE_CHECKING`` and ``Any`` are implementation details imported for
+    type-checking only, and ``annotations`` is a side effect of
+    ``from __future__ import annotations``.  Listing them in
+    ``dir(nexusdl.interfaces)`` would be noise in a REPL, and would
+    suggest they are part of the public API — which they are not.
     """
-    return sorted(set(globals()) | set(__all__))
+    _public_dunders = {
+        "__all__",
+        "__doc__",
+        "__name__",
+        "__package__",
+        "__path__",
+    }
+    return sorted(set(__all__) | _public_dunders)

@@ -77,6 +77,7 @@ No dependency on ``nexusdl.parsers.*`` at runtime — see
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -220,6 +221,12 @@ class SiteRegistry:
         self._reload_lock = asyncio.Lock()
 
         self._initialized = False
+        #: Guard flag set while :meth:`initialize` is running, so that
+        #: concurrent ``initialize()`` calls do not both execute the
+        #: reload. Cleared in a ``finally`` so that a failed initialize
+        #: can be retried (the exception propagates and the caller may
+        #: correct the config before retrying).
+        self._initializing = False
 
         self._log = logger.bind(component="registry.sites")
 
@@ -230,15 +237,34 @@ class SiteRegistry:
     async def initialize(self) -> None:
         """Load the sites configuration. Idempotent.
 
+        Concurrent callers are safe: the first to acquire the reload
+        lock performs the load, the others return once it has finished
+        (whether it succeeded or failed). A **failed** initialize leaves
+        the registry in its previous state (empty on first run) and
+        ``_initialized = False`` so a retry is possible.
+
         Raises:
             ConfigError: If loading or validation fails.
         """
         if self._initialized:
             return
         async with self._reload_lock:
+            # Re-check after acquiring the lock — a concurrent caller
+            # may have completed initialization while we waited.
             if self._initialized:
                 return
-            await self._reload_locked()
+            if self._initializing:
+                # Defensive: this path is unreachable because
+                # ``_reload_lock`` already serialises the entry, but
+                # leaving the flag in place documents the intent and
+                # protects against a future refactor that moves the
+                # lock acquisition.
+                return
+            self._initializing = True
+            try:
+                await self._reload_locked()
+            finally:
+                self._initializing = False
             self._initialized = True
 
     async def reload(self) -> None:
@@ -427,13 +453,19 @@ class SiteRegistry:
             async with semaphore:
                 try:
                     parser = self.get_parser(site.id, session)
-                    # ``parser.search`` is an *async generator* — it must
-                    # be iterated with ``async for``, not awaited, and it
-                    # yields individual ``SearchResult`` objects (there is
-                    # no wrapping "page" object with an ``.items``
-                    # attribute).
+                    # ``parser.search`` is an **async generator** on the
+                    # current ``BaseParser`` contract — iterate with
+                    # ``async for``, do **not** ``await`` it. A future
+                    # parser that returns an ``AsyncIterator`` from an
+                    # ``async def`` (coroutine wrapping the iterator)
+                    # would break the bare ``async for``; the
+                    # ``_call_parser_search`` helper below handles both
+                    # shapes defensively, at the cost of a single
+                    # ``inspect.isasyncgen`` call per site.
                     collected: list[SearchResult] = []
-                    async for hit in parser.search(query, page=1):
+                    async for hit in _call_parser_search(
+                        parser, query, page=1
+                    ):
                         collected.append(hit)
                     return collected
                 except asyncio.CancelledError:
@@ -452,10 +484,32 @@ class SiteRegistry:
             for site in sites
         ]
         try:
-            for coro in asyncio.as_completed(tasks):
-                results = await coro
-                for result in results:
-                    yield result
+            # Use ``asyncio.wait(FIRST_COMPLETED)`` in a loop rather than
+            # ``asyncio.as_completed`` — the latter's sync form (bare
+            # ``for``) emits a ``DeprecationWarning`` on Python 3.12+ and
+            # is slated for removal. ``wait`` is stable across all
+            # supported versions.
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    # ``_search_one`` never raises except on cancellation
+                    # (caught and re-raised) — the ``result()`` access is
+                    # safe. A defensive ``try`` guards against a future
+                    # refactor that lets a different exception escape.
+                    try:
+                        results = task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 — defence in depth
+                        self._log.exception(
+                            "search_all: task raised outside _search_one"
+                        )
+                        continue
+                    for result in results:
+                        yield result
         finally:
             for task in tasks:
                 if not task.done():
@@ -568,14 +622,23 @@ class SiteRegistry:
         """
         try:
             raw_text = self._read_sites_text()
-        except OSError as exc:
+        except (OSError, ModuleNotFoundError) as exc:
+            # ``ModuleNotFoundError`` is raised by
+            # ``importlib.resources.files`` when the package data
+            # directory is missing (a broken installation) — it is
+            # *not* an ``OSError`` and would otherwise leak a raw
+            # traceback from a config-loading path that promises a
+            # ``ConfigError``.
             raise ConfigError(
                 f"cannot read sites configuration: {exc}"
             ) from exc
 
         try:
             document = yaml.safe_load(raw_text)
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, RecursionError) as exc:
+            # A pathologically nested document raises ``RecursionError``
+            # in PyYAML — treat it as a YAML parse failure. The caller
+            # passed an unparseable file and needs a clear error.
             raise ConfigError(
                 f"invalid YAML in sites configuration: {exc}"
             ) from exc
@@ -593,8 +656,9 @@ class SiteRegistry:
         """Read the sites YAML from disk or from the bundle.
 
         Raises:
-            OSError: If a user-provided file cannot be read, or the
-                bundled resource cannot be located.
+            OSError: If a user-provided file cannot be read.
+            ModuleNotFoundError: If the bundled package data cannot be
+                located (a broken installation).
         """
         if self._sites_path is not None:
             return self._sites_path.read_text(encoding="utf-8")
@@ -683,16 +747,21 @@ class SiteRegistry:
                     f"{_KEY_SITES}[{index}].domains must be a list, got "
                     f"{type(raw_domains).__name__}"
                 )
+            raw_language = raw["language"]
+            # ``yaml.safe_load`` returns plain strings for enum-valued
+            # fields; the ``isinstance`` check is defensive in case a
+            # future loader hands us the enum directly.
+            language = (
+                raw_language
+                if isinstance(raw_language, Language)
+                else Language(str(raw_language).lower())
+            )
             return SiteConfig(
                 id=raw["id"],
                 name=raw["name"],
                 domains=tuple(str(d) for d in raw_domains),
                 parser_class=raw["parser_class"],
-                # ``Language`` members are declared with lowercase values
-                # (``FR = "fr"``); matching is by value.  ``sites.yaml``
-                # uses the same lowercase form, but we lowercase anyway to
-                # tolerate a future YAML that accidentally capitalises.
-                language=Language(str(raw["language"]).lower()),
+                language=language,
                 adult=bool(raw["adult"]),
                 capabilities=SiteCapabilities(**dict(raw_capabilities)),
                 default_headers={
@@ -919,3 +988,52 @@ class SiteRegistry:
                 f"initialize(); the composition root must await "
                 f"registry.initialize() during startup"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Parser ``search`` adapter                                                   #
+# --------------------------------------------------------------------------- #
+
+
+async def _call_parser_search(
+    parser: Any, query: str, *, page: int = 1
+) -> AsyncIterator[SearchResult]:
+    """Iterate the results of ``parser.search`` regardless of its shape.
+
+    ``BaseParser.search`` on the current codebase is an **async
+    generator** — ``async def`` with ``yield`` — which is consumed
+    directly with ``async for``. A future implementation could instead
+    return an ``AsyncIterator`` from a plain ``async def`` (a coroutine
+    that resolves to an async iterable); iterating that with a bare
+    ``async for`` would raise ``TypeError: 'coroutine' object is not
+    async iterable``.
+
+    This adapter detects both shapes via :func:`inspect.isasyncgen` and
+    awaits the coroutine form before iterating, so the registry's
+    public contract ("yield ``SearchResult`` objects") holds regardless
+    of the parser's internal choice.
+
+    Args:
+        parser: A parser exposing ``search(query, *, page=...)``.
+        query: The search query.
+        page: 1-based page index.
+
+    Yields:
+        Every :class:`~nexusdl.core.models.search.SearchResult` produced
+        by the parser.
+    """
+    result = parser.search(query, page=page)
+    if inspect.isasyncgen(result):
+        async for hit in result:
+            yield hit
+        return
+    if inspect.isawaitable(result):
+        awaited = await result
+        async for hit in awaited:
+            yield hit
+        return
+    # Fallback: a synchronous iterable (e.g. a plugin that returns a
+    # pre-computed list wrapped in an async-like object). Iterate
+    # normally.
+    for hit in result:
+        yield hit

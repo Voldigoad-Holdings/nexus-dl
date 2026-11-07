@@ -77,7 +77,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -272,18 +271,21 @@ class Deduplicator:
         self._max_completed_entries = max_completed_entries
         self._clock = clock
 
-        #: Keys currently held by a coroutine.
+        #: Keys currently held by a coroutine. ``set.discard`` is atomic
+        #: on CPython, which lets :meth:`acquire` release a key even when
+        #: its ``finally`` block is cancelled mid-await.
         self._in_flight: set[str] = set()
 
         #: Key → completed_at (monotonic seconds). Bounded by
         #: ``max_completed_entries``.
         self._completed: dict[str, float] = {}
 
-        #: FIFO of ``(key, completed_at)`` for bounded eviction. The
-        #: ``completed_at`` timestamp guards against evicting a *fresh*
-        #: entry when an older entry with the same key is popped — this can
-        #: happen if the same key is completed twice within one TTL window.
-        self._completed_order: deque[tuple[str, float]] = deque()
+        #: Insertion-ordered map of completed keys, used for bounded FIFO
+        #: eviction. Values are ignored; insertion order encodes recency,
+        #: and ``pop`` + re-insert on every store keeps each key at most
+        #: once — a hot key that is completed repeatedly cannot evict the
+        #: rest of the cache by producing many stale FIFO entries.
+        self._completed_order: dict[str, None] = {}
 
         #: Cumulative counters exposed via :meth:`stats`.
         self._hits_in_flight: int = 0
@@ -365,6 +367,12 @@ class Deduplicator:
         cancellation release without caching, so a retry can acquire the
         key immediately.
 
+        ``release`` runs in a ``finally`` block, and a cancellation that
+        lands *inside* that block is handled by forcing the in-flight
+        release synchronously before propagating. Without this guard, a
+        cancel that interrupts ``await self.release(...)`` would leave the
+        key permanently in-flight.
+
         Args:
             key: The dedup key.
             skip_completed: Forwarded to :meth:`try_acquire`.
@@ -379,7 +387,18 @@ class Deduplicator:
             success = True
         finally:
             if acquired:
-                await self.release(key, completed=success)
+                try:
+                    await self.release(key, completed=success)
+                except asyncio.CancelledError:
+                    # The cancellation interrupted the lock acquisition in
+                    # ``release``. Force the in-flight release — the
+                    # ``set.discard`` below is atomic on CPython — so the
+                    # key does not remain permanently acquired. The
+                    # completed entry, if any, is lost; correctness of
+                    # dedup bookkeeping outweighs caching a completion
+                    # that was interrupted by cancellation.
+                    self._in_flight.discard(key)
+                    raise
 
     # ------------------------------------------------------------------ #
     # Public API — introspection                                         #
@@ -407,12 +426,18 @@ class Deduplicator:
     async def should_process(
         self, key: str, *, skip_completed: bool = True
     ) -> bool:
-        """Return ``True`` iff neither tier would reject *key*.
+        """Return ``True`` iff neither tier would reject *key* right now.
 
         Convenience for callers who want a single boolean check before
         calling :meth:`try_acquire` — useful when the caller wants to
         report the reason ("already downloading" vs "already downloaded")
         without duplicating the underlying checks.
+
+        **This check is time-of-check-to-time-of-use.** Between this call
+        returning ``True`` and a subsequent :meth:`try_acquire`, another
+        coroutine may acquire the key. Use :meth:`try_acquire` (or
+        :meth:`acquire`) for correctness; use this method only for
+        preliminary reporting.
 
         Args:
             key: The dedup key.
@@ -498,22 +523,26 @@ class Deduplicator:
     def _store_completed_locked(self, key: str) -> None:
         """Record *key* as recently completed and enforce the FIFO cap.
 
-        Caller must hold :attr:`_lock`. The ``completed_at`` timestamp is
-        compared on eviction so that a stale FIFO entry for a re-completed
-        key does not evict the fresh entry.
+        Caller must hold :attr:`_lock`. Re-completing an already-recorded
+        key moves it to the most-recent position in the FIFO instead of
+        appending a duplicate entry — otherwise a hot key completed in a
+        burst could accumulate many stale FIFO entries and evict every
+        other key from the cache.
 
         Args:
             key: The dedup key.
         """
         completed_at = self._clock()
         self._completed[key] = completed_at
-        self._completed_order.append((key, completed_at))
+        # Re-inserting moves the key to the end of the insertion order,
+        # which is what "most recently completed" means here.
+        self._completed_order.pop(key, None)
+        self._completed_order[key] = None
         while len(self._completed_order) > self._max_completed_entries:
-            oldest_key, oldest_at = self._completed_order.popleft()
-            # Only evict if the stored timestamp still matches the FIFO
-            # entry. A duplicate completion would have overwritten the dict
-            # value with a newer timestamp, and this older FIFO entry must
-            # not remove the fresh one.
-            if self._completed.get(oldest_key) == oldest_at:
+            oldest_key, _ = self._completed_order.popitem(last=False)
+            # Only evict from ``_completed`` if the key is still present.
+            # ``release`` may race with another release for the same key
+            # via ``clear``; the guard makes eviction idempotent.
+            if oldest_key in self._completed:
                 del self._completed[oldest_key]
                 self._evictions += 1

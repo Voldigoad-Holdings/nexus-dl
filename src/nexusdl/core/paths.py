@@ -24,7 +24,8 @@ cannot:
   :func:`resolve_paths` computes the entire set from a single base
   directory, so an operator who wants everything under
   ``/mnt/nexusdl`` calls one function and gets ten paths that agree
-  with each other.
+  with each other **and** with what ``Settings`` would produce given
+  the same override.
 
 Public surface
 --------------
@@ -85,7 +86,9 @@ Excluded by design
   in both (a manga titled ``"!!!"`` produces no slug) is documented
   but **not** fixed here: fixing it requires changing
   :meth:`~nexusdl.core.downloader.worker.DownloadWorker._compute_output_path`
-  at the same time, and that module is already delivered.
+  at the same time, and that module is already delivered. The eventual
+  migration to :func:`nexusdl.core.utils.text.slugify_safe` fixes both,
+  and should be applied to the worker and to this helper in one commit.
 
 Dependency graph (no cycles)::
 
@@ -99,6 +102,46 @@ Dependency graph (no cycles)::
 ``core.utils.filesystem`` is a leaf. ``core.config`` is only imported
 for type annotations under ``TYPE_CHECKING``, so this module is
 importable from the bootstrap phase before ``Settings`` exists.
+
+Relocated-vs-default layout note
+--------------------------------
+:func:`resolve_paths` produces **one** layout when *base_dir* is
+``None`` (the platformdirs defaults) and a **different** layout when
+*base_dir* is provided (the four roots are named ``data``, ``config``,
+``cache``, ``log`` under the base). The two are not the same shape, and
+they **cannot** be made the same shape without breaking one of them:
+
+* The platformdirs defaults use four **distinct** root directories
+  (``share/`` for data, ``config/`` for config, ``cache/`` for cache,
+  ``state/log/`` for logs). They have no common ancestor other than the
+  user's home.
+* A single ``base_dir`` override must distinguish the four types under
+  one root, so each type gets a named subdirectory.
+
+What **must** stay consistent is the relationship between
+:func:`resolve_paths` and :class:`~nexusdl.core.config.Settings`: a
+caller who feeds ``resolve_paths(base_dir=X)`` into a custom
+``PathsSection`` and a caller who passes ``Settings(paths={"user_data_dir":
+X})`` must get the **same** layout. This is why ``user_data_dir`` in
+relocated mode is ``base_dir`` and **not** ``base_dir / "data"`` — the
+``PathsSection`` override for ``user_data_dir`` is the base itself, so
+matching it is the only way to keep the two paths identical. The
+``/config``, ``/cache``, ``/log`` suffixes for the other three roots
+are unaffected by this reasoning: ``Settings`` does not derive them
+from ``user_data_dir``, so each has to be set explicitly, and
+``resolve_paths`` sets them to ``base_dir / "<type>"`` to match.
+
+The concrete guarantees:
+
+* ``resolve_paths(None)`` matches a fresh ``Settings().paths`` exactly.
+* ``resolve_paths(base_dir=X)`` matches
+  ``Settings(paths={field: value for field, value in
+  resolve_paths(X).items()}).paths`` exactly, **field by field**.
+  The ``downloads_dir`` entry (which lives on
+  :class:`~nexusdl.core.config.StorageSection`) is the only exception —
+  it is *not* a ``PathsSection`` field, so the ``Settings`` constructor
+  in this comparison must additionally pass
+  ``storage={"downloads_dir": resolve_paths(X)["downloads_dir"]}``.
 """
 
 from __future__ import annotations
@@ -302,64 +345,46 @@ def resolve_paths(base_dir: Path | None = None) -> dict[str, Path]:
     note).
 
     When *base_dir* is ``None``, the paths match
-    :class:`~nexusdl.core.config.PathsSection`'s defaults exactly — the
-    same values a fresh ``Settings().paths`` and
-    ``Settings().storage.downloads_dir`` would carry::
+    :class:`~nexusdl.core.config.PathsSection`'s defaults exactly.
 
-        resolve_paths() == {
-            "user_data_dir":   platformdirs.user_data_path(APP_SLUG),
-            "user_config_dir": platformdirs.user_config_path(APP_SLUG),
-            "user_cache_dir":  platformdirs.user_cache_path(APP_SLUG),
-            "user_log_dir":    platformdirs.user_log_path(APP_SLUG),
-            "downloads_dir":   user_data_dir / "downloads",
-            "cookies_file":    user_data_dir / "cookies.enc",
-            "database_file":   user_data_dir / "library.db",
-            "cache_dir":       user_cache_dir,
-            "logs_dir":        user_log_dir,
-            "plugins_dir":     user_data_dir / "plugins",
-        }
+    When *base_dir* is provided, the layout is:
 
-    When *base_dir* is provided, every path is derived from it — but
-    **the derivation is not the same shape as the platformdirs
-    default**. ``platformdirs`` uses four distinct root directories
-    (``share/`` for data, ``config/`` for config, ``cache/`` for cache,
-    ``state/log/`` for logs); a single ``base_dir`` override must
-    distinguish them explicitly, so each type gets a named subdirectory::
+    * ``user_data_dir = base_dir``
+    * ``user_config_dir = base_dir / "config"``
+    * ``user_cache_dir = base_dir / "cache"``
+    * ``user_log_dir = base_dir / "log"``
+    * ``downloads_dir = base_dir / "downloads"``
+    * ``cookies_file = base_dir / "cookies.enc"``
+    * ``database_file = base_dir / "library.db"``
+    * ``plugins_dir = base_dir / "plugins"``
 
-        resolve_paths(Path("/mnt/nexusdl")) == {
-            "user_data_dir":   Path("/mnt/nexusdl/data"),
-            "user_config_dir": Path("/mnt/nexusdl/config"),
-            "user_cache_dir":  Path("/mnt/nexusdl/cache"),
-            "user_log_dir":    Path("/mnt/nexusdl/log"),
-            "downloads_dir":   Path("/mnt/nexusdl/data/downloads"),
-            "cookies_file":    Path("/mnt/nexusdl/data/cookies.enc"),
-            "database_file":   Path("/mnt/nexusdl/data/library.db"),
-            "cache_dir":       Path("/mnt/nexusdl/cache"),
-            "logs_dir":        Path("/mnt/nexusdl/log"),
-            "plugins_dir":     Path("/mnt/nexusdl/data/plugins"),
-        }
+    The relocated layout is **field-by-field identical** to what
+    ``Settings(paths={field: value for field, value in
+    resolve_paths(X).items()}, storage={"downloads_dir":
+    resolve_paths(X)["downloads_dir"]})`` would produce. An operator
+    who runs ``nexusdl paths --base-dir /mnt/x`` and then writes the
+    printed values into their ``.env`` gets the same layout that
+    ``nexusdl --base-dir /mnt/x`` would use.
 
     .. note::
 
-       The ``/data`` suffix on ``user_data_dir`` in relocated mode is
-       **deliberate** and asymmetric with the platformdirs default
-       (which has no ``data`` suffix). A caller that wants to override
-       ``Settings.paths`` to match a relocated ``resolve_paths(...)``
-       must read the relocated value — ``user_data_dir`` is
-       ``base_dir / "data"``, not ``base_dir``. Reconstructing the
-       paths by hand as ``Settings(paths={"user_data_dir": "/mnt/x"})``
-       would produce a *different* layout from ``resolve_paths(Path("/mnt/x"))``
-       — every derived path under it would be one level shallower
-       than what ``resolve_paths`` computed. When relocating, always
-       use one of the two: the relocated ``resolve_paths(...)`` dict
-       (feeding a custom ``PathsSection``), **or** the ``Settings``
-       override — never mix the two.
+       An **earlier version** of this function used
+       ``user_data_dir = base_dir / "data"``, which was asymmetric
+       with ``Settings(paths={"user_data_dir": base_dir})`` and caused
+       a silent one-level path drift between a ``nexusdl paths
+       --base-dir`` diagnostic and an actual ``nexusdl download
+       --base-dir`` run. The current version aligns ``user_data_dir``
+       with the base directory; the ``/config``, ``/cache``, ``/log``
+       suffixes remain because ``Settings`` does not derive those from
+       ``user_data_dir`` and each has to be set explicitly.
+       **This changes the layout for callers that used the old
+       behaviour** — but the old behaviour produced a different path
+       tree from the equivalent ``Settings`` override, which was a bug.
+       The fix makes the two consistent.
 
     The dict has the same keys as :class:`~nexusdl.core.config.PathsSection`'s
     fields, plus ``downloads_dir`` (which lives on
     :class:`~nexusdl.core.config.StorageSection` in the config object).
-    This makes the result directly usable with :func:`ensure_all_directories`
-    and :func:`describe`.
 
     Args:
         base_dir: Optional root directory under which to relocate every
@@ -379,9 +404,12 @@ def resolve_paths(base_dir: Path | None = None) -> dict[str, Path]:
         log = user_log_dir()
     else:
         # Relocated — every path derives from the single base.
-        # The per-type subdirectory suffixes are what make the four
-        # logically distinct roots distinguishable under one base.
-        data = base_dir / "data"
+        # ``user_data_dir`` is the base itself (matching the
+        # ``Settings(paths={"user_data_dir": base_dir})`` override),
+        # and the other three roots get a type-specific subdirectory
+        # because ``Settings`` does not derive them from
+        # ``user_data_dir``.
+        data = base_dir
         config = base_dir / "config"
         cache = base_dir / "cache"
         log = base_dir / "log"

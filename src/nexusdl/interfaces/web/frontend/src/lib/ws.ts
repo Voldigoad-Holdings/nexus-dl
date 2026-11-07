@@ -58,6 +58,16 @@
  * A user-initiated :meth:`disconnect` transitions to ``"closed"`` and
  * never triggers a reconnect.
  *
+ * **Internal close events are ignored.**  When the client itself closes
+ * the socket — on disconnect, on heartbeat timeout, or on a fatal error
+ * — the corresponding ``close`` event must not be interpreted as a
+ * *server-initiated* close.  The client tracks this with
+ * ``_expectingClose``: it is set to ``true`` just before any internal
+ * ``ws.close(...)`` and cleared when the ``close`` event fires, which
+ * short-circuits ``_handleClose``.  Without this guard, a fatal-error
+ * close (code ``4000``, retriable) would immediately schedule a reconnect,
+ * resurrecting a client that had just transitioned to ``"failed"``.
+ *
  * What this client does **not** do
  * --------------------------------
  * * It does not touch the download store, the settings store, the auth
@@ -273,12 +283,19 @@ export interface WebSocketClientOptions {
  * server close, so that the app can distinguish auth failures (which
  * require a token refresh) from transient network failures (which just
  * need a retry).
+ *
+ * ``cause`` is stored on the instance directly when the running engine
+ * does not support ``ErrorOptions.cause`` (Node < 16.9, Safari < 15).  The
+ * explicit assignment produces the same property on engines that do
+ * support the option, so the class is portable across runtimes.
  */
 export class NexusWebSocketError extends Error {
   /** WebSocket close code, or ``null`` when the error is not close-related. */
   public readonly closeCode: number | null;
   /** Server-supplied close reason, or ``null``. */
   public readonly closeReason: string | null;
+  /** The original exception, when the error originated below the WS layer. */
+  public override readonly cause: unknown;
 
   constructor(
     message: string,
@@ -288,10 +305,11 @@ export class NexusWebSocketError extends Error {
       cause?: unknown;
     } = {},
   ) {
-    super(message, { cause: options.cause });
+    super(message);
     this.name = "NexusWebSocketError";
     this.closeCode = options.closeCode ?? null;
     this.closeReason = options.closeReason ?? null;
+    this.cause = options.cause;
   }
 }
 
@@ -344,6 +362,18 @@ export class NexusWebSocketClient {
   private _lastError: NexusWebSocketError | null = null;
   private _ws: WebSocket | null = null;
   private _userDisconnected = false;
+  /**
+   * Set just before any **internal** ``ws.close(...)`` call and cleared
+   * when the corresponding ``close`` event fires.
+   *
+   * Distinguishes the client closing its own socket (disconnect, heartbeat
+   * timeout, fatal error) from the server initiating the close.  Without
+   * this, a fatal-error close (code 4000, retriable) would be interpreted
+   * by :meth:`_handleClose` as a server-initiated close and would schedule
+   * a reconnect — resurrecting a client that had just transitioned to
+   * ``"failed"``.
+   */
+  private _expectingClose = false;
   private _reconnectAttempts = 0;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -369,9 +399,10 @@ export class NexusWebSocketClient {
    * The most recent fatal error, if any.
    *
    * Set when the client transitions to ``"failed"``; cleared on the next
-   * :meth:`connect` call.  The app inspects this field to decide whether
-   * to refresh the token (``closeCode === 1008`` or ``4001`` / ``4002``)
-   * or to show a generic error message (any other fatal code).
+   * :meth:`connect` call **and** on every successful :meth:`_handleOpen`.
+   * The app inspects this field to decide whether to refresh the token
+   * (``closeCode === 1008`` or ``4001`` / ``4002``) or to show a generic
+   * error message (any other fatal code).
    */
   public get lastError(): NexusWebSocketError | null {
     return this._lastError;
@@ -422,11 +453,14 @@ export class NexusWebSocketClient {
     this._ws = null;
 
     if (ws !== null) {
+      this._expectingClose = true;
       try {
         ws.close(1000, "client disconnect");
       } catch (err) {
         // ``ws.close`` can throw if the socket is already closing — that is
-        // a benign race, not an error.
+        // a benign race, not an error.  Clear the flag ourselves because
+        // no ``close`` event will fire in that case.
+        this._expectingClose = false;
         this._debug("Error during disconnect:", err);
       }
     }
@@ -511,7 +545,25 @@ export class NexusWebSocketClient {
   // ─────────────────────────────────────────────────────────────────────
 
   private _open(): void {
-    this._setState(this._reconnectAttempts === 0 ? "connecting" : "reconnecting");
+    // Defensive: if a previous ``_open`` left a socket behind (which should
+    // not happen given the state guard below, but a future refactor could
+    // introduce one), close it before opening a new one.  Without this,
+    // listeners would accumulate on a zombie socket.
+    if (this._ws !== null) {
+      const stale = this._ws;
+      this._ws = null;
+      this._expectingClose = true;
+      try {
+        stale.close(1000, "replaced");
+      } catch (err) {
+        this._expectingClose = false;
+        this._debug("Error closing stale WebSocket before open:", err);
+      }
+    }
+
+    this._setState(
+      this._reconnectAttempts === 0 ? "connecting" : "reconnecting",
+    );
 
     let url: string;
     try {
@@ -569,17 +621,33 @@ export class NexusWebSocketClient {
 
     this._reconnectAttempts = 0;
     this._lastInboundAt = Date.now();
+    // A successful open is the strongest possible evidence that any
+    // previous fatal error is now resolved.  Leaving ``lastError`` set
+    // would make a "live" connection render with a "Disconnected" badge.
+    this._lastError = null;
     this._setState("connected");
     this._startHeartbeat();
     this._debug("WebSocket connected");
   }
 
   private _handleClose(code: number, reason: string): void {
+    const wasExpected = this._expectingClose;
+    this._expectingClose = false;
     this._ws = null;
     this._stopHeartbeat();
 
+    if (wasExpected) {
+      // The client closed this socket itself (disconnect, heartbeat
+      // timeout, fatal error, or replacement before ``_open``).  Whatever
+      // state transition the caller already made is final; do not
+      // reschedule a reconnect.
+      return;
+    }
+
     if (this._userDisconnected) {
-      // ``disconnect()`` already set the state; nothing more to do.
+      // Defensive: ``disconnect()`` sets this flag and clears ``_ws``
+      // before calling ``close``, but a close event fired before the flag
+      // took effect can still reach here.  Do nothing.
       return;
     }
 
@@ -611,9 +679,15 @@ export class NexusWebSocketClient {
     if (this._ws !== null) {
       const ws = this._ws;
       this._ws = null;
+      // Mark the close as expected so that ``_handleClose`` — which will
+      // be triggered by this close — does not interpret code ``4000`` as
+      // a retriable server-close and schedule a reconnect.  This was the
+      // bug that resurrected a "failed" client.
+      this._expectingClose = true;
       try {
         ws.close(CLIENT_STALE_CLOSE_CODE, CLIENT_STALE_CLOSE_REASON);
       } catch (err) {
+        this._expectingClose = false;
         this._debug("Error closing failed WebSocket:", err);
       }
     }
@@ -707,11 +781,20 @@ export class NexusWebSocketClient {
         );
         const ws = this._ws;
         if (ws !== null) {
+          this._ws = null;
+          // Mark the close as expected: the state machine should observe
+          // a single, retriable disconnect from the caller's point of
+          // view, not a raw server-close.  ``_handleClose`` will see
+          // ``_expectingClose`` and short-circuit — we schedule the
+          // reconnect explicitly here instead.
+          this._expectingClose = true;
           try {
             ws.close(CLIENT_STALE_CLOSE_CODE, CLIENT_STALE_CLOSE_REASON);
           } catch (err) {
+            this._expectingClose = false;
             this._debug("Error closing stale WebSocket:", err);
           }
+          this._scheduleReconnect();
         }
         return;
       }
@@ -801,7 +884,10 @@ export class NexusWebSocketClient {
           handler(typedEvent.payload, typedEvent);
         } catch (err) {
           // A throwing handler must not take down the client or prevent
-          // other handlers from running.  Log and move on.
+          // other handlers from running.  Log and move on.  ``console.error``
+          // (rather than ``_debug``) is intentional: a throwing handler is
+          // a developer bug, not a diagnostic, and should be loud even in
+          // production.
           console.error(
             `[NexusWS] Handler for "${event.type}" threw:`,
             err,
@@ -825,7 +911,12 @@ export class NexusWebSocketClient {
 
   private _send(message: object): void {
     const ws = this._ws;
-    if (ws === null || ws.readyState !== WebSocket.OPEN) {
+    // ``ws.readyState === WebSocket.OPEN`` would reference the global
+    // ``WebSocket`` class, which is undefined in Node without ``ws`` or
+    // in an SSR context.  We only reach this line with a non-null ``ws``
+    // (which implies a WebSocket global existed when it was constructed),
+    // but comparing to the literal ``1`` is robust regardless.
+    if (ws === null || ws.readyState !== 1 /* OPEN */) {
       return;
     }
     try {
@@ -968,6 +1059,12 @@ let _singleton: NexusWebSocketClient | null = null;
  * cannot be reconfigured without a reconnect, and silently applying new
  * options would surprise the caller.  Call :func:`resetWebSocketClient`
  * first if you need to change non-token options on a live client.
+ *
+ * The returned client is **not** automatically connected.  The caller (in
+ * practice, :mod:`../hooks/useWebSocket`) is responsible for calling
+ * ``connect()``.  This separation keeps the singleton accessor free of
+ * side effects beyond instance lifecycle, which makes it safe to call
+ * from React render paths.
  */
 export function getWebSocketClient(
   options: WebSocketClientOptions,
@@ -986,7 +1083,9 @@ export function getWebSocketClient(
  * Disconnect the process-wide WebSocket client and clear the singleton.
  *
  * Safe to call when no client exists.  Idempotent — a second call is a
- * no-op.
+ * no-op.  Synchronous: the returned ``void`` makes the sync contract
+ * explicit at every call site (``resetWebSocketClient()``, not
+ * ``await resetWebSocketClient()``).
  */
 export function resetWebSocketClient(): void {
   if (_singleton !== null) {

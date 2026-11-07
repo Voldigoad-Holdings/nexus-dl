@@ -217,9 +217,25 @@ export function normalizePriority(
  * Live progress counters for a download task.
  *
  * These are cumulative over the whole task's lifetime; pausing and resuming
- * does not reset them.  Every counter is a non-negative integer, and
- * ``*_completed + *_failed`` never exceeds ``*_total`` — a backend invariant
- * that the frontend relies on for progress-bar widths.
+ * does not reset them.
+ *
+ * **Invariants (trusted backend contract).**
+ *
+ * Every counter is a non-negative integer, and the pair invariants
+ * ``chapters_completed + chapters_failed <= chapters_total``,
+ * ``pages_completed + pages_failed <= pages_total`` and
+ * ``bytes_downloaded <= bytes_total`` hold on the wire.  The frontend
+ * relies on these for progress-bar widths: a bar is rendered as
+ * ``completed / total`` without clamping, so a backend that violated the
+ * invariant would produce a visibly broken bar.
+ *
+ * The store (`store/downloads.ts`) applies defensive clamps on the
+ * **incremental** mutations it owns (`updateChapterCompleted`,
+ * `updateChapterFailed`), where a replayed WebSocket event could otherwise
+ * push a counter past its bound.  Full progress snapshots delivered by
+ * `download.progress` are applied verbatim — a snapshot is authoritative
+ * and is emitted by the same worker that owns the counters, so it is not
+ * a place where the frontend should second-guess the backend.
  */
 export interface DownloadProgress {
   /** Number of chapters the task is expected to process. */
@@ -245,7 +261,9 @@ export interface DownloadProgress {
   speed_bps: number;
   /**
    * Estimated seconds remaining, or ``null`` when the estimator cannot yet
-   * produce a stable value (e.g. before the first page completes).
+   * produce a stable value (e.g. before the first page completes), or when
+   * the task is paused.  ``null`` is distinct from ``0``: ``0`` would mean
+   * "less than one second remaining", which is not true when paused.
    */
   eta_seconds: number | null;
 
@@ -463,10 +481,13 @@ export interface DownloadStartedPayload {
  *
  * Emitted whenever the task's :type:`DownloadProgress` changes in a
  * user-visible way — typically once per page download, plus on
- * chapter transitions.  The event carries only the counters that changed
- * since the last ``download.progress``; the type is nevertheless a full
- * snapshot so that a client that misses an intermediate event converges
- * correctly on the next one.
+ * chapter transitions.
+ *
+ * ``progress`` is a **full snapshot** of the task's counters, not a delta.
+ * A client that misses an intermediate event still converges correctly on
+ * the next one, because applying a snapshot replaces the entire progress
+ * object rather than merging into it.  The store's ``updateProgress``
+ * action implements exactly this replacement semantics.
  */
 export interface DownloadProgressPayload {
   task_id: string;

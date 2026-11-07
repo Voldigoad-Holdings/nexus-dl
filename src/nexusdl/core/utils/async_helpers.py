@@ -48,6 +48,11 @@ that contract everywhere:
 * :func:`cancel_safely` and :func:`cancel_all` **do not** swallow the
   cancellation of the caller — they only await the cancelled tasks'
   cleanup, then re-raise any pending cancellation of the caller.
+  Distinguishing the two cases uses
+  :meth:`asyncio.Task.cancelling` (Python 3.11+) as an authoritative
+  signal: if the caller's own task has a pending cancellation, the
+  helper re-raises rather than treating the caller's cancellation as
+  the cancelled task's.
 * :func:`fire_and_forget` schedules a task on the running loop; the
   task's cancellation is its own concern, not the caller's.
 * :class:`AsyncLazy` propagates cancellation from the underlying
@@ -98,8 +103,33 @@ _background_tasks: Final[set[asyncio.Task[Any]]] = set()
 
 
 # --------------------------------------------------------------------------- #
-# Cancellation                                                               #
+# Cancellation                                                                #
 # --------------------------------------------------------------------------- #
+
+
+def _caller_is_being_cancelled() -> bool:
+    """Return ``True`` iff the current task has a pending cancellation.
+
+    Uses :meth:`asyncio.Task.cancelling` (Python 3.11+), which returns
+    the number of pending ``cancel()`` requests on the current task.
+    A non-zero count means the caller was cancelled while we were
+    awaiting somebody else — an event that must propagate, not be
+    swallowed.
+
+    Falls back to ``False`` on platforms where ``cancelling`` is
+    unavailable (Python 3.10 and earlier). The pipeline supports
+    Python 3.12+, so the fallback is defensive only.
+    """
+    current = asyncio.current_task()
+    if current is None:
+        return False
+    cancelling = getattr(current, "cancelling", None)
+    if not callable(cancelling):
+        return False
+    try:
+        return cancelling() > 0
+    except Exception:
+        return False
 
 
 async def cancel_safely(task: asyncio.Task[Any]) -> None:
@@ -121,14 +151,14 @@ async def cancel_safely(task: asyncio.Task[Any]) -> None:
     errors). This function performs the same sequence and is the only
     place a reader has to verify the logic.
 
-    **The caller's own cancellation is not swallowed.** If the caller is
+    **The caller's own cancellation is preserved.** If the caller is
     cancelled while ``await task`` is running, that ``CancelledError``
-    propagates — the helper suppresses the *cancelled task's* exception,
-    not the caller's. The two are distinguishable because the cancelled
-    task has finished by the time the caller's cancellation arrives;
-    the ``except asyncio.CancelledError`` in the implementation guards
-    the ``await task`` line specifically, and only skips it when
-    ``task`` itself was the source.
+    propagates. The helper distinguishes the two cases via
+    :meth:`asyncio.Task.cancelling`: if the caller's own task has a
+    pending cancellation, we re-raise; otherwise we swallow the
+    cancelled task's exception. Without that check, the two cases are
+    indistinguishable from inside the ``except`` block and the caller's
+    cancellation would be silently lost.
 
     A task that finishes with a non-cancellation exception propagates
     that exception — the caller asked to cancel a task that already
@@ -145,6 +175,11 @@ async def cancel_safely(task: asyncio.Task[Any]) -> None:
     try:
         await task
     except asyncio.CancelledError:
+        if _caller_is_being_cancelled():
+            # The caller was cancelled, not (only) the task we awaited.
+            # Propagate — the caller's cancellation is not ours to
+            # swallow.
+            raise
         # The task's own cancellation — expected and intended.
         return
 
@@ -164,18 +199,31 @@ async def cancel_all(tasks: list[asyncio.Task[Any]]) -> None:
     themselves after this returns (they are ``done()``).
 
     The caller's own cancellation propagates normally — this helper
-    never masks a cancellation arriving from above.
+    never masks a cancellation arriving from above. The same
+    :func:`_caller_is_being_cancelled` check used in
+    :func:`cancel_safely` is applied here: if the caller's own task has
+    a pending cancellation, the ``CancelledError`` raised by
+    :func:`asyncio.gather` is re-raised instead of being silently
+    swallowed.
 
     Args:
         tasks: The tasks to cancel. An empty list is a no-op. Tasks that
             have already finished are skipped.
     """
     pending = [t for t in tasks if not t.done()]
-    for task in pending:
-        task.cancel()
     if not pending:
         return
-    await asyncio.gather(*pending, return_exceptions=True)
+    for task in pending:
+        task.cancel()
+    try:
+        await asyncio.gather(*pending, return_exceptions=True)
+    except asyncio.CancelledError:
+        if _caller_is_being_cancelled():
+            raise
+        # Otherwise, the CancelledError is the tasks' own (already
+        # collected by ``return_exceptions=True``), not the caller's —
+        # do not propagate.
+        return
 
 
 # --------------------------------------------------------------------------- #
@@ -266,7 +314,13 @@ def _log_background_exception(task: asyncio.Task[Any]) -> None:
     exc = task.exception()
     if exc is None:
         return
-    task_name = task.get_name()
+    # ``get_name`` may raise ``AttributeError`` on an exotic Task
+    # subclass where ``set_name`` was rejected earlier; a debug
+    # callback must not crash the loop.
+    try:
+        task_name = task.get_name()
+    except Exception:
+        task_name = "<unnamed>"
     _log.warning(
         "Background task {!r} raised {}: {}",
         task_name,
@@ -341,7 +395,13 @@ class AsyncLazy(Generic[_T]):
             failure, called once and never again (sticky failure).
     """
 
-    __slots__ = ("_error", "_initializer", "_lock", "_value")
+    __slots__ = (
+        "_error",
+        "_initialized",
+        "_initializer",
+        "_lock",
+        "_value",
+    )
 
     def __init__(
         self, initializer: Callable[[], Awaitable[_T]]

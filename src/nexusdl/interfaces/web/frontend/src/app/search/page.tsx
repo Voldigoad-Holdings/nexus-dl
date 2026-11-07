@@ -93,6 +93,9 @@ import { useSettingsStore } from "../../store/settings";
 /** Sites-catalogue freshness window. */
 const SITES_STALE_TIME_MS = 5 * 60 * 1000;
 
+/** Number of failed sites listed inline before truncation. */
+const FAILED_SITES_PREVIEW_COUNT = 3;
+
 // ───────────────────────────────────────────────────────────────────────────
 // Page
 // ───────────────────────────────────────────────────────────────────────────
@@ -194,8 +197,13 @@ function SearchBody() {
   // -------------------------------------------------------------------
   const [showFilters, setShowFilters] = useState(false);
 
-  const activeFilterCount =
-    search.filters.site_ids.length + search.filters.languages.length;
+  // Count every non-empty array field in ``filters`` rather than only
+  // ``site_ids`` and ``languages``: a future filter dimension is picked
+  // up automatically instead of silently under-counting the badge.
+  const activeFilterCount = Object.values(search.filters).reduce(
+    (acc, value) => (Array.isArray(value) && value.length > 0 ? acc + 1 : acc),
+    0,
+  );
 
   // -------------------------------------------------------------------
   // Derived display state
@@ -237,12 +245,18 @@ function SearchBody() {
       {/* Search bar + filters toggle ------------------------- */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
         <div className="flex-1">
+          {/*
+           * Do **not** disable the input while a search is in flight:
+           * a user must be able to refine the query and submit a new
+           * search without waiting for the previous one to finish.  The
+           * submit button is disabled separately by ``SearchBar`` via
+           * the ``isLoading`` prop.
+           */}
           <SearchBar
             value={search.query}
             onChange={search.setQuery}
             onSubmit={search.submit}
             isLoading={search.isFetching && search.submitted !== null}
-            disabled={search.isFetching && search.submitted !== null}
           />
         </div>
 
@@ -348,8 +362,11 @@ function SearchBody() {
 
       {search.isLoading && <ResultsSkeleton />}
 
-      {search.isError && search.error !== null && (
-        <ErrorBanner error={search.error} onRetry={search.refetch} />
+      {search.isError && (
+        <ErrorBanner
+          error={search.error as NexusApiError}
+          onRetry={search.refetch}
+        />
       )}
 
       {!search.isLoading && search.submitted !== null && (
@@ -437,13 +454,19 @@ function InitialState() {
   );
 }
 
-/** Skeleton shown during the first fetch after a submit. */
+/**
+ * Skeleton shown during the first fetch after a submit.
+ *
+ * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
+ * is static, so an ``aria-live`` region would never announce anything
+ * (screen readers only announce *changes*).  ``aria-busy`` is the correct
+ * signal for "content is loading".
+ */
 function ResultsSkeleton() {
   return (
     <div
       className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6"
       aria-busy="true"
-      aria-live="polite"
     >
       <span className="sr-only">Searching…</span>
       {Array.from({ length: 12 }, (_, index) => (
@@ -510,20 +533,22 @@ function ResultSummary({
  * Warning banner listing sites that did not respond.
  *
  * Shown **above** the results — the user should know that fewer sites
- * answered than they asked for.  When there are more than three failing
- * sites, the list is truncated to "and N more" to keep the banner on one
- * line on desktop; the full list is available via the ``title`` tooltip.
+ * answered than they asked for.  When there are more than
+ * :data:`FAILED_SITES_PREVIEW_COUNT` failing sites, the list is truncated
+ * to "and N more" to keep the banner on one line on desktop.  The full
+ * list is provided to screen readers via an ``sr-only`` span (a ``title``
+ * attribute on a ``<div>`` is not exposed to assistive technology).
  */
 function FailedSitesWarning({ sites }: { sites: readonly string[] }) {
   const count = sites.length;
-  const preview = sites.slice(0, 3).join(", ");
-  const hasMore = count > 3;
+  const preview = sites.slice(0, FAILED_SITES_PREVIEW_COUNT).join(", ");
+  const hasMore = count > FAILED_SITES_PREVIEW_COUNT;
+  const remaining = count - FAILED_SITES_PREVIEW_COUNT;
 
   return (
     <div
       role="status"
       aria-live="polite"
-      title={sites.join(", ")}
       className={cn(
         "flex items-start gap-2 rounded-md border border-amber-500/30",
         "bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-400",
@@ -537,13 +562,17 @@ function FailedSitesWarning({ sites }: { sites: readonly string[] }) {
             : `${count} sites did not respond`}
           <span className="ml-1 opacity-80">
             ({preview}
-            {hasMore ? `, +${count - 3} more` : ""})
+            {hasMore ? `, +${remaining} more` : ""})
           </span>
         </p>
         <p className="mt-0.5 text-xs opacity-80">
           Their results are missing from this page.  Retry the search to
           try again.
         </p>
+        <span className="sr-only">
+          {" "}
+          Failing sites: {sites.join(", ")}.
+        </span>
       </div>
     </div>
   );

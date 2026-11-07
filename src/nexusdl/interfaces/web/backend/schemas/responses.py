@@ -25,6 +25,12 @@ Design notes
   (:class:`~nexusdl.core.models.manga.Manga`,
   :class:`~nexusdl.core.models.chapter.Chapter`, …) can be passed
   directly to ``Schema.model_validate(obj)``.
+* **Domain-field coercion.** Domain payloads set
+  ``coerce_numbers_to_str=True`` so a domain object whose ``number`` (or
+  ``title``) is an ``int`` validates cleanly — a parser that returns
+  ``chapter.number = 42`` is a real case, and rejecting it with a
+  ``ValidationError`` would surface as a 500. Envelopes keep the strict
+  default.
 * **Secrets are never leaked.** :class:`SettingFieldSchema.current_value`
   is ``None`` for secret fields — only ``is_set: bool`` is exposed.
   :class:`SiteSchema` carries cookie *names*, never values.
@@ -104,6 +110,8 @@ __all__ = [
     "SettingsSectionSchema",
     "SettingsResponse",
     "SettingsUpdateResponse",
+    # Helpers
+    "compute_status_counts",
 ]
 
 
@@ -146,6 +154,12 @@ class ErrorCode(str, Enum):
     LIBRARY_ERROR = "LIBRARY_ERROR"
     CONFIG_ERROR = "CONFIG_ERROR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+    CONFLICT = "CONFLICT"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+    METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
+    PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
+    UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE"
+    NOT_IMPLEMENTED = "NOT_IMPLEMENTED"
 
 
 # ===========================================================================
@@ -172,6 +186,11 @@ class _DomainModel(BaseModel):
 
     Allows extra fields: plugins and forward-compatible versions can
     extend a manga / site / chapter schema without breaking clients.
+
+    ``coerce_numbers_to_str=True`` because parsers occasionally return
+    numeric fields (``chapter.number = 42``, ``chapter.title = 5``) that
+    must serialize as strings. Without coercion, Pydantic v2 rejects the
+    ``int`` value with a ``ValidationError`` that surfaces as a 500.
     """
 
     model_config = ConfigDict(
@@ -180,6 +199,7 @@ class _DomainModel(BaseModel):
         populate_by_name=True,
         from_attributes=True,
         str_strip_whitespace=True,
+        coerce_numbers_to_str=True,
     )
 
 
@@ -514,14 +534,28 @@ class ReadingProgressSchema(_DomainModel):
     """Reading progress for a manga.
 
     ``chapter_id`` is ``None`` when the user has never opened the manga.
+
+    ``percent`` is expected in ``[0.0, 1.0]``. Values outside that range
+    are clamped here rather than rejected: a bug in a downstream service
+    that returns ``1.5`` (or ``50`` for a percentage) must not 500 the
+    whole endpoint — the client would show a stuck progress bar with no
+    way to recover. Clamping keeps the response well-formed.
     """
 
     chapter_id: str | None = Field(default=None)
     chapter_number: str | None = Field(default=None)
     page_index: int = Field(default=0, ge=0)
     page_count: int | None = Field(default=None, ge=0)
-    percent: float = Field(default=0.0, ge=0.0, le=1.0)
+    percent: float = Field(default=0.0)
     last_read_at: datetime | None = Field(default=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        # Clamp ``percent`` to ``[0.0, 1.0]`` without rejecting the value.
+        # ``object.__setattr__`` is used because the model is frozen.
+        if self.percent < 0.0:
+            object.__setattr__(self, "percent", 0.0)
+        elif self.percent > 1.0:
+            object.__setattr__(self, "percent", 1.0)
 
 
 class MangaSummarySchema(_DomainModel):
@@ -562,7 +596,10 @@ class MangaDetailSchema(_DomainModel):
     source_url: str | None = Field(default=None)
     chapter_count: int | None = Field(default=None, ge=0)
     genres: list[str] = Field(default_factory=list)
-    year: int | None = Field(default=None, ge=1900, le=2200)
+    # ``year`` is informational. Range is permissive (a manga from 1850,
+    # a pre-release dated 2200, or a parser that reads a wrong number
+    # must not crash the detail page). ``None`` when unparseable.
+    year: int | None = Field(default=None, ge=1, le=9999)
 
     # Library metadata (populated only if the manga is in the library).
     in_library: bool = False
@@ -577,7 +614,11 @@ class MangaDetailSchema(_DomainModel):
 
 
 class ChapterSummarySchema(_DomainModel):
-    """Chapter projection used in list endpoints."""
+    """Chapter projection used in list endpoints.
+
+    ``reading_progress`` is clamped to ``[0.0, 1.0]`` (see
+    :class:`ReadingProgressSchema` for the rationale).
+    """
 
     id: str
     manga_id: str
@@ -591,18 +632,40 @@ class ChapterSummarySchema(_DomainModel):
 
     # Status of the *local* copy, if any.
     downloaded: bool = False
-    reading_progress: float = Field(default=0.0, ge=0.0, le=1.0)
+    reading_progress: float = Field(default=0.0)
+
+    def model_post_init(self, __context: Any) -> None:
+        # Clamp, do not reject — see ``ReadingProgressSchema``.
+        if self.reading_progress < 0.0:
+            object.__setattr__(self, "reading_progress", 0.0)
+        elif self.reading_progress > 1.0:
+            object.__setattr__(self, "reading_progress", 1.0)
 
 
 class PageSchema(_DomainModel):
-    """A single page within a chapter."""
+    """A single page within a chapter.
+
+    ``url`` is optional: a library-only page (never scraped, or with the
+    source URL lost) has ``url=None`` and only ``filename``. Requiring
+    ``url`` would 500 on those — the router used to emit ``""`` as a
+    workaround, but that is not a valid URL and clients that build a
+    download link from it fail at request time. ``None`` is honest.
+
+    ``width``/``height`` accept ``0``: a parser that fails to read image
+    dimensions may set ``0`` (or a stale ``0`` from a partial scan); that
+    must not crash the whole ``/pages`` response.
+    """
 
     index: int = Field(ge=0, description="0-based page index.")
-    url: str = Field(description="Source URL (may require auth cookies).")
+    url: str | None = Field(
+        default=None,
+        description="Source URL (may require auth cookies). ``null`` for "
+                    "library-only pages that have a local ``filename``.",
+    )
     filename: str | None = Field(default=None)
     size_bytes: int | None = Field(default=None, ge=0)
-    width: int | None = Field(default=None, ge=1)
-    height: int | None = Field(default=None, ge=1)
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
 
 
 class ChapterListResponse(PaginatedResponse[ChapterSummarySchema]):
@@ -612,12 +675,26 @@ class ChapterListResponse(PaginatedResponse[ChapterSummarySchema]):
 
 
 class PageListResponse(_ResponseModel):
-    """All pages of a chapter, in order. Not paginated."""
+    """All pages of a chapter, in order. Not paginated.
+
+    ``downloaded`` distinguishes the two page sources:
+
+    * ``True`` — pages come from the local library; each page has
+      ``filename`` set (and possibly ``url=None``).
+    * ``False`` — pages come from a live parse; each page has ``url``
+      set and ``filename=None``.
+    """
 
     manga_id: str
     chapter_id: str
     pages: list[PageSchema]
     total: int = Field(ge=0)
+    downloaded: bool = Field(
+        default=False,
+        description="True when the pages came from the local library "
+                    "(``filename`` set); False for a live parse (``url`` "
+                    "set).",
+    )
 
 
 # ===========================================================================
@@ -672,20 +749,36 @@ class DownloadTaskSchema(_DomainModel):
     finished_at: datetime | None = Field(default=None)
 
 
+#: Default per-status zeros used by :class:`DownloadTaskListResponse`.
+#: Exposed as a module-level constant so callers (the router's fallback
+#: path, tests) can reuse the exact same dict — never a partial one.
+_EMPTY_STATUS_COUNTS: dict[str, int] = {
+    "pending": 0,
+    "running": 0,
+    "paused": 0,
+    "done": 0,
+    "failed": 0,
+    "cancelled": 0,
+}
+
+
 class DownloadTaskListResponse(_ResponseModel):
     """Response for ``GET /api/v1/download``.
 
     Flat (not paginated) — the queue is small and clients usually want
     the whole picture. ``counts`` pre-aggregates by status so the UI can
-    render badges without a full scan.
+    render badges without a full scan. It is initialised with zeros for
+    every status, so a client that always reads ``counts["running"]``
+    never hits a ``KeyError`` even on an empty queue.
     """
 
     items: list[DownloadTaskSchema]
     counts: dict[str, int] = Field(
-        default_factory=dict,
+        default_factory=lambda: dict(_EMPTY_STATUS_COUNTS),
         description="Pre-aggregated counts by status "
                     "(`running`, `pending`, `paused`, `done`, `failed`, "
-                    "`cancelled`).",
+                    "`cancelled`). Always contains every key, initialised "
+                    "to zero.",
     )
     queue_paused: bool = False
 
@@ -823,16 +916,11 @@ def compute_status_counts(
     """Compute the ``counts`` dict for :class:`DownloadTaskListResponse`.
 
     Kept here (not on the router) so the aggregation logic is testable in
-    isolation and centralised for every caller.
+    isolation and centralised for every caller. Returns every key of
+    :data:`_EMPTY_STATUS_COUNTS` initialised to zero, so a caller that
+    always reads a specific status never hits a ``KeyError``.
     """
-    counts: dict[str, int] = {
-        "pending": 0,
-        "running": 0,
-        "paused": 0,
-        "done": 0,
-        "failed": 0,
-        "cancelled": 0,
-    }
+    counts: dict[str, int] = dict(_EMPTY_STATUS_COUNTS)
     for item in items:
         key = str(item.status.value)
         if key in counts:

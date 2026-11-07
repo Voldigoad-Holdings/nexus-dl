@@ -84,13 +84,24 @@ from the others, and there would be no compile-time signal.
    user-facing display string and the case matches — substituting it
    is safe and recommended.
 
-The refactor is **scheduled, not urgent**, and follows the same rule
-used elsewhere in this codebase: each affected module is opened for the
-substitution the next time it is opened **for any other reason**. The
-substitution is a one-line change per module: replace the private
-constant with ``from nexusdl.core.constants import EVENT_...`` (or
-``APP_SLUG`` / ``APP_NAME`` / ``DATA_PACKAGE``) and use it as before. No
-call site changes; no behaviour changes.
+**Events emitted by ``database.py`` and ``site_registry.py``.** The two
+events :data:`EVENT_LIBRARY_UPDATED` and :data:`EVENT_SITE_HEALTH_CHANGED`
+are currently **reserved** — no module emits them yet. When
+:mod:`nexusdl.core.library.database` starts emitting the former and
+:mod:`nexusdl.core.registry.site_registry` starts emitting the latter,
+they **must** import the constant from this module rather than hardcoding
+the string. There is no private copy to migrate today, so the diff is a
+straightforward ``from nexusdl.core.constants import EVENT_...`` plus an
+``event_bus.publish(Event(type=EVENT_..., ...))`` call.
+
+The refactor for the modules that **do** have private copies is
+**scheduled, not urgent**, and follows the same rule used elsewhere in
+this codebase: each affected module is opened for the substitution the
+next time it is opened **for any other reason**. The substitution is a
+one-line change per module: replace the private constant with
+``from nexusdl.core.constants import EVENT_...`` (or ``APP_SLUG`` /
+``APP_NAME`` / ``DATA_PACKAGE``) and use it as before. No call site
+changes; no behaviour changes.
 
 This file will not reopen any of those modules on its own — the user's
 explicit rule is that a delivered file is final, and adding a constant
@@ -144,6 +155,24 @@ This module is a **pure leaf** — zero imports, zero third parties. It
 can be imported from anywhere, including from the package's own
 ``__init__.py`` if that ever needs to expose ``APP_SLUG`` before the
 rest of the package is importable.
+
+Event origin reference
+----------------------
+For clarity, the emitters of each event are:
+
+* **Worker** (``core/downloader/worker.py``): ``download.started``,
+  ``download.progress``, ``download.completed``, ``download.failed``.
+* **Manager** (``core/downloader/manager.py``): ``download.paused``,
+  ``download.resumed``, ``download.cancelled``, ``chapter.started``,
+  ``chapter.completed``, ``chapter.failed``.
+* **Reserved** (not yet emitted): ``library.updated`` (will come from
+  ``core/library/database.py``), ``site.health.changed`` (will come
+  from ``core/registry/site_registry.py``).
+
+The manager does **not** re-emit the worker's ``download.*`` events —
+it only emits the three lifecycle events and the three chapter events.
+Subscribers that want per-page progress subscribe to ``download.progress``
+directly on the bus; they are not receiving a copy from the manager.
 """
 
 from __future__ import annotations
@@ -238,12 +267,13 @@ DATA_PACKAGE: Final[str] = "nexusdl.data"
 # a compile error rather than a silent no-match at runtime.
 #
 # The four "download state" events (started / progress / completed /
-# failed) come from the worker and are re-emitted by the manager's
-# ``download_manga`` iterator; the three "download lifecycle" events
-# (paused / resumed / cancelled) come from the manager. The three
-# "chapter" events come from the manager's ``download_manga`` loop. The
-# library and site events are emitted by the library database (on
-# mutation) and the site registry (on health transition) respectively.
+# failed) come from the worker and are consumed directly by subscribers
+# (the progress tracker, the API's WebSocket bridge). The manager does
+# **not** re-emit them; it only emits the three lifecycle events
+# (paused / resumed / cancelled) and the three chapter-level events
+# (started / completed / failed). The library and site events are
+# emitted by the library database (on mutation) and the site registry
+# (on health transition) respectively, and are currently reserved.
 #
 # Event names are lowercase, dot-separated, and follow a
 # ``<namespace>.<verb>`` convention. A plugin that emits custom events
@@ -310,16 +340,21 @@ EVENT_CHAPTER_FAILED: Final[str] = "chapter.failed"
 
 # --- Library and site ------------------------------------------------ #
 
-#: Emitted by the library database after any write that changes the
-#: stored content — a manga or chapter upsert, a reading-progress
-#: update, a manga deletion. A subscriber that re-renders the library
-#: view on this event does not need to know which write triggered it.
+#: **Reserved** — emitted by the library database after any write that
+#: changes the stored content: a manga or chapter upsert, a
+#: reading-progress update, a manga deletion. A subscriber that
+#: re-renders the library view on this event does not need to know
+#: which write triggered it. Not yet emitted by the shipped code —
+#: :mod:`nexusdl.core.library.database` must import this constant when
+#: it starts publishing.
 EVENT_LIBRARY_UPDATED: Final[str] = "library.updated"
 
-#: Emitted by the site registry when a health check changes a site's
-#: :class:`~nexusdl.core.models.enums.SiteHealth` value from one state
-#: to another. Emitted only on the transition, not on every check —
-#: a subscriber that updates a UI indicator sees one event per state
-#: change, not one per poll. Payload includes ``site_id``,
-#: ``previous_status``, and ``new_status``.
+#: **Reserved** — emitted by the site registry when a health check
+#: changes a site's :class:`~nexusdl.core.models.enums.SiteHealth` value
+#: from one state to another. Emitted only on the transition, not on
+#: every check — a subscriber that updates a UI indicator sees one event
+#: per state change, not one per poll. Payload includes ``site_id``,
+#: ``previous_status``, and ``new_status``. Not yet emitted by the
+#: shipped code — :mod:`nexusdl.core.registry.site_registry` must import
+#: this constant when it starts publishing.
 EVENT_SITE_HEALTH_CHANGED: Final[str] = "site.health.changed"

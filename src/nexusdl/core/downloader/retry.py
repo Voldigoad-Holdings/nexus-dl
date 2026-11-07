@@ -259,6 +259,23 @@ class RetryPolicy:
             )
 
 
+def _coerce_field(
+    value: object,
+    *,
+    fallback: int | float,
+    field_name: str,
+) -> int | float:
+    """Return *value* coerced to the type of *fallback*, or *fallback* if
+    *value* is ``None``.
+
+    Centralises the "explicit ``None`` means use the default" rule so both
+    numeric fields of :func:`policy_from_settings` behave identically.
+    """
+    if value is None:
+        return fallback
+    return type(fallback)(value)  # type: ignore[call-arg]
+
+
 def policy_from_settings(
     retry_config: object | None,
     *,
@@ -275,7 +292,10 @@ def policy_from_settings(
     Every field falls back independently: a settings section that provides
     ``max_attempts`` but not ``max_delay`` yields a policy with the custom
     attempt count and the default delay. ``None`` for the whole section
-    yields the module defaults.
+    yields the module defaults. A field explicitly set to ``None`` on an
+    otherwise-populated section is treated the same as an absent field —
+    this matches how ``pydantic-settings`` represents an unset optional
+    numeric and lets a single retry config be reused across contexts.
 
     Args:
         retry_config: Any object exposing ``max_attempts``, ``initial_delay``,
@@ -291,17 +311,35 @@ def policy_from_settings(
         (e.g. ``max_attempts=0``) raise :class:`ValueError` from
         :class:`RetryPolicy`'s post-init check rather than being silently
         coerced.
+
+    Raises:
+        TypeError: If a field is present and non-``None`` but cannot be
+            coerced to its expected numeric type.
+        ValueError: If the resulting values violate :class:`RetryPolicy`'s
+            invariants.
     """
     fallback = default if default is not None else RetryPolicy()
     return RetryPolicy(
         max_attempts=int(
-            getattr(retry_config, "max_attempts", fallback.max_attempts)
+            _coerce_field(
+                getattr(retry_config, "max_attempts", None),
+                fallback=fallback.max_attempts,
+                field_name="max_attempts",
+            )
         ),
         initial_delay=float(
-            getattr(retry_config, "initial_delay", fallback.initial_delay)
+            _coerce_field(
+                getattr(retry_config, "initial_delay", None),
+                fallback=fallback.initial_delay,
+                field_name="initial_delay",
+            )
         ),
         max_delay=float(
-            getattr(retry_config, "max_delay", fallback.max_delay)
+            _coerce_field(
+                getattr(retry_config, "max_delay", None),
+                fallback=fallback.max_delay,
+                field_name="max_delay",
+            )
         ),
     )
 

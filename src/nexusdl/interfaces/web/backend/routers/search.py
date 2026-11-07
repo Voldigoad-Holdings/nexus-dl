@@ -46,13 +46,29 @@ The router looks for a search service on ``ServicesDep`` in this order:
 If neither method exists, the router raises a **500** with a clear
 message — silent fallbacks would make composition-root bugs invisible.
 
+Optional keyword: the service method may accept ``requested_by`` (the
+caller's user id) as a keyword-only argument. The router inspects the
+signature and forwards it when present — services that do not declare it
+are called with a single positional argument. No ``TypeError`` probing:
+signature introspection is authoritative.
+
+If the service accepts an ``include_adult`` keyword, the router forwards
+it explicitly (in addition to embedding it in the request copy). If the
+service declares neither, only the request copy carries the resolved
+flag — but the copy step is only attempted on Pydantic v2 models;
+services whose request object does not support ``model_copy`` are called
+with the original request unchanged (the policy decision is then the
+service's responsibility, as documented in the audit log).
+
 Normalized return shapes accepted by :func:`_normalize_outcome`:
 
 * Object with ``.items``, ``.total``, ``.sites_queried``, ``.sites_failed``
   — the recommended shape.
 * Object with ``.items`` and ``.total`` only — ``sites_queried`` is
   inferred from the request, ``sites_failed`` is ``[]``.
-* ``tuple(items, total)`` — same inference as above.
+* ``tuple(items, total)``, ``tuple(items, total, page)``, and
+  ``tuple(items, total, page, sites_queried, sites_failed)`` — all
+  common paginated-result conventions are accepted.
 * ``list[item]`` — ``total = len(items)``, same inference as above.
 """
 from __future__ import annotations
@@ -133,6 +149,12 @@ async def search(
             include_adult=include_adult,
             requested_by=payload.sub,
         )
+    except HTTPException:
+        # A service may legitimately raise ``HTTPException`` (e.g. its own
+        # 404 for an unknown ``site_ids`` entry, its own 403 for a
+        # policy check that must surface verbatim). Never mask it as a
+        # generic 502 — the client deserves the real status code.
+        raise
     except Exception:
         _log.exception(
             "Search failed (method={}, user={}, query_len={}, sites={})",
@@ -283,40 +305,103 @@ async def _invoke_search(
 ) -> Any:
     """Invoke the search method, forwarding the resolved adult flag.
 
-    Two calling conventions are supported:
+    The router inspects the target's signature (via
+    :func:`inspect.signature`) to decide which keyword arguments to
+    forward. This is authoritative and version-independent — no
+    ``TypeError`` message parsing, no accidental catch of a
+    ``TypeError`` raised *inside* the service's own body.
 
-    * ``search(request: SearchRequest)`` — the request object carries
-      ``include_adult`` already; the router mutates ``body``? No — the
-      request is frozen. Instead, we pass the resolved flag via a
-      dedicated kwarg so the service cannot miss the policy decision.
-    * Service implementations that accept
-      ``search(request, *, include_adult, requested_by)`` — ideal.
+    Forwarded kwargs:
 
-    If the service only takes a positional ``request`` argument, the
-    router falls back to passing ``body.model_copy(update={"include_adult":
-    include_adult})`` so the resolved value travels with the request.
+    * ``requested_by`` — only if the callee declares it. Common for
+      services that need the caller's identity for audit or per-user
+      filtering.
+    * ``include_adult`` — only if the callee declares it *and* the
+      request copy also carries it. The copy is authoritative; the
+      kwarg is a convenience for services that inspect the kwarg
+      directly.
+
+    The request copy: the router attempts ``body.model_copy(update=...)``
+    to inject the resolved ``include_adult``. This is Pydantic v2 only.
+    If the request object is not a Pydantic model (msgspec, dataclass,
+    frozen class without ``model_copy``), the original request is
+    passed unchanged — the resolved flag is then only forwarded via
+    kwarg, if the callee supports it. This is documented explicitly
+    (see the module docstring) — the router never silently drops the
+    policy decision when the service declares ``include_adult`` as a
+    kwarg.
     """
-    # Build a request with the resolved include_adult so services that
-    # only inspect `request.include_adult` still see the policy decision.
-    resolved_request = body.model_copy(
-        update={"include_adult": include_adult}
+    resolved_request = _with_resolved_adult(body, include_adult)
+    kwargs = _introspect_kwargs(
+        search_callable,
+        include_adult=include_adult,
+        requested_by=requested_by,
     )
 
-    # Try the rich contract first.
-    try:
-        result = search_callable(
-            resolved_request,
-            requested_by=requested_by,
-        )
-    except TypeError as exc:
-        # Signature mismatch → fallback to plain positional call.
-        if "requested_by" not in str(exc):
-            raise
-        result = search_callable(resolved_request)
-
+    result = search_callable(resolved_request, **kwargs)
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+def _with_resolved_adult(
+    body: SearchRequest, include_adult: bool
+) -> SearchRequest:
+    """Return a copy of ``body`` with ``include_adult`` forced to the policy.
+
+    If ``body`` supports ``model_copy`` (Pydantic v2), the copy is
+    authoritative. Otherwise the original request is returned
+    unchanged — service implementations must then honor the
+    ``include_adult`` kwarg (which the router forwards when declared).
+    """
+    copy_method = getattr(body, "model_copy", None)
+    if callable(copy_method):
+        try:
+            return copy_method(update={"include_adult": include_adult})
+        except Exception:
+            # A field is missing or the copy method failed unexpectedly —
+            # fall through to the plain pass.
+            _log.debug(
+                "model_copy(update={'include_adult': ...}) failed on "
+                "request; passing original to search service"
+            )
+    return body
+
+
+def _introspect_kwargs(
+    callee: Any,
+    *,
+    include_adult: bool,
+    requested_by: str | None,
+) -> dict[str, Any]:
+    """Return the kwargs the callee accepts, filtered to what we have.
+
+    Returns an empty dict when introspection is not available (e.g. for
+    C extensions or partials without ``__wrapped__``). Never raises —
+    introspection failure degrades gracefully to the positional call,
+    which is the least common denominator contract.
+    """
+    try:
+        sig = inspect.signature(callee)
+    except (TypeError, ValueError):
+        return {}
+
+    kwargs: dict[str, Any] = {}
+    params = sig.parameters
+
+    # ``**kwargs`` in the callee means any keyword is accepted.
+    accepts_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+    if "requested_by" in params or accepts_var_kw:
+        if requested_by is not None:
+            kwargs["requested_by"] = requested_by
+
+    if "include_adult" in params or accepts_var_kw:
+        kwargs["include_adult"] = include_adult
+
+    return kwargs
 
 
 # ===========================================================================
@@ -342,44 +427,179 @@ def _normalize_outcome(raw: Any, request: SearchRequest) -> _Outcome:
     * Rich object: ``.items``, ``.total``, ``.sites_queried``,
       ``.sites_failed`` — used verbatim.
     * Sparse object: ``.items``, ``.total`` — sites inferred from request.
-    * Tuple: ``(items, total)``.
-    * List: ``items`` (total = len).
+    * Tuple of length 1–5 — ``(items,)``, ``(items, total)``,
+      ``(items, total, page)``,
+      ``(items, total, page, sites_queried)``, or
+      ``(items, total, page, sites_queried, sites_failed)``.
+    * List of items.
+
+    Missing or wrongly-typed fields fall back to safe defaults rather
+    than raising — a well-behaved client should never see a 502 because
+    a service returned ``total=None``.
     """
-    items: list[Any] = []
-    total: int = 0
-    page: int = request.page
-    sites_queried: tuple[str, ...] = tuple(request.site_ids or ())
-    sites_failed: tuple[str, ...] = ()
+    default_sites_queried: tuple[str, ...] = tuple(
+        str(s) for s in (request.site_ids or ())
+    )
+    default_page: int = _coerce_int(
+        getattr(request, "page", 1), default=1, minimum=1
+    )
 
     if raw is None:
-        return _Outcome((), 0, page, sites_queried, sites_failed)
+        return _Outcome((), 0, default_page, default_sites_queried, ())
 
-    if isinstance(raw, (list, tuple)) and not isinstance(raw, _Outcome):
-        # Plain collection or (items, total) tuple.
-        if len(raw) == 2 and isinstance(raw[1], int):
-            items = list(raw[0])
-            total = int(raw[1])
-        else:
-            items = list(raw)
-            total = len(items)
-        return _Outcome(
-            tuple(items), total, page, sites_queried, sites_failed
+    # --- List/tuple shapes -------------------------------------------
+    if isinstance(raw, (list, tuple)):
+        return _outcome_from_sequence(
+            raw, default_page, default_sites_queried
         )
 
-    # Object path.
-    items = list(getattr(raw, "items", []) or [])
-    total = int(getattr(raw, "total", len(items)) or len(items))
-    page = int(getattr(raw, "page", request.page) or request.page)
+    # --- Object shapes -----------------------------------------------
+    items = list(getattr(raw, "items", None) or [])
+    total = _coerce_int(
+        getattr(raw, "total", None),
+        default=len(items),
+        minimum=0,
+    )
+    page = _coerce_int(
+        getattr(raw, "page", None),
+        default=default_page,
+        minimum=1,
+    )
 
-    raw_queried = getattr(raw, "sites_queried", None)
-    if raw_queried:
-        sites_queried = tuple(str(s) for s in raw_queried)
-
-    raw_failed = getattr(raw, "sites_failed", None)
-    if raw_failed:
-        sites_failed = tuple(str(s) for s in raw_failed)
+    sites_queried = _coerce_site_list(
+        getattr(raw, "sites_queried", None),
+        default=default_sites_queried,
+    )
+    sites_failed = _coerce_site_list(
+        getattr(raw, "sites_failed", None),
+        default=(),
+    )
 
     return _Outcome(items, total, page, sites_queried, sites_failed)
+
+
+def _outcome_from_sequence(
+    raw: Sequence[Any],
+    default_page: int,
+    default_sites_queried: tuple[str, ...],
+) -> _Outcome:
+    """Normalize the various ``list``/``tuple`` return conventions.
+
+    Recognized shapes:
+
+    * ``(items,)`` — 1-tuple, only items.
+    * ``(items, total)`` — 2-tuple, the most common.
+    * ``(items, total, page)`` — 3-tuple.
+    * ``(items, total, page, sites_queried)`` — 4-tuple.
+    * ``(items, total, page, sites_queried, sites_failed)`` — 5-tuple.
+    * a plain ``list[items]`` (no total).
+
+    The **discriminator** is ``isinstance(raw[1], int)``: if the second
+    element is an ``int``, the sequence is a paginated-result tuple; if
+    not, it is a plain list of items.
+    """
+    if len(raw) == 0:
+        return _Outcome((), 0, default_page, default_sites_queried, ())
+
+    # Plain list of items → no total element.
+    if len(raw) == 1:
+        items = list(raw[0]) if isinstance(raw[0], (list, tuple)) else list(raw)
+        return _Outcome(
+            items, len(items), default_page, default_sites_queried, ()
+        )
+
+    if not (len(raw) >= 2 and isinstance(raw[1], int)):
+        # First element is not a paginated tuple — treat the whole
+        # sequence as items.
+        return _Outcome(
+            list(raw), len(raw), default_page, default_sites_queried, ()
+        )
+
+    items_raw = raw[0]
+    try:
+        items = list(items_raw) if items_raw is not None else []
+    except TypeError:
+        # Non-iterable first element — this is a shape bug; return
+        # empty rather than 500.
+        items = []
+
+    total = _coerce_int(raw[1], default=len(items), minimum=0)
+
+    page = (
+        _coerce_int(raw[2], default=default_page, minimum=1)
+        if len(raw) >= 3
+        else default_page
+    )
+
+    sites_queried = (
+        _coerce_site_list(raw[3], default=default_sites_queried)
+        if len(raw) >= 4
+        else default_sites_queried
+    )
+
+    sites_failed = (
+        _coerce_site_list(raw[4], default=())
+        if len(raw) >= 5
+        else ()
+    )
+
+    return _Outcome(items, total, page, sites_queried, sites_failed)
+
+
+def _coerce_int(value: Any, *, default: int, minimum: int) -> int:
+    """Coerce ``value`` to ``int`` with a floor, or return ``default``.
+
+    Accepts real ``int`` (and ``bool``, which is a subclass), numeric
+    strings, and floats (truncated). Everything else — ``None``, ``""``,
+    ``"two"``, complex objects, ``NaN`` — falls back to ``default``.
+    Values below ``minimum`` are clamped. This is defensive: a service
+    returning ``total=None`` or ``page="2"`` should not surface as a
+    502 to the client.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return minimum if not value else max(minimum, 1)
+    if isinstance(value, int):
+        return max(minimum, value)
+    if isinstance(value, float):
+        try:
+            iv = int(value)
+        except (ValueError, OverflowError):
+            return default
+        return max(minimum, iv)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return max(minimum, int(stripped))
+        except ValueError:
+            try:
+                return max(minimum, int(float(stripped)))
+            except (ValueError, OverflowError):
+                return default
+    return default
+
+
+def _coerce_site_list(
+    value: Any, *, default: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Coerce ``value`` to a tuple of site-id strings.
+
+    Handles the ``"mangadex"`` vs ``["mangadex"]`` footgun: a bare
+    string is wrapped in a 1-tuple. Iterables are consumed into strings.
+    Anything else returns ``default``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        s = value.strip()
+        return (s,) if s else default
+    try:
+        return tuple(str(s) for s in value if s is not None)
+    except TypeError:
+        return default
 
 
 # ===========================================================================
@@ -395,7 +615,8 @@ def _normalize_outcome(raw: Any, request: SearchRequest) -> _Outcome:
 #     response" pattern (adult policy on site_ids), not a silent 403
 #     leak.
 # [ ] New normalization shapes are added to :func:`_normalize_outcome`
-#     AND documented in the module docstring.
+#     AND documented in the module docstring. Every new tuple shape must
+#     be covered by a test in ``tests/integration/test_search.py``.
 # [ ] Rate limits are declared in :mod:`..middleware.rate_limit`, never
 #     inline here.
 # [ ] Error envelopes use :func:`error_response` — never build

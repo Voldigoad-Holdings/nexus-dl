@@ -65,8 +65,11 @@ Adding a member to a **persisted** enumeration is a **breaking change**:
 2. Add a migration that extends the corresponding ``CHECK`` constraint
    and, if the new value should be the default, changes the column
    default.
-3. Update every consumer that exhaustively matches on the enumeration
-   (``mypy --strict`` will flag non-exhaustive matches).
+3. Audit every consumer that exhaustively matches on the enumeration.
+   ``mypy --strict`` does **not** flag non-exhaustive ``match`` by itself —
+   it would need ``warn_unreachable = True`` in ``[tool.mypy]`` **and**
+   the ``match`` case to be provably exhaustive for the type. In practice,
+   expect code review to be the safety net, not the type checker.
 
 Adding a member to a **non-persisted** enumeration is a minor change — no
 migration required. Renaming is a breaking change for both categories.
@@ -139,25 +142,51 @@ class MangaStatus(StrEnum):
 
 
 class ContentRating(StrEnum):
-    """Content rating of a manga, ordered from safest to most explicit.
+    """Content rating of a manga, declared from safest to most explicit.
 
     Matches the ``CHECK`` constraint on ``mangas.content_rating``. The
-    order of the members is meaningful for callers implementing an
-    adult-content gate: **members declared later are more explicit**, so a
-    caller that wants to allow up to ``SUGGESTIVE`` can compare
-    ``rating.value <= ContentRating.SUGGESTIVE.value`` **only** if they
-    reverse the alphabetical comparison — hence the recommended
-    implementation is an explicit allowlist (``rating in {SAFE,
-    SUGGESTIVE}``) rather than a comparison. Documented here so a caller
-    who tries the comparison route understands why it does not work.
+    declaration order below (:attr:`SAFE` → :attr:`PORNOGRAPHIC`) is the
+    **semantic** order from least to most explicit — and it is **not**
+    the alphabetical order of the string values. A caller who needs a
+    numeric comparison must materialise the ordering explicitly::
 
-    .. note::
+        _CONTENT_RATING_ORDER: tuple[ContentRating, ...] = (
+            ContentRating.SAFE,
+            ContentRating.SUGGESTIVE,
+            ContentRating.EROTICA,
+            ContentRating.PORNOGRAPHIC,
+        )
 
-       The order of the members does **not** affect string comparison
-       (``"EROTICA" < "PORNOGRAPHIC" < "SAFE"`` alphabetically), and
-       comparing ``StrEnum`` members with ``<`` raises ``TypeError`` —
-       which is the safest default. Use explicit set membership for
-       gating logic.
+        def allows_up_to(
+            rating: ContentRating, cap: ContentRating
+        ) -> bool:
+            return (
+                _CONTENT_RATING_ORDER.index(rating)
+                <= _CONTENT_RATING_ORDER.index(cap)
+            )
+
+    **Do not** compare ``rating.value`` with ``<`` or ``<=``. The
+    alphabetical order of the string values is arbitrary relative to the
+    semantic order:
+
+    * ``"EROTICA" < "PORNOGRAPHIC" < "SAFE" < "SUGGESTIVE"``
+
+    so a comparison like ``rating.value <= ContentRating.SUGGESTIVE.value``
+    happens to accept ``SAFE`` and ``SUGGESTIVE`` **and also accepts**
+    ``EROTICA`` and ``PORNOGRAPHIC`` under some other naive tests — the
+    point being that **no** string comparison matches the intended
+    semantics across every combination. The only correct approaches are:
+
+    1. **Explicit allowlist** — ``rating in {ContentRating.SAFE,
+       ContentRating.SUGGESTIVE}`` for a "safe only" gate. This is the
+       recommended pattern for any simple binary gate.
+    2. **Explicit ordered tuple** — as shown above, for a "cap at X"
+       gate.
+
+    :class:`~enum.StrEnum` members do not support ``<`` between themselves
+    (Python raises ``TypeError``), which is the safest default — it forces
+    a caller to think about the ordering rather than write a comparison
+    that silently misbehaves.
     """
 
     SAFE = "SAFE"
@@ -187,10 +216,17 @@ class PackagingFormat(StrEnum):
     neither of which exists today.
 
     Note that the value of :attr:`CBT` is ``"cbt"``, but the file extension
-    the worker produces for a CBT is ``.tar`` — see
-    :data:`nexusdl.core.downloader.worker._FORMAT_EXTENSIONS`. The two are
-    intentionally different: ``"cbt"`` names the format, ``.tar`` names
-    the container.
+    the worker produces for a CBT is ``.tar``. **Both** the worker and the
+    manager carry a ``_FORMAT_EXTENSIONS`` map that must agree on this
+    value:
+
+    * :data:`nexusdl.core.downloader.worker._FORMAT_EXTENSIONS`
+    * :data:`nexusdl.core.downloader.manager._FORMAT_EXTENSIONS`
+
+    The two are intentionally kept as separate copies with a
+    cross-checking test; changing one without the other would make the
+    manager's ``skip_existing`` check disagree with the worker's output
+    path. ``"cbt"`` names the format, ``.tar`` names the container.
     """
 
     FOLDER = "folder"
@@ -205,7 +241,7 @@ class Priority(IntEnum):
     """Download task priority.
 
     Numerically ordered: ``LOW < NORMAL < HIGH``. The download queue sorts
-    by descending priority (``-priority.value``) and falls back to
+    by descending priority (``-int(priority.value)``) and falls back to
     submission order (FIFO) at equal priority.
 
     Using :class:`~enum.IntEnum` — rather than :class:`~enum.StrEnum`, as
@@ -291,7 +327,7 @@ class SiteHealth(StrEnum):
 class UserRole(StrEnum):
     """Authorisation role of a user account.
 
-    Matches the ``CHECK`` constraint on ``users.role``. Ordered from least
+    Matches the ``CHECK`` constraint on ``users.role``. Declared from least
     to most privileged, but **the order is descriptive only** — the auth
     layer must use explicit comparisons (``role == UserRole.ADMIN``), not
     ``>=`` against the member, because :class:`~enum.StrEnum` members do

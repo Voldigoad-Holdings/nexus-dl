@@ -22,10 +22,13 @@ the same exceptions as :class:`~nexusdl.core.models.manga.Manga`:
   does not hydrate them from the database row. This is a documented gap
   matching the one in :mod:`nexusdl.core.models.manga`; when it is fixed,
   these fields will start arriving populated without any change to this
-  module. In the meantime they are correctly persisted by
-  :meth:`LibraryDatabase.add_chapter` (which uses
-  ``getattr(chapter, "created_at", None)`` — ``None`` means "let the
-  database set it to now on insert, preserve on update").
+  module. **The same gap applies to ``published_at``**: the column exists
+  in the schema, but the mapper does not read it. A caller who does
+  ``get_chapter`` → ``add_chapter`` in the same process will see
+  ``published_at`` silently reset to ``None`` (or ``created_at`` reset to
+  ``now``). This will be fixed in ``database.py`` — see the ``# TODO``
+  on ``_row_to_chapter`` in that file. Until then, avoid round-tripping
+  chapters through the database if ``published_at`` matters.
 * The unique constraint ``UNIQUE(manga_id, source_id)`` is enforced at the
   schema level; the model does not duplicate it, because no single
   :class:`Chapter` instance can violate a uniqueness constraint against
@@ -80,6 +83,14 @@ chapter model carries only the metadata the database schema provides
 the actual :class:`~nexusdl.core.models.page.Page` list is not part of
 this value object.
 
+ID pattern
+----------
+``_HEX16_PATTERN`` (16 lowercase hex characters) is deliberately identical
+to ``Manga._MANGA_ID_PATTERN``. Both modules keep their own copy rather
+than importing to avoid cross-``models`` coupling — the two are
+maintained in lockstep by a unit test that asserts the compiled patterns
+are equal. If you change one, change the other and re-run that test.
+
 Dependency graph (no cycles)::
 
     core.models.enums  ──► core.models.chapter
@@ -92,7 +103,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Final
 
 from nexusdl.core.models.enums import Language
@@ -109,10 +120,24 @@ __all__ = ["Chapter"]
 #: produced by ``sha256(...)[:16]``. The schema enforces only
 #: ``length(...) = 16``; the model is deliberately stricter so that a bug
 #: in id generation cannot reach the database and only fail on read.
+#:
+#: .. note::
+#:
+#:    This pattern is deliberately identical to
+#:    ``Manga._MANGA_ID_PATTERN`` in :mod:`nexusdl.core.models.manga`.
+#:    Both modules keep their own copy rather than importing to avoid
+#:    cross-``models`` coupling. The two are maintained in lockstep by a
+#:    unit test that asserts the compiled patterns are equal.
 _HEX16_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{16}$")
 
 #: Length of the canonical truncated-sha256 id.
 _ID_LENGTH: Final[int] = 16
+
+#: Tolerance applied to the ``created_at <= updated_at`` check. Imports
+#: from other systems occasionally suffer a few seconds of NTP drift; a
+#: small skew is not a data-integrity bug. Aligned with
+#: :mod:`nexusdl.core.models.user` and :mod:`nexusdl.core.models.manga`.
+_MAX_CLOCK_SKEW_SECONDS: Final[int] = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -172,7 +197,9 @@ class Chapter:
             :meth:`LibraryDatabase.add_chapter`. Defaults to ``0`` for a
             newly-created chapter whose pages have not been fetched yet.
         published_at: Optional UTC timestamp of publication. ``None``
-            when the source does not expose a date.
+            when the source does not expose a date. Note: the current
+            :meth:`LibraryDatabase._row_to_chapter` does **not** hydrate
+            this field — see the module docstring.
         created_at: UTC timestamp of creation. ``None`` when the current
             :meth:`LibraryDatabase._row_to_chapter` produces this
             instance — see the module docstring.
@@ -215,7 +242,8 @@ class Chapter:
                 ``manga_id`` does not match the canonical hex16 pattern,
                 ``number`` / ``volume`` is an empty string,
                 ``page_count`` is negative, a timestamp is timezone-naive,
-                or ``created_at > updated_at``.
+                or ``created_at > updated_at`` (beyond the clock-skew
+                tolerance).
         """
         self._validate_id("id", self.id)
         self._validate_id("manga_id", self.manga_id)
@@ -314,13 +342,15 @@ class Chapter:
         if (
             self.created_at is not None
             and self.updated_at is not None
-            and self.created_at > self.updated_at
         ):
-            raise ValueError(
-                "Chapter.created_at must be <= Chapter.updated_at "
-                f"({self.created_at.isoformat()} > "
-                f"{self.updated_at.isoformat()})"
-            )
+            skew = timedelta(seconds=_MAX_CLOCK_SKEW_SECONDS)
+            if self.updated_at + skew < self.created_at:
+                raise ValueError(
+                    "Chapter.created_at must be <= Chapter.updated_at "
+                    f"(tolerating {_MAX_CLOCK_SKEW_SECONDS}s clock skew) "
+                    f"({self.created_at.isoformat()} > "
+                    f"{self.updated_at.isoformat()})"
+                )
 
     # ------------------------------------------------------------------ #
     # Identity                                                           #
@@ -398,9 +428,7 @@ class Chapter:
         verbatim and validated by :meth:`__post_init__`. The
         ``**overrides`` signature mirrors
         :meth:`Manga.create` — the constructor's own validation is the
-        single source of truth for what values are acceptable, and
-        enumerating every optional keyword argument would duplicate that
-        contract without adding safety.
+        single source of truth for what values are acceptable.
 
         Use this method (rather than calling :class:`Chapter` directly)
         when you are creating a **new** chapter from application data. Use
@@ -413,15 +441,35 @@ class Chapter:
             title: The chapter's title.
             url: The chapter's canonical URL.
             **overrides: Any additional field of :class:`Chapter`. See the
-                class docstring for the full attribute list.
+                class docstring for the full attribute list. Cannot
+                override ``id``, ``manga_id``, ``source_id``, ``title``,
+                or ``url`` — those are computed or taken from the
+                keyword arguments.
 
         Returns:
             A newly-constructed :class:`Chapter` with a computed id.
 
         Raises:
-            TypeError: If any field has the wrong type.
+            TypeError: If any field has the wrong type, or if an override
+                collides with one of the explicit parameters
+                (``id``, ``manga_id``, ``source_id``, ``title``, ``url``).
             ValueError: If any field fails semantic validation.
         """
+        # Reject overrides that would collide with the explicit
+        # parameters. Without this check, a caller passing ``id="..."``
+        # (or any of the other four) would crash deep in ``cls(...)``
+        # with a cryptic
+        # ``__init__() got multiple values for keyword argument 'id'``.
+        reserved = frozenset(
+            {"id", "manga_id", "source_id", "title", "url"}
+        )
+        collisions = reserved & set(overrides)
+        if collisions:
+            raise TypeError(
+                "Chapter.create() got conflicting override(s) "
+                f"{sorted(collisions)!r}; these parameters are computed "
+                "or keyword-only. Remove them from **overrides."
+            )
         return cls(
             id=cls.make_id(manga_id, source_id),
             manga_id=manga_id,

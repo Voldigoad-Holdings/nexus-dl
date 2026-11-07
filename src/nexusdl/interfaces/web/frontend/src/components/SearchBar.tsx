@@ -36,9 +36,11 @@
  *
  * Accessibility
  * -------------
- * * ``<form role="search" aria-label="Search sites">`` — a search landmark
- *   with a unique, descriptive name (the label ensures the landmark is
- *   unambiguous on pages that also host filter panels or a sidebar).
+ * * ``<form role="search" aria-label="Site search form">`` — a search
+ *   landmark with a unique, descriptive name.  The landmark is labelled
+ *   distinctly from the input ("Site search form" vs "Search sites") so
+ *   that a screen reader announces two distinct regions on the page:
+ *   the search *form* and the search *field* inside it.
  * * The input has an ``sr-only`` ``<label>``, so its accessible name is
  *   "Search sites" regardless of the placeholder.
  * * The clear button has ``aria-label="Clear search"`` and a matching
@@ -172,16 +174,29 @@ export const SearchBar = forwardRef<HTMLInputElement, SearchBarProps>(
 
     const handleSubmit = (event: FormEvent<HTMLFormElement>): void => {
       event.preventDefault();
-      if (canSubmit) {
-        onSubmit();
+      // The ``canSubmit`` guard covers ``isLoading`` and ``disabled`` too,
+      // but spelling out the early return documents the intent: while a
+      // search is in flight, pressing Enter does nothing.  The alternative
+      // (re-submitting the same query) would race the in-flight request
+      // and produce a flash of stale results.
+      if (!canSubmit) {
+        return;
       }
+      onSubmit();
     };
 
     const handleKeyDown = (
       event: KeyboardEvent<HTMLInputElement>,
     ): void => {
       // Escape clears a non-empty input.  When the input is empty, we let
-      // the event bubble so a surrounding dialog can close.
+      // the event bubble so a surrounding dialog can close.  When the
+      // input is non-empty, ``preventDefault`` stops the browser from
+      // doing anything else (Safari's native "clear on Escape" for
+      // ``type="search"`` inputs, which we suppress via
+      // ``[&::-webkit-search-cancel-button]:appearance-none``) but also
+      // stops propagation — a dialog layered above will require a second
+      // Escape press to close, which is the standard search-bar behaviour
+      // users expect.
       if (event.key === "Escape" && value.length > 0) {
         event.preventDefault();
         onChange("");
@@ -191,7 +206,10 @@ export const SearchBar = forwardRef<HTMLInputElement, SearchBarProps>(
     return (
       <form
         role="search"
-        aria-label="Search sites"
+        // Distinct from the input's ``aria-label`` ("Search sites") so
+        // that a screen reader hears two distinct regions: the search
+        // *form* and the search *field* inside it.
+        aria-label="Site search form"
         aria-busy={isLoading}
         onSubmit={handleSubmit}
         className={cn("flex w-full items-center gap-2", className)}

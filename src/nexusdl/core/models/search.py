@@ -87,6 +87,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Final
+from urllib.parse import urlparse
 
 from nexusdl.core.models.enums import (
     ContentRating,
@@ -109,18 +110,40 @@ __all__ = [
 #: Site identifier pattern, identical to the one in
 #: :class:`nexusdl.core.models.site.SiteConfig` and ``sites_schema.json``.
 #: Kept as a compiled regex per-module rather than imported to avoid a
-#: cross-module dependency for a single pattern — the two definitions are
-#: guarded by a unit test that asserts equality.
+#: cross-module dependency for a single pattern — the three definitions
+#: (this module, ``site.py``, and ``sites_schema.json``) are guarded by a
+#: unit test that asserts equality.
 _SITE_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 #: Length of the canonical truncated-sha256 manga id. Same value as
 #: ``Manga.id`` and ``Chapter.id`` — see the PROMPT MASTER's ID table.
 _MANGA_ID_LENGTH: Final[int] = 16
 
-#: Site URLs and cover URLs must be absolute HTTPS. HTTP is rejected —
-#: every source site NexusDL supports serves HTTPS, and accepting HTTP
-#: would open a downgrade surface.
-_HTTPS_PREFIX: Final[str] = "https://"
+#: Prefix every absolute HTTPS URL must carry. Validated with
+#: :func:`urllib.parse.urlparse` (not a bare ``startswith``) so a malformed
+#: URL like ``"https://"`` (no host) is rejected.
+_HTTPS_SCHEME: Final[str] = "https"
+
+
+def _is_https_url(value: str) -> bool:
+    """Return ``True`` iff *value* is a well-formed absolute HTTPS URL.
+
+    Performs a full parse rather than a string-prefix check so that
+    ``"https://"`` (no host) and ``"https:// space"`` (whitespace in netloc)
+    are rejected. Scheme is compared case-insensitively — ``"HTTPS://"``
+    is accepted (RFC 3986 §3.1).
+
+    Args:
+        value: The candidate URL.
+
+    Returns:
+        ``True`` for well-formed absolute HTTPS URLs with a non-empty host.
+    """
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == _HTTPS_SCHEME and bool(parsed.netloc)
 
 
 # --------------------------------------------------------------------------- #
@@ -155,7 +178,9 @@ class SearchFilters:
             ``None`` means "no upper bound". Must be ``>= 0`` and
             ``>= year_min`` when both are set.
         tags: Genre / tag names the caller is interested in. Empty tuple
-            means "no tag filter". Must not contain empty strings.
+            means "no tag filter". Must not contain empty strings;
+            duplicates are removed at construction time while preserving
+            first-occurrence order.
         content_rating: Restrict to mangas with this content rating.
             ``None`` means "any rating". Callers implementing an
             adult-content gate should set this to a non-``PORNOGRAPHIC`` /
@@ -251,6 +276,12 @@ class SearchFilters:
                 raise ValueError(
                     "SearchFilters.tags must not contain empty strings"
                 )
+        # Deduplicate while preserving first-occurrence order. A
+        # duplicated tag would reach the parser verbatim, and some sites
+        # interpret ``?tags=a,a`` differently from ``?tags=a``.
+        deduped = tuple(dict.fromkeys(self.tags))
+        if deduped != self.tags:
+            object.__setattr__(self, "tags", deduped)
 
     @property
     def is_empty(self) -> bool:
@@ -318,10 +349,12 @@ class SearchResult:
             content should treat ``None`` conservatively (assume the
             worst) rather than assuming ``SAFE``.
         relevance: Optional relevance score, when the site exposes one.
-            ``None`` means "not scored". Positive floats only; the scale
-            is site-defined and not comparable across sites. Consumers
-            that want a cross-site ranking must define their own
-            normalisation.
+            ``None`` means "not scored". Non-negative float; the scale is
+            site-defined and not comparable across sites. Consumers that
+            want a cross-site ranking must define their own
+            normalisation. Stored as :class:`float` even when the site
+            reported an integer, so downstream code never sees an
+            ``int | float`` union.
     """
 
     site_id: str
@@ -344,7 +377,7 @@ class SearchResult:
             TypeError: If a field has the wrong Python type.
             ValueError: If ``site_id`` does not match the site-id pattern,
                 ``source_id`` / ``title`` is empty, ``url`` / ``cover_url``
-                does not start with ``https://``, ``year`` is negative, or
+                is not a well-formed HTTPS URL, ``year`` is negative, or
                 ``relevance`` is negative.
         """
         # --- Required strings ---------------------------------------- #
@@ -378,10 +411,10 @@ class SearchResult:
                 f"SearchResult.url must be a str, got "
                 f"{type(self.url).__name__}"
             )
-        if not self.url.startswith(_HTTPS_PREFIX):
+        if not _is_https_url(self.url):
             raise ValueError(
-                f"SearchResult.url must start with {_HTTPS_PREFIX!r}, "
-                f"got {self.url!r}"
+                f"SearchResult.url must be a well-formed absolute "
+                f"HTTPS URL, got {self.url!r}"
             )
         if self.cover_url is not None:
             if not isinstance(self.cover_url, str):
@@ -389,10 +422,10 @@ class SearchResult:
                     f"SearchResult.cover_url must be a str or None, got "
                     f"{type(self.cover_url).__name__}"
                 )
-            if not self.cover_url.startswith(_HTTPS_PREFIX):
+            if not _is_https_url(self.cover_url):
                 raise ValueError(
-                    f"SearchResult.cover_url must start with "
-                    f"{_HTTPS_PREFIX!r}, got {self.cover_url!r}"
+                    f"SearchResult.cover_url must be a well-formed "
+                    f"absolute HTTPS URL, got {self.cover_url!r}"
                 )
 
         # --- Optional strings ---------------------------------------- #
@@ -453,6 +486,13 @@ class SearchResult:
                     f"SearchResult.relevance must be >= 0, "
                     f"got {self.relevance}"
                 )
+            # Normalise int → float so the instance always matches the
+            # declared ``float | None`` type. A parser that returns an
+            # integer relevance (e.g. a raw counter) produces a
+            # SearchResult whose ``relevance`` is a float, keeping
+            # downstream arithmetic consistent.
+            if not isinstance(self.relevance, float):
+                object.__setattr__(self, "relevance", float(self.relevance))
 
     # ------------------------------------------------------------------ #
     # Derived identity                                                   #
@@ -540,7 +580,8 @@ class SearchResultPage:
         query: The raw query string the page was produced for. Stored
             verbatim so a future "request next page" implementation can
             forward it unchanged. Not normalised — sites sometimes apply
-            their own tokenisation, and re-normalising risks drift.
+            their own tokenisation, and re-normalising risks drift. Must
+            contain at least one non-whitespace character.
         items: The page's results, in the site's own order (typically
             relevance-descending or date-descending, depending on the
             site). Empty is valid and means "no matches".
@@ -567,9 +608,9 @@ class SearchResultPage:
         Raises:
             TypeError: If a field has the wrong Python type.
             ValueError: If ``site_id`` does not match the site-id pattern,
-                ``query`` is empty, ``items`` contains a result from a
-                different site, ``page`` is ``< 1``, ``next_page <= page``,
-                or ``total`` is negative.
+                ``query`` is whitespace-only, ``items`` contains a result
+                from a different site, ``page`` is ``< 1``,
+                ``next_page <= page``, or ``total`` is negative.
         """
         if not isinstance(self.site_id, str):
             raise TypeError(
@@ -586,8 +627,10 @@ class SearchResultPage:
                 f"SearchResultPage.query must be a str, got "
                 f"{type(self.query).__name__}"
             )
-        if not self.query:
-            raise ValueError("SearchResultPage.query must be non-empty")
+        if not self.query.strip():
+            raise ValueError(
+                "SearchResultPage.query must be non-empty after strip"
+            )
         if not isinstance(self.items, tuple):
             raise TypeError(
                 f"SearchResultPage.items must be a tuple, got "

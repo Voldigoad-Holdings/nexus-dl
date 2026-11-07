@@ -40,6 +40,36 @@ whichever name fits its ``LibraryDatabase``:
 
 Each method may be sync or async. ``inspect.isawaitable`` handles both.
 
+Method resolution policy
+------------------------
+
+**Method name fallbacks are tried only when the previous name is
+absent** — never when it exists but raises. A method that exists and
+raises is a *bug* in the host, not a signal to silently try another
+implementation: masking it would turn a broken database into
+"library not available" without any actionable diagnostic. Exceptions
+from existing methods propagate to the caller as 500
+``INTERNAL_ERROR``.
+
+Not-found detection
+-------------------
+
+For a **write** or a **delete**, the router treats any of:
+
+* ``False`` return value,
+* exception from the service,
+
+as a signal that the row does not exist **or** that the DB is broken.
+The two cases are **not** distinguished at the HTTP layer (both are
+404 for the write case, 500 for the delete case) but the log contains
+the real reason. This is deliberate: a client should not learn whether
+a manga exists in another user's library — and should not learn
+whether the DB is currently healthy either.
+
+For a **read** (get entry, list), any exception **always** propagates
+as 500 — the client asked for data, the server cannot produce it, the
+error must be visible.
+
 Sort whitelist
 ==============
 
@@ -232,6 +262,11 @@ async def update_progress(
         percent=body.percent,
     )
 
+    # ``False`` → the row does not exist for this user.
+    # ``None`` → the host wrote successfully but returned no value (the
+    #   common ``UPDATE``-style contract).
+    # Any other truthy value → host confirmed the write.
+    # An exception from the host → 500 already raised in the helper.
     if wrote is False:
         raise _not_found(manga_id)
 
@@ -325,7 +360,13 @@ async def _library_query(
     offset: int,
     limit: int,
 ) -> tuple[list[Any], int]:
-    """Call the library's list method, tolerant to name and shape."""
+    """Call the library's list method.
+
+    Tries ``query`` then ``list_mangas``; **falls through to the next
+    candidate only if the previous one is absent**. An existing method
+    that raises is a host bug and propagates as 500 — silently trying
+    the next name would mask a broken database.
+    """
     for name in ("query", "list_mangas"):
         method = getattr(services.library, name, None)
         if not callable(method):
@@ -347,16 +388,28 @@ async def _library_query(
                 result = await result
             return _normalize_items_total(result)
         except Exception:
-            _log.exception("library.{} raised", name)
-            continue
-    # No method worked.
+            _log.exception(
+                "library.{} raised while querying user={}",
+                name,
+                user_id,
+            )
+            raise _service_error(
+                "Failed to query the library.", cause_name=name
+            )
+    # No method found.
     raise _service_unavailable("Library query is not available.")
 
 
 async def _library_get_entry(
     services: ServicesDep, *, manga_id: str, user_id: str
 ) -> Any | None:
-    """Fetch a single library entry, tolerant to method name."""
+    """Fetch a single library entry.
+
+    Tries ``get_entry`` then ``get_manga``; falls through only if the
+    first is absent. Returns ``None`` for a true miss (both methods
+    missing or the primary returning ``None``). A method that raises
+    propagates as 500.
+    """
     for name in ("get_entry", "get_manga"):
         method = getattr(services.library, name, None)
         if not callable(method):
@@ -369,8 +422,15 @@ async def _library_get_entry(
                 result = await result
             return result
         except Exception:
-            _log.exception("library.{} raised for {}", name, manga_id)
-            continue
+            _log.exception(
+                "library.{} raised for manga={} user={}",
+                name,
+                manga_id,
+                user_id,
+            )
+            raise _service_error(
+                "Failed to read library entry.", cause_name=name
+            )
     return None
 
 
@@ -384,11 +444,18 @@ async def _library_set_progress(
     page_count: int | None,
     percent: float | None,
 ) -> bool | None:
-    """Write reading progress. Returns ``False`` if the manga is absent.
+    """Write reading progress.
 
-    ``None`` means "wrote or unknown" (the DB layer does not report
-    whether the row existed). Only a strict ``False`` triggers a 404 —
-    hosts that want to enforce existence must return ``False``.
+    Returns:
+        * ``False`` — the row is absent for this user (404).
+        * ``True``  — the host confirmed the write.
+        * ``None``  — the host returned ``None`` (the common pattern for
+          a SQL ``UPDATE`` that does not care about the row count).
+
+    A raised exception **always** propagates as 500 — never as ``None``,
+    which would look like a successful write. Prior to this fix, an
+    exception was silently mapped to ``None`` and the endpoint responded
+    200 "saved" even when the DB had rejected the write.
     """
     for name in ("set_reading_progress", "update_progress"):
         method = getattr(services.library, name, None)
@@ -408,10 +475,16 @@ async def _library_set_progress(
                 result = await result
             return result
         except Exception:
-            _log.exception("library.{} raised for {}", name, manga_id)
-            return None
-    # No method worked; treat as "not found" rather than 500 — hosts that
-    # omit the writer method simply cannot accept progress writes.
+            _log.exception(
+                "library.{} raised for manga={} user={}",
+                name,
+                manga_id,
+                user_id,
+            )
+            raise _service_error(
+                "Failed to save reading progress.", cause_name=name
+            )
+    # No writer method at all — cannot write; treat as miss.
     return False
 
 
@@ -422,7 +495,12 @@ async def _library_delete(
     user_id: str,
     delete_files: bool,
 ) -> bool:
-    """Delete a library entry. Returns whether a row was removed."""
+    """Delete a library entry.
+
+    Returns ``True`` when a row was removed, ``False`` when the row was
+    absent. A raised exception from the host propagates as 500 — never
+    as ``False`` (which the caller would surface as a misleading 404).
+    """
     for name in ("delete", "remove"):
         method = getattr(services.library, name, None)
         if not callable(method):
@@ -436,14 +514,23 @@ async def _library_delete(
             )
             if inspect.isawaitable(result):
                 result = await result
-            # ``None`` from a delete is common (no return value); assume
-            # success unless the host explicitly returned ``False``.
+            # ``None`` from a delete is common (SQL ``DELETE`` does not
+            # return a boolean); assume success unless the host
+            # explicitly returned ``False``.
             if result is None:
                 return True
             return bool(result)
         except Exception:
-            _log.exception("library.{} raised for {}", name, manga_id)
-            return False
+            _log.exception(
+                "library.{} raised for manga={} user={} files={}",
+                name,
+                manga_id,
+                user_id,
+                delete_files,
+            )
+            raise _service_error(
+                "Failed to delete library entry.", cause_name=name
+            )
     return False
 
 
@@ -452,10 +539,18 @@ def _call_with_supported_kwargs(
 ) -> Any:
     """Call ``method`` filtering ``kwargs`` to those it accepts.
 
-    Hosts may implement a subset of the documented keyword arguments. We
-    use :func:`inspect.signature` when available and silently drop
-    unsupported kwargs; on ``ValueError`` (builtins with no signature),
-    pass everything.
+    - **``**kwargs`` in the signature** → everything goes through.
+    - **Positional-only parameters** (rare, but legal since 3.8) are
+      never passed as keywords — silently dropped from the kwargs dict
+      to avoid a ``TypeError`` at call time.
+    - **No signature available** (builtins, ``functools.partial``
+      without ``__wrapped__``) → everything is passed through
+      optimistically.
+
+    Supports both ``**kwargs``-style and keyword-only parameters. The
+    filter is conservative: unknown kwargs are silently dropped rather
+    than raising. Callers relying on this contract (all five methods
+    above) document which kwargs they expect the host to accept.
     """
     try:
         sig = inspect.signature(method)
@@ -484,7 +579,15 @@ def _call_with_supported_kwargs(
 # ===========================================================================
 
 def _normalize_items_total(raw: Any) -> tuple[list[Any], int]:
-    """Coerce any of the supported return shapes into ``(items, total)``."""
+    """Coerce any of the supported return shapes into ``(items, total)``.
+
+    Handles:
+        * ``None`` → ``([], 0)``.
+        * ``(items, total)`` tuple with integer total.
+        * Object with ``.items`` / ``.total`` (either attribute or
+          method — a method is called).
+        * Bare iterable (list, tuple, generator) → total = len.
+    """
     if raw is None:
         return [], 0
 
@@ -494,22 +597,42 @@ def _normalize_items_total(raw: Any) -> tuple[list[Any], int]:
         and len(raw) == 2
         and isinstance(raw[1], int)
     ):
-        items = list(raw[0] or [])
+        try:
+            items = list(raw[0] or [])
+        except TypeError:
+            items = []
         return items, int(raw[1])
 
-    # Object with .items / .total.
+    # Object with .items / .total (attribute OR callable).
     items_attr = getattr(raw, "items", None)
     total_attr = getattr(raw, "total", None)
-    if items_attr is not None and total_attr is not None:
-        items = list(items_attr or [])
-        return items, int(total_attr or len(items))
+    if items_attr is not None or total_attr is not None:
+        try:
+            items_value = items_attr() if callable(items_attr) else items_attr
+        except Exception:
+            items_value = None
+        try:
+            total_value = total_attr() if callable(total_attr) else total_attr
+        except Exception:
+            total_value = None
 
-    # Bare sequence.
+        if items_value is not None:
+            try:
+                items = list(items_value or [])
+            except TypeError:
+                items = []
+            try:
+                total = int(total_value) if total_value is not None else len(items)
+            except (TypeError, ValueError):
+                total = len(items)
+            return items, total
+
+    # Bare sequence / iterable.
     try:
         items = list(raw)
-        return items, len(items)
     except TypeError:
         return [], 0
+    return items, len(items)
 
 
 def _to_entry_schema(item: Any) -> LibraryEntrySchema:
@@ -523,18 +646,31 @@ def _to_entry_schema(item: Any) -> LibraryEntrySchema:
       (``.reading_progress``, ``.added_at``…).
 
     Both shapes are handled; each field has a safe default.
+
+    The manga summary projection is **not** wrapped in a try/except fallback
+    that builds ``MangaSummarySchema(id=..., title=...)`` — that pattern
+    is a trap: ``MangaSummarySchema`` has required fields beyond ``id``
+    and ``title``, so the "fallback" itself raised ``ValidationError``
+    and produced a 500. Instead, the exception is allowed to propagate
+    with a clear log, so a broken domain object surfaces as a 500 with
+    a diagnostic rather than a misleading 200 with a fake manga.
     """
     manga_domain = getattr(item, "manga", item)
 
     try:
         manga = MangaSummarySchema.model_validate(manga_domain)
     except Exception:
-        _log.exception("Failed to validate manga in library entry")
-        # Build a minimal valid schema from attributes — this keeps the
-        # endpoint from 500'ing on an unusual domain object.
-        manga = MangaSummarySchema(
-            id=str(getattr(manga_domain, "id", "")),
-            title=str(getattr(manga_domain, "title", "")),
+        _log.exception(
+            "Failed to project manga domain into MangaSummarySchema; "
+            "item_type={}",
+            type(manga_domain).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Failed to serialize library entry.",
+            ).model_dump(),
         )
 
     # Reading progress.
@@ -545,23 +681,59 @@ def _to_entry_schema(item: Any) -> LibraryEntrySchema:
         try:
             progress = ReadingProgressSchema.model_validate(progress_raw)
         except Exception:
+            _log.exception(
+                "Failed to project reading_progress; using empty default"
+            )
             progress = ReadingProgressSchema()
     else:
         progress = ReadingProgressSchema()
 
-    downloaded = int(getattr(item, "downloaded_chapters", 0) or 0)
-    size_bytes = getattr(item, "total_size_bytes", None)
+    downloaded = _coerce_int(getattr(item, "downloaded_chapters", 0), default=0)
+    size_bytes = _coerce_optional_int(getattr(item, "total_size_bytes", None))
     added_at = getattr(item, "added_at", None)
     updated_at = getattr(item, "updated_at", None)
 
-    return LibraryEntrySchema(
-        manga=manga,
-        downloaded_chapters=downloaded,
-        total_size_bytes=size_bytes,
-        reading_progress=progress,
-        added_at=added_at,
-        updated_at=updated_at,
-    )
+    try:
+        return LibraryEntrySchema(
+            manga=manga,
+            downloaded_chapters=downloaded,
+            total_size_bytes=size_bytes,
+            reading_progress=progress,
+            added_at=added_at,
+            updated_at=updated_at,
+        )
+    except Exception:
+        _log.exception(
+            "Failed to build LibraryEntrySchema; item_type={}",
+            type(item).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Failed to serialize library entry.",
+            ).model_dump(),
+        )
+
+
+def _coerce_int(value: Any, *, default: int) -> int:
+    """Best-effort int coercion; returns ``default`` on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    """Best-effort int coercion; returns ``None`` on failure."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ===========================================================================
@@ -569,11 +741,20 @@ def _to_entry_schema(item: Any) -> LibraryEntrySchema:
 # ===========================================================================
 
 def _resolve_sort_field(requested: str | None) -> str:
-    """Return a whitelisted sort field, or raise 400 for unknown values."""
+    """Return a whitelisted sort field, or raise 400 for unknown values.
+
+    Comparison is **case-insensitive and whitespace-trimmed**: ``"Title"``
+    and ``" title "`` are normalized to ``"title"`` before the whitelist
+    check, matching the API contract that sort fields are identifiers
+    (not free-text). A value that survives normalization but is still
+    not in :data:`_SORT_FIELDS` produces the 400 — never a silent
+    fallback to the default.
+    """
     if requested is None:
         return _DEFAULT_SORT
-    if requested in _SORT_FIELDS:
-        return requested
+    normalized = str(requested).strip().lower()
+    if normalized in _SORT_FIELDS:
+        return normalized
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=error_response(
@@ -594,7 +775,11 @@ def _require_user_id(payload: CurrentUser) -> str:
     future dependency refactor cannot silently produce a
     user-unspecified request that scopes the library to nobody.
     """
-    if not payload or not payload.sub:
+    # ``TokenPayload`` is a Pydantic model: it is never falsy. Only the
+    # ``.sub`` presence check is meaningful — the ``not payload`` branch
+    # was a no-op that misled readers into thinking ``payload`` could be
+    # ``None`` here.
+    if not getattr(payload, "sub", None):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=error_response(
@@ -638,6 +823,25 @@ def _service_unavailable(message: str) -> HTTPException:
     )
 
 
+def _service_error(message: str, *, cause_name: str) -> HTTPException:
+    """500 for a service method that exists and raised.
+
+    Distinct from :func:`_service_unavailable` (which is raised when
+    **no** method exists). The distinction matters for debugging: the
+    former points at a host bug (broken DB query, unreachable
+    connection), the latter at a deployment choice. Both are 500 —
+    a broken DB must never look like a 404 to the client.
+    """
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=error_response(
+            ErrorCode.INTERNAL_ERROR,
+            message,
+            details={"cause": f"library.{cause_name}"},
+        ).model_dump(),
+    )
+
+
 # ===========================================================================
 # Self-audit checklist
 # ===========================================================================
@@ -659,3 +863,9 @@ def _service_unavailable(message: str) -> HTTPException:
 #     ``HTTPException(detail="...")``.
 # [ ] ``delete_files`` remains an opt-in boolean. Deleting files by
 #     default would be a data-loss footgun.
+# [ ] Method-name fallbacks only trigger on **absence**, not on
+#     exceptions. An existing method that raises is a bug — it must
+#     surface as 500, never be masked as "not found" or "unavailable".
+# [ ] Any new read path that returns ``None`` for the service must
+#     distinguish "the row does not exist" (404) from "the DB raised"
+#     (500) explicitly. Wrapping both in the same branch is forbidden.

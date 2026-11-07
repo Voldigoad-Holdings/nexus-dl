@@ -33,7 +33,7 @@ actually needs.
     nexusdl.core.image        image pipeline (validator, optimizer, converter, downloader)
     nexusdl.core.library      local library (database, scanner, metadata, search, migrations)
     nexusdl.core.models       domain models (manga, chapter, page, site, user, search, download, ...)
-    nexusdl.core.packaging    output formats (ZIP, CBZ, CB7, PDF, FOLDER) and ComicInfo
+    nexusdl.core.packaging    output formats (FOLDER, ZIP, CBZ, CB7, PDF, CBT) and ComicInfo
     nexusdl.core.registry     sites.yaml loading, validation, runtime registry
     nexusdl.core.session      HTTP session and its collaborators (rate limiter, proxy, cookies, cache, ...)
     nexusdl.core.utils        generic primitives (url, time, text, hash, retry, filesystem, async)
@@ -303,7 +303,8 @@ level. That includes:
   helpers. Import from :mod:`nexusdl.core.library`.
 * **The packaging family** - :class:`BasePackager`,
   :class:`PackagerFactory`, :class:`ComicInfo`, and every concrete
-  packager. Import from :mod:`nexusdl.core.packaging`.
+  packager (FOLDER, ZIP, CBZ, CB7, PDF, CBT). Import from
+  :mod:`nexusdl.core.packaging`.
 * **The registry** - :class:`SiteRegistry`,
   :class:`SitesValidator`, the parser protocols. Import from
   :mod:`nexusdl.core.registry`.
@@ -312,7 +313,7 @@ level. That includes:
   :class:`ProxyManager`, :class:`PlaywrightPool`,
   :class:`FlareSolverrClient`, :class:`HttpCache`, and the
   user-agent rotator. Import from :mod:`nexusdl.core.session`.
-* **The utilities** - the 84 symbols across URL, time, text, hash,
+* **The utilities** - the 86 symbols across URL, time, text, hash,
   retry, filesystem, and async helpers. Import from
   :mod:`nexusdl.core.utils`.
 * **The exceptions beyond the base** - :class:`ConfigError`,
@@ -509,6 +510,11 @@ def __getattr__(name: str) -> Any:
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
+    The catch is intentionally broadened from ``ModuleNotFoundError`` to
+    ``ImportError`` — a partially-initialized submodule (missing symbol,
+    circular import resolved differently across Python versions) also
+    deserves the ``[core]`` install hint rather than a raw traceback.
+
     Args:
         name: The attribute name being accessed.
 
@@ -524,8 +530,8 @@ def __getattr__(name: str) -> Any:
             such as ``pydantic-settings`` or ``cryptography``, a syntax
             error deeper in the module, or a broken installation), or when
             the submodule does not define the requested name.
-            ``AttributeError`` - rather than ``ImportError`` - is required
-            by PEP 562 so that ``hasattr`` works.
+            ``AttributeError`` — rather than ``ImportError`` — is
+            required by PEP 562 so that ``hasattr`` works.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -547,9 +553,10 @@ def __getattr__(name: str) -> Any:
     submodule_basename, attr_name = entry
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
-    except ModuleNotFoundError as exc:
-        # Optional dependency missing from the core extras.
-        if exc.name in {
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose — see the docstring.
+        if getattr(exc, "name", None) in {
             "pydantic",
             "pydantic_settings",
             "cryptography",
@@ -566,12 +573,18 @@ def __getattr__(name: str) -> Any:
 
     try:
         value = getattr(module, attr_name)
-    except AttributeError:
+    except AttributeError as exc:
+        # ``from exc`` preserves the cause. A ``getattr`` on a healthy
+        # module raises ``AttributeError`` with the standard message; an
+        # exotic failure (a broken descriptor, a partially-initialised
+        # class) shows up with its own message attached, which is the
+        # diagnostic the operator needs.
         raise AttributeError(
             f"The core submodule {submodule_basename!r} does not define "
             f"{attr_name!r}. This is a package-internal inconsistency - "
-            f"nexusdl.core.__all__ and the submodules are out of sync."
-        ) from None
+            f"nexusdl.core.__all__ and the submodules are out of sync. "
+            f"Original error: {exc}"
+        ) from exc
 
     # Cache in the module namespace so subsequent lookups bypass
     # __getattr__ entirely (same behavior as a top-level import).
@@ -588,109 +601,21 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Return the public names for interactive introspection.
+    """Return the package's visible attributes, including lazy exports.
 
-    Python's default :func:`dir` implementation collects a module's
-    ``__dict__`` and, when the module defines ``__getattr__``, calls it
-    with each candidate name to decide what to display. Because none of
-    the fifteen lazy exports are present in ``__dict__`` at import time,
-    an unmodified :func:`dir` would not list them - the package would
-    appear empty in a REPL.
+    Python's default :func:`dir` on a module already lists ``__all__``
+    entries even when they are not bound in ``__dict__`` — so without
+    this override, ``Settings``, ``EventBus``, etc. would still appear.
+    Keeping the override explicit serves two purposes:
 
-    The returned list is :data:`__all__` plus the standard module dunders
-    a user typically expects to see.
-    """
-    return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
-    )
+    1. It documents that the seventeen exports are *intentional*
+       attributes of this package, not accidental names.
+    2. It preserves the module's actual attributes (``__file__``,
+       ``__spec__``, ``__loader__``, ``__dict__``, ``__getattr__``,
+       ``__dir__``, ``list_symbols``, ``get_symbol``, ``_LAZY``,
+       ``_LOCAL``, …) alongside the lazy ones — a plain ``dir`` would
+       include them anyway, but spelling out the union makes the
+       contract explicit and future-proof against refactors that change
+       how ``__all__`` is built.
 
-
-# ===========================================================================
-# Introspection helpers
-# ===========================================================================
-
-def list_symbols() -> list[str]:
-    """Return the sorted list of every top-level export (lazy + local).
-
-    The list is the union of:
-
-    * the fifteen **lazy** exports registered in :data:`_LAZY`, and
-    * the two **local** helpers (:func:`list_symbols` itself and
-      :func:`get_symbol`), which are defined in this module's body.
-
-    This matches :data:`__all__` exactly - the invariant is checked in
-    :mod:`tests.unit.core.test_core_init` (both directions). Useful for
-    parametrized tests (``@pytest.mark.parametrize("name",
-    list_symbols())``), schema registries, and tooling that needs to
-    enumerate the core's Tier-1 surface without importing every
-    submodule.
-
-    Returns:
-        A sorted list of strings, one per public export.
-    """
-    return sorted(set(_LAZY) | _LOCAL)
-
-
-def get_symbol(name: str) -> Any:
-    """Return the core symbol registered under ``name``.
-
-    Equivalent to ``getattr(package, name)`` but with a clearer error
-    message when the name is unknown. Convenient for dynamic lookups
-    (plugin introspection tools, parametrized tests, composition-root
-    builders that want to resolve a symbol from a config string).
-
-    For the two **local** helpers (:func:`list_symbols`,
-    :func:`get_symbol`), this is exactly a plain attribute access - they
-    are already bound in the module namespace.
-
-    For a **lazy** export, this routes through :func:`__getattr__` so
-    the cache is populated with the same value a plain attribute access
-    would return. This matters for the ``logger`` symbol: an
-    implementation that used ``__import__(__name__, fromlist=[name])``
-    would force the ``nexusdl.core.logger`` submodule to load and rebind
-    ``nexusdl.core.logger`` to the module object, silently returning
-    the **module** instead of the loguru logger. Routing through
-    :func:`__getattr__` avoids that.
-
-    Args:
-        name: The export name to resolve.
-
-    Returns:
-        The symbol, exactly as ``getattr(nexusdl.core, name)`` would
-        return it.
-
-    Raises:
-        KeyError: If ``name`` is not a public core export.
-    """
-    if name not in _LAZY and name not in _LOCAL:
-        available = ", ".join(list_symbols())
-        raise KeyError(
-            f"Unknown core symbol {name!r}. Available: {available}. "
-            f"Every other symbol lives in its specific submodule - "
-            f"import from 'nexusdl.core.<submodule>' directly."
-        )
-    # Local helpers are already bound; lazy ones go through __getattr__
-    # so the cache stays consistent with plain attribute access.
-    if name in _LOCAL:
-        return globals()[name]
-    return __getattr__(name)
-
-
-# ===========================================================================
-# Sanity: __all__ must exactly match the union of lazy + local exports
-# ===========================================================================
-# This assertion runs at import time and would fail on any future edit
-# that adds an entry to _LAZY without adding it to __all__ (or vice
-# versa), or that adds a local helper without registering it in _LOCAL.
-# The cost is a single set comparison at import; the benefit is that an
-# inconsistent public surface is caught the moment the package loads,
-# not on the first `from nexusdl.core import *` in a caller.
-
-if frozenset(__all__) != (frozenset(_LAZY) | _LOCAL):
-    _missing_from_all = (frozenset(_LAZY) | _LOCAL) - frozenset(__all__)
-    _missing_from_exports = frozenset(__all__) - (frozenset(_LAZY) | _LOCAL)
-    raise RuntimeError(
-        "nexusdl.core.__all__ does not match the union of _LAZY and "
-        f"_LOCAL. Missing from __all__: {sorted(_missing_from_all)}. "
-        f"Listed but not exported: {sorted(_missing_from_exports)}."
-    )
+    The result is the union of the module's actual namespace (dunders

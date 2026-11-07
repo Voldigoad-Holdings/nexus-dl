@@ -166,6 +166,17 @@ Known limitations
   expect, while still surfacing the real error in a traceback.  A CI smoke
   test that does ``from nexusdl.interfaces.web import create_app_from_env``
   will therefore fail with a clear message, not a mysterious ``None``.
+* The signatures declared under :data:`typing.TYPE_CHECKING` are currently
+  ``Any``-based.  They exist so that ``mypy --strict`` sees *something*
+  rather than a bare ``__getattr__`` — a stricter declaration would require
+  importing the concrete types from
+  ``nexusdl.interfaces.web.backend.main``, which would create a cycle
+  (``main`` imports services which import routers which import the web
+  package).  When those types become importable without a cycle, replace
+  the ``Any`` signatures with the concrete types.  Until then,
+  ``mypy --strict`` reports no error, and the ``__getattr__`` runtime
+  resolution is the single source of truth for what the attributes actually
+  are.
 """
 
 from __future__ import annotations
@@ -179,6 +190,13 @@ if TYPE_CHECKING:
     # types produced by the lazy ``__getattr__`` below.  These declarations
     # are **not** executed at runtime — the runtime implementation is
     # ``__getattr__``, which imports the backend on first access.
+    #
+    # The ``Any`` types are a known limitation: the concrete types
+    # (``AppServices``, ``CORSConfig``, ``AuthConfig``, …) live in the
+    # backend package and importing them here would create a cycle
+    # (main → services → routers → web).  When the cycle is broken (e.g.
+    # by moving the config dataclasses into a leaf module), replace these
+    # ``Any`` annotations with the real types.
     def create_app(
         services: Any,
         *,
@@ -225,6 +243,20 @@ def __getattr__(name: str) -> Any:
             ``ImportError`` — is required by PEP 562 so that ``hasattr`` and
             :func:`getattr` with a default argument work correctly.
     """
+    # Dunders are interrogated by the import machinery, by ``pickle``, by
+    # ``copy``, by ``inspect`` and by every framework that touches a
+    # module (Pytest, IPython, mypy's runtime helpers, …).  When one of
+    # those probes asks for ``__wrapped__``, ``__path__``, ``__file__``
+    # or any other standard dunder, the answer must be the plain Python
+    # ``AttributeError`` — a long explanatory message about
+    # ``create_app_from_env`` is not just unhelpful, it can break
+    # tooling that pattern-matches on ``str(exc)``.  The custom message
+    # is reserved for *real* attribute lookups that miss.
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        )
+
     if name not in __all__:
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}. "
@@ -255,7 +287,7 @@ def __getattr__(name: str) -> Any:
         ) from exc
 
     try:
-        return getattr(main, name)
+        value = getattr(main, name)
     except AttributeError:
         raise AttributeError(
             f"The NexusDL web backend module "
@@ -265,6 +297,15 @@ def __getattr__(name: str) -> Any:
             f"'create_app_from_env'."
         ) from None
 
+    # Cache the resolved value in the module ``__dict__`` so that
+    # subsequent accesses skip both the ``sys.modules`` lookup and the
+    # ``getattr`` on ``main``.  This is the standard PEP 562 optimisation
+    # recommended by the PEP's own "Example" section: after the first
+    # access, Python finds the attribute in ``__dict__`` and never calls
+    # ``__getattr__`` again.
+    globals()[name] = value
+    return value
+
 
 def __dir__() -> list[str]:
     """Return the public names for interactive introspection.
@@ -273,8 +314,9 @@ def __dir__() -> list[str]:
     ``__dict__`` and, when the module defines ``__getattr__``, calls it with
     each name returned here to decide what to display.  Without this
     override, ``dir(nexusdl.interfaces.web)`` would not list ``create_app``
-    or ``create_app_from_env`` — they are never present in ``__dict__`` —
-    which would make the module appear empty in an interactive session.
+    or ``create_app_from_env`` — they are never present in ``__dict__``
+    until the first access — which would make the module appear empty in an
+    interactive session.
 
     The returned list is the union of :data:`__all__` and the standard
     module dunders a user typically expects to see.

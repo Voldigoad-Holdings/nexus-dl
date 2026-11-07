@@ -2,12 +2,36 @@
 # Git.  Git does not track empty directories; an empty placeholder file is
 # the standard idiom for preserving the directory structure in a repository.
 #
-# The directory holds assets served directly by the FastAPI backend (e.g.
-# locally hosted images, custom CSS overrides, or OpenAPI branding).  It is
-# mounted at application startup by ``nexusdl.interfaces.web.backend.main``
-# and is intentionally empty in the source tree — everything it will serve
-# is produced at build or deployment time.
+# Role
+# ====
 #
-# Do not delete this file unless the directory is populated with a tracked
-# asset.  Do not add content here: this placeholder must remain harmless if
-# accidentally served by the static file handler.
+# This directory is a **candidate** for the ``frontend.static_dir``
+# setting in :class:`nexusdl.core.config.Settings`. When that setting
+# points here (rare — most deployments serve the frontend from Next.js,
+# nginx, Caddy or another CDN), FastAPI mounts it at ``/`` with
+# ``html=True`` via
+# :func:`nexusdl.interfaces.web.backend.main._mount_static`. In the
+# default configuration the setting is unset, so this directory is
+# **never** mounted — it exists purely to give deployments a place to
+# drop a pre-built static frontend without inventing their own path.
+#
+# The default static frontend shipped with NexusDL is the Next.js
+# application under ``src/nexusdl/interfaces/web/frontend/``. Its
+# exported assets (``.next``, ``out/``, or wherever the deployment
+# points ``frontend.static_dir``) are what ``_mount_static`` serves when
+# the operator opts into backend-hosted static serving. Nothing in this
+# directory is bundled with the Python package by default.
+#
+# It is intentionally empty in the source tree: any real assets are
+# added by the deployment, not committed here. This keeps the wheel /
+# sdist small and lets the deployment choose between Next.js dev server,
+# a pre-built SPA, or a CDN — without changing the source tree.
+#
+# Do not delete this file unless the directory is populated with a
+# tracked asset. Do not add content here: this placeholder must remain
+# harmless if accidentally served by the static file handler (it
+# contains only comments — no executable content, no secrets, no data).
+#
+# If you are looking for the assets served by the *default* deployment,
+# see ``src/nexusdl/interfaces/web/frontend/public/`` (favicons, logos,
+# screenshots, manifest, og-image, etc.).

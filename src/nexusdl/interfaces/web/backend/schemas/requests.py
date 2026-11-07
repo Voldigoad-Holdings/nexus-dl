@@ -17,17 +17,31 @@ Design notes
   on every request. Instances are safe to pass across layers without
   defensive copying.
 
+* **Whitespace stripping is opt-in.** ``str_strip_whitespace=True`` is
+  applied to **identifiers and search text** (username, email, site ids,
+  search query) but **not** to passwords or free-form settings values.
+  A password ``" abc "`` is a legitimate password distinct from
+  ``"abc"``; stripping it silently changes the user's credential and
+  breaks login for every client that did not strip on its own side.
+
+* **Password byte length is enforced in ``field_validator``.** bcrypt
+  truncates at 72 **bytes**, not 72 characters. Pydantic's
+  ``max_length`` counts characters, so a 72-character string of
+  non-ASCII codepoints can exceed 72 bytes and be silently truncated by
+  bcrypt — meaning two different passwords share the same hash. The
+  validators below reject by byte length explicitly.
+
 * **No legacy ``@validator``.** Only Pydantic v2 ``@field_validator`` /
   ``@model_validator`` are used. Every ``ValueError`` surfaces through
   :class:`~..schemas.responses.ErrorResponse` under
   ``details.fields``.
 
 * **Password policy lives elsewhere.** :class:`RegisterRequest` only
-  enforces technical guards (max byte length for bcrypt). The actual
-  policy (min length, required character classes) is enforced by
-  :class:`~..security.PasswordPolicy` inside
-  :meth:`~..security.AuthService.hash_password`. This keeps a single
-  source of truth for password rules.
+  enforces technical guards (max byte length for bcrypt, confirmation
+  equality, username shape). The actual policy (min length, required
+  character classes) is enforced by :class:`~..security.PasswordPolicy`
+  inside :meth:`~..security.AuthService.hash_password`. This keeps a
+  single source of truth for password rules.
 
 * **Settings keys are open.** :attr:`SettingsPatchRequest.changes` is a
   ``dict[str, Any]`` — the *shape* of a settings patch is data-driven,
@@ -101,8 +115,11 @@ USERNAME_MIN_LENGTH: int = 3
 #: Maximum length for a username (also the max for login identifier).
 USERNAME_MAX_LENGTH: int = 32
 
-#: bcrypt's hard limit. Longer passwords would be silently truncated by
-#: bcrypt — we reject them instead.
+#: bcrypt's hard limit, in **bytes**. Longer passwords would be silently
+#: truncated by bcrypt — we reject them instead. Note that this is a
+#: *byte* count, not a character count: a string of non-ASCII characters
+#: can be longer in bytes than it is in characters. The password
+#: validators below enforce the byte limit explicitly.
 PASSWORD_MAX_BYTES: int = 72
 
 #: Maximum length for a search query string.
@@ -118,7 +135,11 @@ _USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]+$")
 
 #: Very basic email shape (defence-in-depth only; real validation is
 #: server-side, and hosts may layer a stricter validator).
-_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+#:
+#: ``re.fullmatch`` is used at the call site (see
+#: :meth:`RegisterRequest._validate_email`) — not ``re.match`` — so a
+#: trailing ``\\n`` cannot slip through.
+_EMAIL_PATTERN = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
 
 # ===========================================================================
@@ -133,6 +154,13 @@ class RequestBody(BaseModel):
     * ``from_attributes=True`` — allows tests and internal code to build
       a request from a dataclass-like object.
 
+    **``str_strip_whitespace`` is ``False`` by default** — see the module
+    docstring. Fields that need stripping (usernames, emails, site ids,
+    search text) declare it on their own field. Passwords, settings
+    values, and any other user-supplied secret keep their whitespace
+    verbatim, so the credential the user typed is exactly the credential
+    that is verified.
+
     Subclasses must **not** override the config; they add fields and
     validators only.
     """
@@ -142,13 +170,28 @@ class RequestBody(BaseModel):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
     )
 
 
 # ===========================================================================
 # Auth
 # ===========================================================================
+
+def _validate_password_bytes(v: str) -> str:
+    """Reject passwords longer than :data:`PASSWORD_MAX_BYTES` bytes.
+
+    Used by every password-bearing field. ``max_length`` in the ``Field``
+    would check **characters**, which is not the same as **bytes** for
+    non-ASCII input — a 72-character string of codepoints like ``"é"``
+    is 144 bytes and would be silently truncated by bcrypt.
+    """
+    if len(v.encode("utf-8")) > PASSWORD_MAX_BYTES:
+        raise ValueError(
+            f"password must be at most {PASSWORD_MAX_BYTES} bytes "
+            "(bcrypt limit, UTF-8 encoded)"
+        )
+    return v
+
 
 class LoginRequest(RequestBody):
     """Body for ``POST /api/v1/auth/login``.
@@ -157,6 +200,10 @@ class LoginRequest(RequestBody):
     email address — the service resolves which one it is. This keeps the
     client simple and the API future-proof (adding email-based login does
     not require a new endpoint).
+
+    Whitespace is stripped from :attr:`username` only. :attr:`password`
+    keeps its original whitespace — a password ``" abc "`` is a different
+    credential from ``"abc"`` and must not be silently normalized.
     """
 
     model_config = ConfigDict(
@@ -164,7 +211,6 @@ class LoginRequest(RequestBody):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "username": "jane_doe",
@@ -180,10 +226,19 @@ class LoginRequest(RequestBody):
     )
     password: str = Field(
         min_length=1,
-        max_length=PASSWORD_MAX_BYTES,
         description=f"Plain password. Max {PASSWORD_MAX_BYTES} bytes "
                     "(bcrypt limit).",
     )
+
+    @field_validator("username")
+    @classmethod
+    def _strip_username(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("password")
+    @classmethod
+    def _check_password_bytes(cls, v: str) -> str:
+        return _validate_password_bytes(v)
 
 
 class RegisterRequest(RequestBody):
@@ -195,6 +250,8 @@ class RegisterRequest(RequestBody):
     :class:`~..security.PasswordPolicy` inside
     :meth:`~..security.AuthService.hash_password` so the policy stays in
     one place.
+
+    Username and email are stripped; passwords are not.
     """
 
     model_config = ConfigDict(
@@ -202,7 +259,6 @@ class RegisterRequest(RequestBody):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "username": "jane_doe",
@@ -226,19 +282,18 @@ class RegisterRequest(RequestBody):
     )
     password: str = Field(
         min_length=1,
-        max_length=PASSWORD_MAX_BYTES,
         description=f"Plain password. Max {PASSWORD_MAX_BYTES} bytes.",
     )
     password_confirm: str = Field(
         min_length=1,
-        max_length=PASSWORD_MAX_BYTES,
         description="Must equal ``password``.",
     )
 
     @field_validator("username")
     @classmethod
     def _validate_username(cls, v: str) -> str:
-        if not _USERNAME_PATTERN.match(v):
+        v = v.strip()
+        if not _USERNAME_PATTERN.fullmatch(v):
             raise ValueError(
                 "must contain only letters, digits, '_', '-', or '.'"
             )
@@ -249,9 +304,19 @@ class RegisterRequest(RequestBody):
     def _validate_email(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        if not _EMAIL_PATTERN.match(v):
+        v = v.strip()
+        if not v:
+            return None
+        # ``fullmatch`` (not ``match``) — ``match`` would accept a trailing
+        # newline because ``$`` matches just before it.
+        if not _EMAIL_PATTERN.fullmatch(v):
             raise ValueError("not a valid email address")
         return v.lower()
+
+    @field_validator("password", "password_confirm")
+    @classmethod
+    def _check_password_bytes(cls, v: str) -> str:
+        return _validate_password_bytes(v)
 
     @model_validator(mode="after")
     def _passwords_match(self) -> RegisterRequest:
@@ -313,7 +378,6 @@ class SearchRequest(RequestBody):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "query": "one piece",
@@ -396,7 +460,10 @@ class DownloadRequest(RequestBody):
 
     * omitted (``None``) — download every chapter of the manga,
     * empty list — **invalid** (would download nothing),
-    * non-empty list — download exactly those chapters.
+    * non-empty list — download exactly those chapters (duplicates are
+      collapsed before the length cap is checked, so a client that
+      sends the same id many times is not rejected for exceeding the
+      cap).
     """
 
     model_config = ConfigDict(
@@ -404,7 +471,6 @@ class DownloadRequest(RequestBody):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "manga_id": "abc123def456",
@@ -438,6 +504,14 @@ class DownloadRequest(RequestBody):
         description="Scheduling priority.",
     )
 
+    @field_validator("manga_id", "url")
+    @classmethod
+    def _strip_identifiers(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
     @field_validator("chapter_ids")
     @classmethod
     def _dedupe_chapter_ids(cls, v: list[str] | None) -> list[str] | None:
@@ -448,11 +522,10 @@ class DownloadRequest(RequestBody):
                 "if provided, chapter_ids must be a non-empty list "
                 "(omit the field to download all chapters)"
             )
-        if len(v) > MAX_CHAPTER_IDS_PER_REQUEST:
-            raise ValueError(
-                f"chapter_ids cannot exceed {MAX_CHAPTER_IDS_PER_REQUEST} "
-                "entries per request — split the work into multiple calls"
-            )
+        # Deduplicate **first** so the length cap applies to the number
+        # of distinct ids, not the number of list entries. A client that
+        # sends ``["ch1"] * 1000`` (copy-paste bug, retry logic) does
+        # not have 1000 chapters to download — it has 1.
         seen: set[str] = set()
         out: list[str] = []
         for cid in v:
@@ -463,6 +536,12 @@ class DownloadRequest(RequestBody):
             out.append(cid)
         if not out:
             raise ValueError("chapter_ids must contain at least one id")
+        if len(out) > MAX_CHAPTER_IDS_PER_REQUEST:
+            raise ValueError(
+                f"chapter_ids cannot exceed {MAX_CHAPTER_IDS_PER_REQUEST} "
+                "distinct entries per request — split the work into "
+                "multiple calls"
+            )
         return out
 
     @model_validator(mode="after")
@@ -497,7 +576,6 @@ class UpdateProgressRequest(RequestBody):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "chapter_id": "abc123def456",
@@ -528,6 +606,11 @@ class UpdateProgressRequest(RequestBody):
                     "computes it from ``page_index / page_count``.",
     )
 
+    @field_validator("chapter_id")
+    @classmethod
+    def _strip_chapter_id(cls, v: str) -> str:
+        return v.strip()
+
 
 # ===========================================================================
 # Settings
@@ -541,6 +624,12 @@ class SettingsPatchRequest(RequestBody):
     :class:`~..views.settings_view.SettingsSchema` in the GUI, and from
     :class:`Settings` in the backend), so this schema cannot enumerate
     them — it only guarantees the shape is ``dict[str, Any]``.
+
+    **Setting values are not whitespace-stripped.** A path value like
+    ``"/data/manga "`` (with trailing whitespace) or a free-form string
+    setting must be stored exactly as the administrator typed it —
+    silently trimming it would change the value the operator intended.
+    Only the **keys** are stripped (they are identifiers, not data).
 
     Unknown keys, type mismatches, and policy violations are detected by
     the service and reported via ``errors`` in
@@ -561,7 +650,6 @@ class SettingsPatchRequest(RequestBody):
         frozen=True,
         populate_by_name=True,
         from_attributes=True,
-        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "changes": {
@@ -592,9 +680,17 @@ class SettingsPatchRequest(RequestBody):
     @field_validator("changes")
     @classmethod
     def _validate_changes(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # ``Field(min_length=1)`` already rejects an empty dict, but we
+        # re-check for clarity and to give a uniform error message.
         if not v:
             raise ValueError("changes must contain at least one key")
-        for key in v:
-            if not isinstance(key, str) or not key.strip():
+        # Strip the keys (identifiers), preserve the values verbatim.
+        out: dict[str, Any] = {}
+        for key, value in v.items():
+            if not isinstance(key, str):
+                raise ValueError("change keys must be strings")
+            stripped = key.strip()
+            if not stripped:
                 raise ValueError("change keys must be non-empty strings")
-        return v
+            out[stripped] = value
+        return out

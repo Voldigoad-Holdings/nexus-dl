@@ -340,6 +340,10 @@ export interface Manga {
    * Site-specific metadata the parser wants to surface (serialisation
    * status, translator group, original publisher, etc.).  Keys are opaque
    * to the frontend; render as ``key: value`` pairs only when non-empty.
+   *
+   * Always an object on the wire — an empty ``{}`` when the parser
+   * produced nothing.  Never ``null``: that distinction would force every
+   * consumer to handle two "no metadata" shapes for no benefit.
    */
   metadata: Record<string, unknown>;
 }
@@ -413,6 +417,13 @@ export interface Site {
  *
  * The backend computes ``manga_id`` and resolves ``site_name`` so the
  * frontend does not need to join against the sites list.
+ *
+ * **Consumers that need the full manga shape** — e.g.
+ * ``components/MangaCard`` when used on ``/library`` — must not receive a
+ * ``SearchResult`` directly; they must fetch the manga resource (or, in
+ * the library case, already have it) and pass a :type:`Manga`.  Any
+ * adaptation between the two shapes belongs to the component, not to the
+ * wire type.
  */
 export interface SearchResult {
   /** 16-hex SHA-256 digest of ``site_id:source_id``. */
@@ -452,7 +463,17 @@ export interface SearchResult {
  * ``sites`` or ``languages`` is equivalent to omitting the field.
  */
 export interface SearchRequest {
-  /** Search terms.  Empty string is allowed and yields recent releases on most sites. */
+  /**
+   * Search terms.
+   *
+   * Empty string is **allowed by this type** and is documented as yielding
+   * recent releases on most sites.  Whether the backend accepts an empty
+   * ``query`` is a backend contract — see
+   * ``interfaces/web/backend/schemas/requests.py``.  Callers that submit
+   * an empty query from a UI form should validate before sending, so that
+   * a stricter backend does not surface a ``VALIDATION_ERROR`` at the
+   * point of use.
+   */
   query: string;
   /** Restrict to these site ids.  ``null`` / omitted means "all enabled sites". */
   sites?: string[] | null;
@@ -479,6 +500,12 @@ export interface SearchRequest {
  * results are aggregated across sites, ``total`` is the number of results
  * the backend was able to collect from the sites that responded — a site
  * that timed out reduces ``total`` without failing the request.
+ *
+ * **``failed_sites`` contains site **ids**, not display names.**  The
+ * frontend is expected to resolve them against the sites catalogue (which
+ * it already has cached) before rendering them to the user — showing raw
+ * ids like ``"mangadex"`` instead of ``"MangaDex"`` is a bug, not a
+ * deliberate degradation.
  */
 export interface SearchResponse {
   items: SearchResult[];
@@ -488,7 +515,11 @@ export interface SearchResponse {
   total_pages: number;
   has_next: boolean;
   has_prev: boolean;
-  /** Site ids that failed to respond during this search.  Empty when none failed. */
+  /**
+   * Site ids that failed to respond during this search.  Empty when none
+   * failed.  Resolve the display name from the sites catalogue before
+   * rendering.
+   */
   failed_sites: string[];
 }
 

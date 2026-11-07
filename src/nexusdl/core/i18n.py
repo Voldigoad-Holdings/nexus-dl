@@ -86,6 +86,12 @@ conservative:
   whether other parameters are present**: a template with a mix of
   present and absent placeholders interpolates the present ones and
   leaves the absent ones untouched.
+* A placeholder whose **nested** access fails — ``{user.name}`` with
+  no ``user``, ``{items[0]}`` with no ``items``, ``{user.name}`` with
+  a ``user`` that has no ``name`` attribute — is also left unchanged,
+  **including the whole field name**: ``{user.name}`` and
+  ``{items[0]}`` survive verbatim, not ``{user}`` and ``{items}``.
+  The other placeholders in the same template still interpolate.
 * Malformed templates (unclosed braces, invalid format specs) are
   returned verbatim. The caller sees their own bug rather than
   crashing the UI.
@@ -693,56 +699,68 @@ def _plural_suffix(count: int) -> str:
 class _MissingPlaceholder:
     """Marker for a format field whose value is absent from the params.
 
-    Returned by :meth:`_SafeFormatter.get_value` when a field is missing,
-    intercepted by :meth:`_SafeFormatter.convert_field` (so ``!r``,
-    ``!s``, ``!a`` are not applied) and :meth:`_SafeFormatter.format_field`
-    (so ``format_spec`` is not applied), and rendered verbatim as
-    ``"{key}"``. The whole point is that a missing placeholder survives
-    exactly as the translator wrote it, regardless of the surrounding
-    template's use of conversions or specs.
+    Carries the **full field name** — ``"name"`` for ``{name}``,
+    ``"user.name"`` for ``{user.name}``, ``"items[0]"`` for
+    ``{items[0]}`` — so that the placeholder survives verbatim
+    regardless of nested access. The marker is intercepted by
+    :meth:`_SafeFormatter.get_field` (which wraps the whole failed
+    field), :meth:`_SafeFormatter.convert_field` (so ``!r``, ``!s``,
+    ``!a`` are not applied), and :meth:`_SafeFormatter.format_field`
+    (so ``format_spec`` is not applied).
 
-    The ``key`` may be a :class:`str` (named field, ``{name}``) or an
-    :class:`int` (positional field, ``{0}``) — both are preserved.
+    The net effect: ``"{user.name}"`` with no ``user`` stays
+    ``"{user.name}"`` (not ``"{user}"``), which is the documented
+    interpolation contract.
     """
 
-    __slots__ = ("key",)
+    __slots__ = ("field_name",)
 
-    def __init__(self, key: str | int) -> None:
-        self.key = key
+    def __init__(self, field_name: str) -> None:
+        self.field_name = field_name
 
     def render(self) -> str:
-        """Return the placeholder as ``"{key}"``."""
-        return "{" + str(self.key) + "}"
+        """Return the placeholder as ``"{field_name}"``."""
+        return "{" + self.field_name + "}"
 
 
 class _SafeFormatter(string.Formatter):
     """A :class:`string.Formatter` that leaves missing fields untouched.
 
-    The three hooks are overridden so that a missing field:
+    Four hooks are overridden so that a missing or failing field:
 
-    * does not trigger a :class:`KeyError` / :class:`IndexError`
-      (:meth:`get_value` returns a :class:`_MissingPlaceholder`
-      instead of raising),
+    * does not trigger a :class:`KeyError` / :class:`IndexError` /
+      :class:`AttributeError` / :class:`TypeError`
+      (:meth:`get_field` catches every exception from the parent and
+      returns a :class:`_MissingPlaceholder` carrying the full
+      ``field_name``),
     * does not have its ``!r`` / ``!s`` / ``!a`` conversion applied
       (:meth:`convert_field` short-circuits),
     * does not have its ``format_spec`` applied
       (:meth:`format_field` short-circuits).
 
-    The net effect is that ``"{name}"``, ``"{name!r}"``, and
-    ``"{name:>10}"`` all survive verbatim when ``name`` is missing —
-    which is the documented interpolation contract.
+    The net effect is that ``"{name}"``, ``"{name!r}"``,
+    ``"{name:>10}"``, ``"{user.name}"``, and ``"{items[0]}"`` all
+    survive **verbatim** when their field is missing — which is the
+    documented interpolation contract.
     """
 
-    def get_value(
+    def get_field(
         self,
-        key: str | int,
+        field_name: str,
         args: tuple[Any, ...],
         kwargs: Mapping[str, Any],
-    ) -> Any:
+    ) -> tuple[Any, str]:
         try:
-            return super().get_value(key, args, kwargs)  # type: ignore[arg-type]
-        except (KeyError, IndexError):
-            return _MissingPlaceholder(key)
+            return super().get_field(field_name, args, kwargs)
+        except (KeyError, IndexError, AttributeError, TypeError):
+            # Any failure to resolve the field — a missing root, a
+            # missing attribute, a missing index, a value that does
+            # not support the accessor — produces a placeholder
+            # carrying the *whole* field name, so the placeholder
+            # survives verbatim. Other placeholders in the same
+            # template still interpolate, because this hook only
+            # replaces the failing one.
+            return (_MissingPlaceholder(field_name), field_name)
 
     def convert_field(
         self,
@@ -766,14 +784,19 @@ def _safe_format(template: str, params: Mapping[str, Any]) -> str:
     """Interpolate *params* into *template*, tolerating missing fields.
 
     Present parameters are substituted; absent parameters leave the
-    **whole placeholder** untouched — the key survives verbatim and
-    the ``!r`` / ``!s`` / ``!a`` conversion, if any, is dropped
-    (dropping a conversion on a missing field is the only way to leave
-    the placeholder intact; see the module docstring).
+    **whole placeholder** untouched — the field name (including any
+    nested access like ``{user.name}``) survives verbatim and the
+    ``!r`` / ``!s`` / ``!a`` conversion, if any, is dropped (dropping
+    a conversion on a missing field is the only way to leave the
+    placeholder intact; see the module docstring).
 
-    A malformed template (unclosed brace, invalid format spec,
-    non-string attribute access) is returned verbatim — the caller
-    sees their own bug rather than crashing the UI.
+    A malformed template (unclosed brace, invalid format spec on a
+    present field, non-string attribute access on a present field)
+    that cannot be recovered placeholder-by-placeholder is returned
+    verbatim — the caller sees their own bug rather than crashing the
+    UI. The per-placeholder isolation in :class:`_SafeFormatter`
+    means a single failing field does **not** abort the interpolation
+    of the rest.
 
     Args:
         template: The translation string, with ``{var}`` placeholders.
@@ -788,11 +811,12 @@ def _safe_format(template: str, params: Mapping[str, Any]) -> str:
     try:
         return _SAFE_FORMATTER.vformat(template, (), dict(params))
     except (ValueError, IndexError, AttributeError, TypeError):
-        # ValueError: unclosed brace or invalid format spec.
-        # IndexError / AttributeError / TypeError: a nested attribute
-        # or index access on a field this formatter did not intercept
-        # (e.g. `{obj[0]}` when `obj` is missing — `get_field` walks
-        # the accessor before `get_value` returns the placeholder).
+        # ValueError: unclosed brace in the template itself (not a
+        # field failure — those are caught inside ``get_field``).
+        # The other exceptions should not occur because ``get_field``
+        # intercepts them, but they are kept as a defence-in-depth
+        # fallback for a ``str.format`` edge case we have not
+        # anticipated.
         return template
 
 
@@ -828,10 +852,10 @@ def _load_catalog(
 
     Reads from :data:`translations_dir` when provided, from the bundled
     ``nexusdl.data/translations/<code>.json`` otherwise. Any failure —
-    a missing file, an unreadable file, invalid JSON, a JSON document
-    that is not a mapping — yields ``None`` rather than raising. The
-    caller (:meth:`Translator._get_catalog`) caches the ``None`` so the
-    failure is not retried.
+    a missing file, an unreadable file, invalid UTF-8, invalid JSON, a
+    JSON document that is not a mapping — yields ``None`` rather than
+    raising. The caller (:meth:`Translator._get_catalog`) caches the
+    ``None`` so the failure is not retried.
 
     Args:
         code: The locale identifier.
@@ -847,7 +871,7 @@ def _load_catalog(
             text = (translations_dir / f"{code}.json").read_text(
                 encoding="utf-8"
             )
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return None
     else:
         try:
@@ -857,7 +881,12 @@ def _load_catalog(
                 / f"{code}.json"
             )
             text = resource.read_text(encoding="utf-8")
-        except (ModuleNotFoundError, OSError, AttributeError):
+        except (
+            ModuleNotFoundError,
+            OSError,
+            AttributeError,
+            UnicodeDecodeError,
+        ):
             return None
 
     try:

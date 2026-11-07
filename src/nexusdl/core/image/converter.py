@@ -67,6 +67,15 @@ Writes are atomic, using the same temp-file-plus-rename pattern as
 :mod:`nexusdl.core.image.optimizer`. A crash mid-conversion leaves the
 previous contents of ``dest`` untouched.
 
+Metadata preservation
+---------------------
+ICC profile and EXIF are read from the **source image's** ``info`` dict,
+not from the working image. Mode conversions (``RGBA`` → ``RGB``,
+``P`` → ``RGBA``, etc.) construct a new ``Image`` object whose ``info``
+dict is empty — Pillow deliberately does not propagate metadata through
+``convert()``. The converter therefore captures ``source_info`` once,
+before any transformation, and hands it to :func:`_build_save_kwargs`.
+
 Async, thread-safe
 ------------------
 :func:`convert` is a coroutine; the CPU-bound work runs in a worker thread
@@ -325,12 +334,22 @@ def _encode_from_file(src: Path, options: ConversionOptions) -> bytes:
     """Read, transform, and encode *src* into bytes.
 
     All transformation stages run inside a single ``Image.open`` context so
-    Pillow's file handle is released deterministically.
+    Pillow's file handle is released deterministically. The source's
+    ``info`` dict is captured once — before resize and mode adaptation —
+    and forwarded to :func:`_build_save_kwargs`, because Pillow's
+    ``convert()`` builds a new ``Image`` with an empty ``info`` dict. This
+    is what makes ``preserve_icc_profile=True`` and
+    ``strip_exif=False`` actually work.
     """
     try:
         with Image.open(src) as img:
             # Force-decode so corruption surfaces here, not in `save()`.
             img.load()
+
+            # Capture metadata before any transformation. ``img.info`` may
+            # be empty after ``convert()``, so reading it late would
+            # silently drop the ICC profile / EXIF.
+            source_info: dict[str, Any] = dict(img.info)
 
             frames = getattr(img, "n_frames", 1)
             if isinstance(frames, int) and frames > 1:
@@ -344,7 +363,7 @@ def _encode_from_file(src: Path, options: ConversionOptions) -> bytes:
 
             working, owns_working = _prepare_working_image(img, options)
             try:
-                return _encode(working, options)
+                return _encode(working, options, source_info)
             finally:
                 if owns_working:
                     working.close()
@@ -441,8 +460,12 @@ def _prepare_mode(
                     _BACKGROUND_MODE, rgba.size, options.background_color
                 )
                 try:
-                    background.paste(rgba, mask=rgba.getchannel("A"))
-                    return background
+                    alpha = rgba.getchannel("A")
+                    try:
+                        background.paste(rgba, mask=alpha)
+                        return background
+                    finally:
+                        alpha.close()
                 except Exception:
                     background.close()
                     raise
@@ -474,10 +497,19 @@ def _prepare_mode(
     )
 
 
-def _encode(img: PILImage, options: ConversionOptions) -> bytes:
-    """Encode *img* into bytes with the target format's save kwargs."""
+def _encode(
+    img: PILImage,
+    options: ConversionOptions,
+    source_info: dict[str, Any],
+) -> bytes:
+    """Encode *img* into bytes with the target format's save kwargs.
+
+    Metadata (ICC profile, EXIF) is taken from *source_info* — captured from
+    the original image before any transformation — rather than from
+    ``img.info``, which may be empty after ``convert()``.
+    """
     pillow_format = _PILLOW_FORMAT_NAMES[options.target_format]
-    kwargs = _build_save_kwargs(img, options)
+    kwargs = _build_save_kwargs(options, source_info)
     buf = io.BytesIO()
     try:
         img.save(buf, format=pillow_format, **kwargs)
@@ -485,14 +517,32 @@ def _encode(img: PILImage, options: ConversionOptions) -> bytes:
         raise ImageConversionError(
             f"failed to encode image as {options.target_format!r}: {exc}"
         ) from exc
+    except (MemoryError, RecursionError):
+        # Resource exhaustion must propagate untouched — the caller needs
+        # to see it and abort.
+        raise
+    except Exception as exc:
+        # Pillow plugins (particularly AVIF) occasionally surface
+        # structured errors (``struct.error``, custom plugin exceptions)
+        # not covered by the standard tuple. The contract is that any
+        # encoder failure becomes ``ImageConversionError``.
+        raise ImageConversionError(
+            f"failed to encode image as {options.target_format!r}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     return buf.getvalue()
 
 
 def _build_save_kwargs(
-    img: PILImage,
     options: ConversionOptions,
+    source_info: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return the Pillow ``save()`` kwargs for the target format."""
+    """Return the Pillow ``save()`` kwargs for the target format.
+
+    Metadata kwargs (``icc_profile``, ``exif``) are pulled from
+    *source_info* — the original image's ``info`` dict — so that a prior
+    ``convert()`` (which empties ``info``) does not silently drop them.
+    """
     target = options.target_format
     kwargs: dict[str, Any] = {}
 
@@ -511,11 +561,11 @@ def _build_save_kwargs(
         kwargs["quality"] = options.quality
     # Unreachable: __post_init__ rejected any other value.
 
-    if options.preserve_icc_profile and "icc_profile" in img.info:
-        kwargs["icc_profile"] = img.info["icc_profile"]
+    if options.preserve_icc_profile and "icc_profile" in source_info:
+        kwargs["icc_profile"] = source_info["icc_profile"]
 
-    if not options.strip_exif and "exif" in img.info:
-        kwargs["exif"] = img.info["exif"]
+    if not options.strip_exif and "exif" in source_info:
+        kwargs["exif"] = source_info["exif"]
 
     return kwargs
 

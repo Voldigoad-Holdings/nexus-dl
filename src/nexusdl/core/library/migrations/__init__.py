@@ -30,19 +30,29 @@ where:
 
 * ``<version>`` is one or more **ASCII digits** (``0-9``). Leading zeros
   are allowed and ignored (``001`` and ``1`` are the same version).
-  Non-ASCII digits (Arabic-Indic, Devanagari, etc.) are rejected even
-  though Python's ``int()`` would accept them, because a migration file
-  with a non-ASCII version is always a copy-paste accident and would
-  silently produce the same version number as its ASCII equivalent.
+  Non-ASCII digits (Arabic-Indic ``٠١``, Devanagari ``०१``, etc.) are
+  rejected even though Python's ``int()`` would accept them, because a
+  migration file with a non-ASCII version is always a copy-paste accident
+  and would silently produce the same version number as its ASCII
+  equivalent.
 * ``<name>`` is one or more of ``a-z``, ``0-9``, or ``_``. Lowercase only.
 * The extension is exactly ``.sql``.
 
 Files that do not match (including ``__init__.py``, editor backups, and
 stray ``.sql~`` files) are **ignored**, not rejected - a build environment
-can leave artefacts in the directory without breaking the runner. Only a
-``.sql`` file that *looks like* a migration but has a malformed version
-(e.g. ``00a_foo.sql``, ``_foo.sql``, ``foo.sql``, ``٠٠١_foo.sql``) is a
-hard error, because that almost always means a typo in a real migration.
+can leave artefacts in the directory without breaking the runner.
+
+**Two distinct rejection rules apply**, and they are not the same:
+
+* A ``.sql`` file with **no underscore** in its stem (``backup.sql``,
+  ``foo.sql``) is treated as a build artefact and **ignored**. This covers
+  the common accident where an editor or a backup script leaves a renamed
+  copy next to the real migrations. Hard-erroring on these would make the
+  application refuse to start until an unrelated artefact is removed.
+* A ``.sql`` file that **does** have an underscore (``001-foo.sql`` -
+  hyphen instead of underscore - or ``_foo.sql`` - missing version - or
+  ``٠١_foo.sql`` - non-ASCII digits) is a hard error, because it looks
+  like a real migration file that has a typo in its name.
 
 Two migrations with the same ``<version>`` raise
 :class:`~nexusdl.core.exceptions.LibraryError` at discovery time, before
@@ -103,9 +113,9 @@ __all__ = [
 #: and relative working directories cannot affect discovery.
 MIGRATIONS_DIR: Final[Path] = Path(__file__).resolve().parent
 
-#: Filename pattern for a migration. The two named groups are the only
-#: fields the parser needs; ``name`` is captured for error messages even
-#: though :class:`MigrationFile` does not store it.
+#: Strict filename pattern for a migration. The two named groups are the
+#: only fields the parser needs; ``name`` is captured for error messages
+#: even though :class:`MigrationFile` does not store it.
 #:
 #: ``[0-9]`` is used instead of ``\d`` deliberately: ``\d`` is Unicode-aware
 #: in Python 3 and would accept Arabic-Indic, Devanagari, and other
@@ -116,6 +126,18 @@ MIGRATIONS_DIR: Final[Path] = Path(__file__).resolve().parent
 #: contract stated in the module docstring.
 _MIGRATION_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?P<version>[0-9]+)_(?P<name>[a-z0-9_]+)\.sql$"
+)
+
+#: Loose pattern used to decide whether a non-matching ``.sql`` file is a
+#: **broken** migration (hard error) or a **stray artefact** (ignored).
+#: Any ``.sql`` file whose stem contains an underscore is treated as an
+#: attempted migration, because the underscore is the single structural
+#: marker that distinguishes a migration filename from a build artefact.
+#: A file like ``backup.sql`` (no underscore) is ignored; a file like
+#: ``001-foo.sql`` or ``_foo.sql`` (underscore present, strict pattern
+#: fails) raises.
+_LOOKS_LIKE_MIGRATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^.+_.+\.sql$"
 )
 
 
@@ -157,10 +179,10 @@ def list_migrations() -> tuple[MigrationFile, ...]:
     """Return every migration in this directory, sorted by version.
 
     Scans :data:`MIGRATIONS_DIR` for ``.sql`` files matching the filename
-    contract (see the module docstring). Non-``.sql`` files and files whose
-    names do not resemble a migration are silently ignored; a ``.sql`` file
-    whose name *does* look like a migration but whose version segment is
-    malformed is a hard error.
+    contract (see the module docstring). Non-``.sql`` files and ``.sql``
+    files whose name contains no underscore (build artefacts) are silently
+    ignored; a ``.sql`` file with an underscore but a malformed structure
+    is a hard error.
 
     The result is sorted by integer version, not lexicographically, so that
     ``010_...`` correctly follows ``009_...`` regardless of zero-padding.
@@ -176,9 +198,10 @@ def list_migrations() -> tuple[MigrationFile, ...]:
 
     Raises:
         LibraryError: If two migrations share the same integer version, or
-            if a file whose name resembles a migration cannot be parsed
-            (e.g. ``001-foo.sql`` - hyphen instead of underscore - or
-            ``٠٠١_foo.sql`` - non-ASCII digits - both of which almost
+            if a ``.sql`` file whose stem contains an underscore cannot be
+            parsed as a migration (e.g. ``001-foo.sql`` - hyphen instead
+            of underscore - ``_foo.sql`` - missing version - or
+            ``٠١_foo.sql`` - non-ASCII digits - all of which almost
             certainly mean a typo in a real migration file). The error
             message names the offending file(s) and, for the duplicate
             case, both versions.
@@ -186,7 +209,13 @@ def list_migrations() -> tuple[MigrationFile, ...]:
     found: list[MigrationFile] = []
     versions: dict[int, Path] = {}
 
-    for entry in MIGRATIONS_DIR.iterdir():
+    # Sort by filename so that (a) the iteration order is deterministic
+    # regardless of the underlying filesystem, and (b) when two malformed
+    # files exist, the error message reports the alphabetically-first one
+    # consistently across runs.
+    entries = sorted(MIGRATIONS_DIR.iterdir(), key=lambda p: p.name)
+
+    for entry in entries:
         if not entry.is_file():
             continue
         if entry.suffix != ".sql":
@@ -194,6 +223,12 @@ def list_migrations() -> tuple[MigrationFile, ...]:
 
         match = _MIGRATION_PATTERN.match(entry.name)
         if match is None:
+            # Distinguish "malformed migration" from "stray artefact".
+            # An artefact like ``backup.sql`` has no underscore and is
+            # safely ignored; a file with an underscore looks like an
+            # attempted migration and is a hard error.
+            if not _LOOKS_LIKE_MIGRATION_PATTERN.match(entry.name):
+                continue
             raise LibraryError(
                 f"malformed migration filename: {entry.name!r}. "
                 f"Expected '<version>_<name>.sql' where <version> is "

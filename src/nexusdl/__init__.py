@@ -104,12 +104,25 @@ Where to go next
       uvicorn nexusdl.interfaces.web:create_app_from_env \\
           --factory --workers 4 --host 0.0.0.0 --port 8000
 
-  The ``create_app_from_env`` factory gives each worker its own
-  :class:`~nexusdl.interfaces.web.backend.dependencies.AppServices`
-  container (own connection manager, own rate-limit store, own
-  Playwright pool), which is the only safe multi-worker pattern. A
-  module-level ``app`` instance is deliberately not exposed for exactly
-  this reason.
+  .. note::
+
+     The ``create_app_from_env`` factory referenced above must be
+     defined at ``nexusdl/interfaces/web/__init__.py`` (or in
+     ``backend/main.py`` and re-exported from the package's
+     ``__init__``). It takes no arguments and reads the configuration
+     from the environment via
+     :class:`~nexusdl.core.config.Settings` — that is what makes the
+     uvicorn ``--factory`` flag work: uvicorn calls the factory once
+     per worker, and each worker builds its own
+     :class:`~nexusdl.interfaces.web.backend.dependencies.AppServices`
+     container (own connection manager, own rate-limit store, own
+     Playwright pool). **A module-level ``app`` instance is
+     deliberately not exposed** — sharing an ``AsyncEngine``, a
+     connection manager, or a Playwright pool across uvicorn workers
+     is unsafe (uvicorn forks, and fork is not async-safe for these
+     objects). Deployments that use a WSGI/ASGI server other than
+     uvicorn follow the same rule: call the factory in the worker
+     process, do not import a pre-built app.
 
   **Multi-worker caveat.** The per-worker rate-limit store is
   :class:`~nexusdl.interfaces.web.backend.middleware.rate_limit.InMemoryRateLimitStore`
@@ -117,7 +130,10 @@ Where to go next
   global limit is ``N_workers × per_worker_limit``. Deployments that
   need a **global** limit (auth brute-force protection, expensive
   download quotas) must provide a shared store (Redis) via
-  ``RateLimitConfig(store=...)``. Similarly, the default
+  :class:`~nexusdl.interfaces.web.backend.middleware.rate_limit.RateLimitConfig`'s
+  ``store`` keyword — see
+  :class:`~nexusdl.interfaces.web.backend.middleware.rate_limit.RateLimitConfig`.
+  Similarly, the default
   :class:`~nexusdl.interfaces.web.backend.security.InMemoryRevocationStore`
   is per-worker; JWT revocation requires a shared store in multi-worker
   deployments. Both are documented in the respective modules.

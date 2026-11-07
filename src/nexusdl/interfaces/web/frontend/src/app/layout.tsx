@@ -3,23 +3,12 @@ import { Inter } from "next/font/google";
 import type { ReactNode } from "react";
 
 import { Providers } from "./providers";
+import { Sidebar } from "../components/Sidebar";
 import "./globals.css";
 
 // ───────────────────────────────────────────────────────────────────────────
 // Fonts
 // ───────────────────────────────────────────────────────────────────────────
-//
-// ``next/font/google`` self-hosts the font at build time — no runtime
-// request to Google Fonts, which means no external origin in the CSP's
-// ``font-src`` and no privacy concern.  ``display: "swap"`` renders the
-// fallback font immediately and swaps in Inter when it is ready, avoiding
-// the invisible-text flash (FOIT) that ``display: "block"`` would cause.
-//
-// The font is applied directly via ``inter.className`` on ``<body>`` rather
-// than through a CSS variable — globals.css does not declare ``--font-sans``,
-// and adding one would require editing that file, which this iteration does
-// not do.  ``inter.className`` is the simplest shape that works with the
-// existing stylesheet unchanged.
 const inter = Inter({
   subsets: ["latin"],
   display: "swap",
@@ -29,19 +18,8 @@ const inter = Inter({
 // Constants
 // ───────────────────────────────────────────────────────────────────────────
 
-/**
- * Display name of the application.
- *
- * Fixed at the project level (PROMPT MASTER §"Contexte du projet":
- * *nom affiché: NexusDL*), and used identically by the web manifest
- * (``public/manifest.json``), the sidebar brand, the login page and here.
- * Keeping the four in sync is a project invariant; a future refactor could
- * hoist it to a shared constant module, but there is exactly one canonical
- * value today.
- */
 const APP_NAME = "NexusDL";
 
-/** One-line description, matching ``public/manifest.json``. */
 const APP_DESCRIPTION =
   "Multi-site manga, webtoon, comic and doujinshi downloader — CLI, TUI, desktop GUI and web.";
 
@@ -52,29 +30,11 @@ const APP_DESCRIPTION =
 /**
  * Resolve the value of :data:`Metadata.metadataBase`.
  *
- * ``metadataBase`` is the absolute URL that Next.js prepends to every
- * relative URL in the metadata — most importantly the ``/og-image.png``
- * referenced below.  Without it, Next.js falls back to a placeholder and
- * logs a warning at build time; with it, social-sharing previews resolve
- * to a real hostname.
- *
- * The value comes from ``NEXUSDL_PUBLIC_URL`` (PROMPT MASTER §"Principes
- * fondamentaux" rule 1: *URLs app → ``.env``*).  Hardcoding a domain here
- * would violate rule 3 of the same section.  This is why the fallback is
- * not a URL guess but rather:
- *
- *  * ``http://localhost:3000`` in development — matches ``next dev``'s
- *    default port, so local screenshots and sharing previews work;
- *  * ``undefined`` in production when the env var is missing — Next.js
- *    then emits the correct build-time warning telling the operator to
- *    set the variable, rather than silently producing wrong absolute
- *    URLs.
- *
- * Only ``http:`` and ``https:`` URLs are accepted.  Anything else (a
- * ``javascript:`` payload, an ``ftp:`` URL from a copy-paste accident, a
- * ``file:`` path) is treated like a missing value so that the emitted
- * ``metadataBase`` cannot be used to construct a hostile absolute URL in
- * the ``<meta property="og:url">`` tags.
+ * See the previous iteration's docstring for the full rationale.  Summary:
+ * the value comes from ``NEXUSDL_PUBLIC_URL``; only ``http:`` and ``https:``
+ * URLs are accepted; a missing or malformed value yields ``undefined`` in
+ * production (Next.js's build-time warning is the correct signal) and
+ * ``http://localhost:3000`` in development.
  */
 function getMetadataBase(): URL | undefined {
   const raw = process.env.NEXUSDL_PUBLIC_URL?.trim();
@@ -88,16 +48,9 @@ function getMetadataBase(): URL | undefined {
   try {
     url = new URL(raw);
   } catch {
-    // A malformed URL in the environment is a deployment bug — treat it
-    // like a missing one.  The build-time warning is the correct signal;
-    // throwing here would break ``next build`` on a typo, which is not
-    // the failure mode the operator deserves.
     return undefined;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") {
-    // Same treatment as a missing value: the operator typo'd the
-    // protocol, and a wrong absolute URL is worse than the build-time
-    // warning Next.js emits when ``metadataBase`` is unset.
     return undefined;
   }
   return url;
@@ -105,24 +58,10 @@ function getMetadataBase(): URL | undefined {
 
 /**
  * Page metadata — applied to every route that does not override it.
- *
- * Server Component export (Next.js 14 App Router).  Because this is
- * exported from a Server Component, adding ``"use client"`` here would
- * disable it entirely — which is why only ``<Providers>`` (a child
- * component) is marked as a client boundary.
  */
 export const metadata: Metadata = {
   metadataBase: getMetadataBase(),
 
-  // -------------------------------------------------------------------
-  // Title and description
-  // -------------------------------------------------------------------
-  // The ``template`` is what turns a page's own ``metadata.title`` into
-  // ``"<Page Title> · NexusDL"``.  None of the current routes export
-  // their own ``metadata.title`` (they render their titles via ``<h1>``
-  // inside client components), but the template is what a future
-  // Server-Component route (e.g. a public landing page) would pick up
-  // automatically.
   title: {
     default: APP_NAME,
     template: `%s · ${APP_NAME}`,
@@ -131,22 +70,8 @@ export const metadata: Metadata = {
   applicationName: APP_NAME,
   generator: "Next.js",
 
-  // -------------------------------------------------------------------
-  // Referrer policy
-  // -------------------------------------------------------------------
-  // Matches the header set in ``next.config.js``.  Repeating it here is
-  // required so the policy is also emitted for the ``<meta name="referrer">``
-  // tag that some older browsers consult.
   referrer: "strict-origin-when-cross-origin",
 
-  // -------------------------------------------------------------------
-  // Indexing
-  // -------------------------------------------------------------------
-  // Off by default.  NexusDL is a personal downloader whose library is
-  // per-user and whose public catalogue page does not exist — indexing
-  // would only serve to expose the installation URL.  An operator who
-  // explicitly wants their instance indexed should reverse this decision
-  // in a deployment-specific override, not by editing this file.
   robots: {
     index: false,
     follow: false,
@@ -159,21 +84,6 @@ export const metadata: Metadata = {
     },
   },
 
-  // -------------------------------------------------------------------
-  // Icons
-  // -------------------------------------------------------------------
-  // Every entry below corresponds to an actual file under ``public/``:
-  //
-  //   public/favicon.ico
-  //   public/icons/favicon-16x16.png
-  //   public/icons/favicon-32x32.png
-  //   public/icons/apple-touch-icon.png
-  //   public/logo.svg
-  //
-  // Browsers that support the SVG mask icon (Safari on macOS, Edge on
-  // Windows) will use ``logo.svg`` for the pinned-tab and system-tray
-  // icons.  The ``color`` is the dark-theme background, which the
-  // SVG's fill inherits when Safari applies its mask.
   icons: {
     icon: [
       { url: "/favicon.ico", sizes: "any" },
@@ -191,11 +101,6 @@ export const metadata: Metadata = {
     other: [{ rel: "mask-icon", url: "/logo.svg", color: "#0a0a0a" }],
   },
 
-  // -------------------------------------------------------------------
-  // PWA
-  // -------------------------------------------------------------------
-  // The manifest declares the app installable; ``appleWebApp`` fills the
-  // iOS-specific meta tags that Safari does not read from the manifest.
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
@@ -203,13 +108,6 @@ export const metadata: Metadata = {
     statusBarStyle: "black-translucent",
   },
 
-  // -------------------------------------------------------------------
-  // OpenGraph
-  // -------------------------------------------------------------------
-  // Social sharing previews.  The ``/og-image.png`` file exists under
-  // ``public/`` and is the canonical sharing image — a single static PNG
-  // is sufficient for a PWA whose routes are not individually
-  // shareable in the same way a blog post is.
   openGraph: {
     type: "website",
     siteName: APP_NAME,
@@ -225,11 +123,6 @@ export const metadata: Metadata = {
     ],
   },
 
-  // -------------------------------------------------------------------
-  // Twitter / X card
-  // -------------------------------------------------------------------
-  // ``summary_large_image`` uses the same ``og-image.png`` as the
-  // OpenGraph preview, which is what every card renderer expects.
   twitter: {
     card: "summary_large_image",
     title: APP_NAME,
@@ -237,15 +130,6 @@ export const metadata: Metadata = {
     images: ["/og-image.png"],
   },
 
-  // -------------------------------------------------------------------
-  // Format detection
-  // -------------------------------------------------------------------
-  // Safari on iOS auto-links anything that looks like a phone number, an
-  // email address or a postal address.  Manga titles occasionally contain
-  // such tokens ("Vol. 20-11-2024", "Chapter 3-1-2"), and auto-linking
-  // them is always wrong on this UI — the tokens are titles, not contact
-  // information.  Disabling detection globally on the document removes
-  // that class of bug at the root.
   formatDetection: {
     telephone: false,
     email: false,
@@ -256,29 +140,11 @@ export const metadata: Metadata = {
 // ───────────────────────────────────────────────────────────────────────────
 // Viewport
 // ───────────────────────────────────────────────────────────────────────────
-//
-// Exported separately from ``metadata`` — Next.js 14 split these so that
-// ``viewport``-related tags can be re-evaluated on the client without
-// shipping the whole ``metadata`` object.  ``themeColor`` in particular
-// must be able to follow the active color scheme, which is why it is
-// declared here as a media-query pair rather than as a single string in
-// ``metadata``.
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  // ``maximumScale: 5`` rather than ``1`` — pinching to zoom is an
-  // accessibility feature, not something to disable.  Five times the
-  // initial scale is enough for reading page images at full resolution
-  // without turning the whole UI into a scrollable trap.
   maximumScale: 5,
-  // ``userScalable`` is intentionally **not** set to ``false``: iOS
-  // ignores ``maximumScale: 5`` when ``userScalable`` is false, and
-  // disabling zoom outright is an accessibility regression.
   colorScheme: "dark light",
-  // Two theme-colour values keyed on the user's preference.  The dark
-  // value matches ``public/manifest.json`` (``theme_color: "#0a0a0a"``).
-  // The light value is the corresponding light background from
-  // ``globals.css`` (``--background: 0 0% 100%``).
   themeColor: [
     { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
     { media: "(prefers-color-scheme: light)", color: "#ffffff" },
@@ -292,42 +158,30 @@ export const viewport: Viewport = {
 /**
  * Root layout — wraps every route in the App Router.
  *
- * Rendered exactly once by Next.js.  It is a **Server Component** (no
- * ``"use client"`` at the top of this file) so that:
+ * Renders the **application shell**:
  *
- *  * ``export const metadata`` and ``export const viewport`` are honoured
- *    by Next.js — metadata exports are silently ignored in Client
- *    Components.
- *  * The layout ships no JavaScript beyond what ``<Providers>`` needs.
+ * * ``<Sidebar />`` — the primary desktop navigation, hidden below ``md``.
+ *   Mobile navigation is delegated to the sidebar's own responsive
+ *   behaviour (``hidden md:flex``) — when a ``TopBar`` / ``BottomNav``
+ *   primitive lands, it will be added here as a sibling, but the shell's
+ *   structure (``flex min-h-screen`` with the sidebar as the first child
+ *   and ``<main>`` as the second) will not change.
+ * * ``<main id="main-content" tabIndex={-1}>`` — the landmark target for
+ *   "skip to content" links, focus management after navigation, and
+ *   screen-reader heading navigation.  ``tabIndex={-1}`` makes the
+ *   element focusable programmatically (so ``element.focus()`` works) but
+ *   not in the tab order.
+ * * ``<Providers>`` — the single client boundary (theme, query cache,
+ *   WebSocket, toaster).
  *
- * The single client boundary in the tree is ``<Providers>`` (see
- * ``providers.tsx``).  Every other page in the App Router can be either a
- * Server Component or a Client Component; the split is decided by each
- * route's own needs, not forced by the layout.
- *
- * ``suppressHydrationWarning`` is **required** on ``<html>``:
- *
- *  * ``next-themes`` sets ``class="dark"`` (or ``"light"``) on ``<html>``
- *    **before** React hydrates, by injecting a tiny inline script that
- *    runs at document start.
- *  * The server-rendered HTML has no ``class`` attribute on ``<html>``.
- *  * Without ``suppressHydrationWarning``, React reports a hydration
- *    mismatch on every page load.
- *
- * The suppression is safe because it applies **only** to that one
- * attribute on that one element.  A real mismatch inside the tree would
- * still be reported.
+ * ``suppressHydrationWarning`` is required on ``<html>`` because
+ * ``next-themes`` sets ``class="dark"`` (or ``"light"``) **before** React
+ * hydrates, via an inline script.  The suppression is safe: it applies to
+ * that one attribute on that one element, and real mismatches inside the
+ * tree are still reported.
  *
  * ``lang="en"`` reflects the default ``language: "en"`` in the settings
- * store.  A future i18n layer would update this via a client effect that
- * reads the user's preference, but until then the static default matches
- * both the manifest's ``lang`` field and the language of every shipped
- * translation string.
- *
- * The return type is inferred rather than annotated with ``JSX.Element``
- * (deprecated since ``@types/react@18.3``) or ``React.JSX.Element``
- * (requires importing ``React`` just for the type).  Next.js's own
- * layout types accept the inferred return.
+ * store.  A future i18n layer would update this via a client effect.
  */
 export default function RootLayout({
   children,
@@ -337,7 +191,24 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={inter.className}>
-        <Providers>{children}</Providers>
+        <Providers>
+          <a
+            href="#main-content"
+            className="sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50 focus:rounded-md focus:bg-primary focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-primary-foreground"
+          >
+            Skip to content
+          </a>
+          <div className="flex min-h-screen">
+            <Sidebar />
+            <main
+              id="main-content"
+              tabIndex={-1}
+              className="flex min-w-0 flex-1 flex-col focus:outline-none"
+            >
+              {children}
+            </main>
+          </div>
+        </Providers>
       </body>
     </html>
   );

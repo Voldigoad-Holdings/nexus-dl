@@ -9,7 +9,7 @@ before any other logging happens.
 Why a dedicated configuration module
 ------------------------------------
 loguru ships a working default configuration — a colored stderr sink at
-``INFO`` level. That default is appropriate for a **library**, not for a
+``DEBUG`` level. That default is appropriate for a **library**, not for a
 **pipeline** that also runs as a server, a CLI, a GUI, and a TUI. The
 pipeline needs:
 
@@ -127,14 +127,14 @@ into a standalone package together with ``loguru``.
 
 Type-annotation note
 --------------------
-``loguru`` exposes only the ``logger`` **instance** at the top level —
-the ``Logger`` class is not exported, so ``from loguru import Logger``
-raises :class:`ImportError`. The annotation on :func:`get_logger` needs
-the class, so it is imported from ``loguru._logger`` under
-:data:`typing.TYPE_CHECKING`. Because this module uses
-``from __future__ import annotations``, the annotation is never evaluated
-at runtime — the import is only visible to mypy/pyright, not to the
-interpreter. See the module-level import block for the exact form.
+``loguru`` **does** expose ``Logger`` at the top level in every version
+since 0.5.0 (2020), alongside the ``logger`` instance. The class is what
+the annotation on :func:`get_logger` needs, so it is imported under
+:data:`typing.TYPE_CHECKING` — the import is only visible to
+mypy/pyright, not to the interpreter at runtime. Because this module
+uses ``from __future__ import annotations``, the annotation is never
+evaluated at runtime, so a ``TYPE_CHECKING`` import is sufficient and
+avoids a small runtime cost.
 
 Frozen-environment note
 -----------------------
@@ -147,6 +147,16 @@ holds ``None`` and the walk short-circuits to the standard depth,
 which is the best-effort behaviour — the stdlib frames cannot be
 identified without the path, so loguru's default two-frame skip is
 used. This is documented in the handler's ``emit`` docstring as well.
+
+Interpreter-environment note
+----------------------------
+The stderr sink assumes ``sys.stderr`` is a writable stream. A Windows
+``pythonw.exe`` launch (no console) sets ``sys.stderr`` to ``None``, in
+which case ``logger.add(None, ...)`` raises :class:`TypeError` inside
+loguru. NexusDL is a CLI/server pipeline and is not designed to run
+under ``pythonw``; a deployment that needs a windowless launch uses the
+``file=`` sink (which is independent of ``sys.stderr``) and accepts
+that stderr output is unavailable.
 """
 
 from __future__ import annotations
@@ -158,13 +168,12 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 from loguru import logger
 
 if TYPE_CHECKING:
-    # ``loguru`` does not re-export ``Logger`` at the top level (only the
-    # ``logger`` instance). The class lives in the private
-    # ``loguru._logger`` module. Importing it under ``TYPE_CHECKING``
-    # keeps the runtime import list minimal while letting mypy resolve
-    # the ``-> Logger`` annotation on :func:`get_logger`. See the module
-    # docstring's "Type-annotation note" section.
-    from loguru._logger import Logger
+    # ``loguru`` exports ``Logger`` at the top level (since 0.5.0).
+    # Importing it under ``TYPE_CHECKING`` keeps the runtime import list
+    # minimal while letting mypy resolve the ``-> Logger`` annotation
+    # on :func:`get_logger`. See the module docstring's
+    # "Type-annotation note" section.
+    from loguru import Logger
 
     from pathlib import Path
 
@@ -231,7 +240,11 @@ class _InterceptHandler(logging.Handler):
     The forwarding uses loguru's standard "intercept" recipe:
 
     1. Read the record's level name if loguru knows it; otherwise pass
-       the numeric level through unchanged.
+       the numeric level through unchanged. When the numeric level is
+       unknown to loguru (a third-party library using a custom level
+       number, e.g. 15 between DEBUG and INFO), it is **registered** on
+       the fly with ``logger.level(name, no=levelno)`` so the record is
+       not silently dropped by ``logger.log``.
     2. Walk the caller's stack to find the frame that actually issued
        the ``logging`` call (a few frames are loguru-internal), so the
        rendered ``name:function:line`` in the output identifies the
@@ -251,12 +264,21 @@ class _InterceptHandler(logging.Handler):
             record: The stdlib log record to forward.
         """
         # Map the stdlib level to a loguru level name where possible;
-        # fall back to the numeric level so a custom stdlib level (a
-        # library using level 15, say) still logs at the right place.
+        # fall back to the numeric level (registering it if necessary)
+        # so a custom stdlib level (a library using level 15, say) is
+        # forwarded rather than silently dropped by ``logger.log``.
         try:
             level: str | int = logger.level(record.levelname).name
         except (ValueError, AttributeError):
             level = record.levelno
+            try:
+                logger.level(record.levelname)
+            except ValueError:
+                # Unknown to loguru — register it with the numeric
+                # value from the stdlib record. ``logger.level`` is
+                # idempotent: calling it again with the same name is a
+                # no-op, so concurrent registration is safe.
+                logger.level(record.levelname, no=record.levelno)
 
         # Find the frame that issued the logging call, skipping this
         # handler and loguru's own machinery. Two frames is loguru's
@@ -315,7 +337,7 @@ def configure_logging(
     Args:
         level: Minimum log level, as a loguru level name
             (``"TRACE"``, ``"DEBUG"``, ``"INFO"``, ``"SUCCESS"``,
-            ``"WARNING"``, ``"ERROR"``, ``"CRITICAL"``). Case-sensitive;
+            ``"WARNING"``, ``"ERROR"``, ``"CRITICAL"``). Case-insensitive;
             callers using :func:`configure_logging_from_settings` get
             the upper-cased value from
             :attr:`~nexusdl.core.config.LoggingSection.level`.
@@ -352,8 +374,12 @@ def configure_logging(
             * Tracebacks are concise; local variables are not shown.
 
     Raises:
-        ValueError: If *level* is not a loguru level name. Raised by
-            :meth:`loguru.Logger.add`, not by this function directly.
+        ValueError: If *level* is not a loguru level name, or if
+            *format* is not ``"pretty"``, ``"json"``, or ``None``.
+            The level check is raised by :meth:`loguru.Logger.add`, the
+            format check by this function directly (before any sink is
+            added, so a bad argument does not leave the logger in a
+            half-reconfigured state).
         OSError: If *file*'s parent directory cannot be created, or
             the file cannot be opened for writing.
     """
@@ -508,7 +534,9 @@ def _resolve_format(
     """Resolve the effective output format from the arguments.
 
     Explicit values win; ``None`` auto-selects from *debug* per the
-    module docstring's "Format resolution" section.
+    module docstring's "Format resolution" section. An explicit value
+    other than ``"pretty"``, ``"json"``, or ``None`` is rejected — a
+    typo must not silently fall back to the default.
 
     Args:
         format_: The caller-supplied format, or ``None``.
@@ -516,10 +544,17 @@ def _resolve_format(
 
     Returns:
         ``"pretty"`` or ``"json"``.
+
+    Raises:
+        ValueError: If *format_* is not ``"pretty"``, ``"json"``, or
+            ``None``.
     """
+    if format_ is None:
+        return "pretty" if debug else "json"
     if format_ == "pretty":
         return "pretty"
     if format_ == "json":
         return "json"
-    # ``format_`` is ``None`` — auto-select from debug.
-    return "pretty" if debug else "json"
+    raise ValueError(
+        f"format must be 'pretty', 'json', or None, got {format_!r}"
+    )

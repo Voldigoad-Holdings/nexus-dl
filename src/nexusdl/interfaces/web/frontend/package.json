@@ -49,6 +49,11 @@
     "tailwindcss-animate": "^1.0.7",
     "typescript": "~5.5.4"
   },
+  "pnpm": {
+    "overrides": {
+      "glob": "^10.4.5"
+    }
+  },
   "browserslist": {
     "production": [
       ">0.3%",

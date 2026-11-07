@@ -43,7 +43,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, ClassVar, Final
 from uuid import uuid4
 
 from nexusdl.core.events import Event
@@ -102,10 +102,14 @@ class ExamplePlugin:
     __slots__ = ("_ctx", "_lock", "_stats", "_stats_path")
 
     #: Plugin identifier — must match ``name:`` in ``nexus.plugin.yaml``.
-    name: str = "example"
+    #: Declared ``ClassVar`` for the same reason as in
+    #: :class:`~nexusdl.plugins.api.NexusPlugin`: it is a class-level
+    #: constant, not instance state, and ``mypy --strict`` uses ``ClassVar``
+    #: to enforce that no plugin ever mutates its own identity at runtime.
+    name: ClassVar[str] = "example"
 
     #: Plugin version — must match ``version:`` in ``nexus.plugin.yaml``.
-    version: str = "1.0.0"
+    version: ClassVar[str] = "1.0.0"
 
     def __init__(self) -> None:
         # Populated by ``on_load``. ``None`` before load / after unload, so
@@ -154,18 +158,23 @@ class ExamplePlugin:
         if self._ctx is None or self._stats_path is None:
             return
 
+        ctx = self._ctx
+        stats_path = self._stats_path
         try:
-            self._stats_path.parent.mkdir(parents=True, exist_ok=True)
-            self._stats_path.write_text(
+            stats_path.parent.mkdir(parents=True, exist_ok=True)
+            stats_path.write_text(
                 json.dumps(self._stats, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
-            self._ctx.logger.info(
+            ctx.logger.info(
                 "ExamplePlugin unloaded. Persisted stats: {}", self._stats
             )
-        except OSError as exc:
-            # Never raise from a lifecycle hook: the framework is shutting down.
-            self._ctx.logger.warning(
+        except (OSError, TypeError, ValueError) as exc:
+            # ``OSError`` covers write failures, ``TypeError`` / ``ValueError``
+            # cover a corrupted ``_stats`` payload (defensive: the dict is
+            # built from primitives only). Never raise from a lifecycle hook:
+            # the framework is shutting down.
+            ctx.logger.warning(
                 "Could not persist plugin stats on unload: {}", exc
             )
         finally:
@@ -188,13 +197,14 @@ class ExamplePlugin:
             (e.g. to bump its priority or patch metadata), but this example
             deliberately stays transparent.
         """
-        if self._ctx is None:
+        ctx = self._ctx
+        if ctx is None:
             return task
 
         async with self._lock:
             self._stats["tasks_started"] += 1
 
-        self._ctx.logger.debug(
+        ctx.logger.debug(
             HOOK_ON_BEFORE_DOWNLOAD + ": task_id={} status={}",
             task.id,
             task.status,
@@ -213,14 +223,15 @@ class ExamplePlugin:
         Returns:
             The same result, unmodified.
         """
-        if self._ctx is None:
+        ctx = self._ctx
+        if ctx is None:
             return result
 
         async with self._lock:
             self._stats["tasks_completed"] += 1
             snapshot = dict(self._stats)
 
-        self._ctx.logger.info(
+        ctx.logger.info(
             HOOK_ON_AFTER_DOWNLOAD + ": result={!r}", result
         )
         await self._safe_publish(
@@ -236,16 +247,18 @@ class ExamplePlugin:
             page: The page metadata (``index`` is 0-based).
             path: Where the image was written.
         """
-        if self._ctx is None:
+        ctx = self._ctx
+        if ctx is None:
             return
 
         async with self._lock:
             self._stats["pages_downloaded"] += 1
 
-        self._ctx.logger.trace(
-            HOOK_ON_PAGE_DOWNLOADED + ": index={} size={} bytes",
+        size = _safe_size(path)
+        ctx.logger.trace(
+            HOOK_ON_PAGE_DOWNLOADED + ": index={} size={}",
             page.index,
-            _safe_size(path),
+            size if size >= 0 else "<unavailable>",
         )
 
     async def on_error(self, task_id: str, error: Exception) -> None:
@@ -257,13 +270,14 @@ class ExamplePlugin:
                 ``BaseException`` subclasses and never reach this hook, so
                 everything received here is a genuine failure.
         """
-        if self._ctx is None:
+        ctx = self._ctx
+        if ctx is None:
             return
 
         async with self._lock:
             self._stats["errors_seen"] += 1
 
-        self._ctx.logger.error(
+        ctx.logger.error(
             HOOK_ON_ERROR + ": task_id={} error={}: {}",
             task_id,
             type(error).__name__,
@@ -293,13 +307,19 @@ class ExamplePlugin:
         Args:
             context: Plugin context (used for the logger).
         """
-        assert self._stats_path is not None  # set by on_load before call
+        stats_path = self._stats_path
+        if stats_path is None:
+            # ``on_load`` always sets ``self._stats_path`` before calling
+            # this method; the explicit check replaces a previous ``assert``
+            # so that running under ``python -O`` does not turn this into a
+            # silent ``AttributeError`` on the next line.
+            return
 
-        if not self._stats_path.is_file():
+        if not stats_path.is_file():
             return
 
         try:
-            with self._stats_path.open("r", encoding="utf-8") as fh:
+            with stats_path.open("r", encoding="utf-8") as fh:
                 raw = fh.read(_MAX_STATS_FILE_BYTES + 1)
         except OSError as exc:
             context.logger.warning(
@@ -351,10 +371,11 @@ class ExamplePlugin:
             event_type: Namespaced event type, e.g. ``plugin.example.foo``.
             payload: JSON-serialisable mapping carried by the event.
         """
-        if self._ctx is None:  # defensive: callers already guarantee this
+        ctx = self._ctx
+        if ctx is None:  # defensive: callers already guarantee this
             return
         try:
-            await self._ctx.event_bus.publish(
+            await ctx.event_bus.publish(
                 Event(
                     type=event_type,
                     timestamp=datetime.now(UTC),
@@ -363,7 +384,7 @@ class ExamplePlugin:
                 )
             )
         except Exception as exc:  # noqa: BLE001 — a hook must never break the pipeline
-            self._ctx.logger.warning(
+            ctx.logger.warning(
                 "Failed to publish custom event {}: {}", event_type, exc
             )
 

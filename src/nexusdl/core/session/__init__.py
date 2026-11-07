@@ -126,7 +126,7 @@ case with no benefit.
 
 Lazy loading
 ------------
-All forty-five module-level exports are resolved through PEP 562's
+Every export in ``__all__`` is resolved through PEP 562's
 ``__getattr__`` mechanism, plus the two introspection helpers
 (:func:`list_symbols`, :func:`get_symbol`) that are defined locally in
 this module. Importing ``nexusdl.core.session`` **does not import any
@@ -480,6 +480,11 @@ def __getattr__(name: str) -> Any:
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
+    The catch is intentionally broadened from ``ModuleNotFoundError`` to
+    ``ImportError`` — a partially-initialized submodule (missing symbol,
+    circular import resolved differently across Python versions) also
+    deserves the ``[core]`` install hint rather than a raw traceback.
+
     Args:
         name: The attribute name being accessed.
 
@@ -520,9 +525,10 @@ def __getattr__(name: str) -> Any:
     submodule_basename, attr_name = entry
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
-    except ModuleNotFoundError as exc:
-        # Optional dependency missing from the session subsystem.
-        if exc.name in {
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose — see the docstring.
+        if getattr(exc, "name", None) in {
             "httpx",
             "hishel",
             "playwright",
@@ -543,13 +549,18 @@ def __getattr__(name: str) -> Any:
 
     try:
         value = getattr(module, attr_name)
-    except AttributeError:
+    except AttributeError as exc:
+        # ``from exc`` preserves the cause. A ``getattr`` on a healthy
+        # module raises ``AttributeError`` with the standard message;
+        # an exotic failure (a broken descriptor, a partially-initialised
+        # class) shows up with its own message attached, which is the
+        # diagnostic the operator needs.
         raise AttributeError(
             f"The session submodule {submodule_basename!r} does not "
             f"define {attr_name!r}. This is a package-internal "
             f"inconsistency - nexusdl.core.session.__all__ and the "
-            f"submodules are out of sync."
-        ) from None
+            f"submodules are out of sync. Original error: {exc}"
+        ) from exc
 
     # Cache in the module namespace so subsequent lookups bypass
     # __getattr__ entirely (same behavior as a top-level import).
@@ -558,21 +569,30 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Return the public names for interactive introspection.
+    """Return the package's visible attributes, including lazy exports.
 
-    Python's default :func:`dir` implementation collects a module's
-    ``__dict__`` and, when the module defines ``__getattr__``, calls it
-    with each candidate name to decide what to display. Because none of
-    the forty-five lazy exports are present in ``__dict__`` at import
-    time, an unmodified :func:`dir` would not list them - the package
-    would appear empty in a REPL.
+    Python's default :func:`dir` on a module already lists ``__all__``
+    entries even when they are not bound in ``__dict__`` — so without
+    this override, ``HttpSession``, ``RateLimiter``, etc. would still
+    appear. Keeping the override explicit serves two purposes:
 
-    The returned list is :data:`__all__` plus the standard module
-    dunders a user typically expects to see.
+    1. It documents that the session exports are *intentional*
+       attributes of this package, not accidental names.
+    2. It preserves the module's actual attributes (``__file__``,
+       ``__spec__``, ``__loader__``, ``__dict__``, ``__getattr__``,
+       ``__dir__``, ``list_symbols``, ``get_symbol``, ``_LAZY``,
+       ``_LOCAL``, …) alongside the lazy ones — a plain ``dir`` would
+       include them anyway, but spelling out the union makes the
+       contract explicit and future-proof against refactors that change
+       how ``__all__`` is built.
+
+    The result is the union of the module's actual namespace (dunders,
+    introspection helpers, the sanity-check constants, any submodule
+    already imported and cached by :func:`__getattr__`) and
+    :data:`__all__`, deduplicated and sorted so that ``dir()`` output is
+    stable across Python versions and repeat calls.
     """
-    return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
-    )
+    return sorted(set(globals()) | set(__all__))
 
 
 # ===========================================================================
@@ -584,16 +604,15 @@ def list_symbols() -> list[str]:
 
     The list is the union of:
 
-    * the forty-five **lazy** exports registered in :data:`_LAZY`, and
+    * the **lazy** exports registered in :data:`_LAZY`, and
     * the two **local** helpers (:func:`list_symbols` itself and
       :func:`get_symbol`), which are defined in this module's body.
 
-    This matches :data:`__all__` exactly - the invariant is checked in
-    :mod:`tests.unit.core.session.test_session_init` (both directions).
-    Useful for parametrized tests (``@pytest.mark.parametrize("name",
-    list_symbols())``), session-status dashboards that enumerate what the
-    subsystem exposes, and tooling that needs to know the public surface
-    without importing every submodule.
+    This matches :data:`__all__` exactly - the invariant is checked below
+    (both directions). Useful for parametrized tests
+    (``@pytest.mark.parametrize("name", list_symbols())``), session-status
+    dashboards that enumerate what the subsystem exposes, and tooling that
+    needs to know the public surface without importing every submodule.
 
     Returns:
         A sorted list of strings, one per public export.

@@ -39,6 +39,25 @@ Design notes
   by the router (e.g. ``sort_field = sort.sort or "added_at"``). This
   keeps :class:`SortParams` free of resource-specific knowledge.
 
+* **Sort direction is ``?order=asc|desc``.** The convenience
+  :attr:`SortParams.descending` property is for service-layer use — it
+  is **not** a query parameter name. Clients that send
+  ``?descending=true`` will be silently ignored (FastAPI drops unknown
+  parameters under ``Depends()``).
+
+* **List-valued query parameters use repetition, not CSV.**
+  ``?status=running&status=pending`` is what FastAPI parses into a
+  ``list[DownloadStatus]``. CSV (``?status=running,pending``) is **not**
+  parsed by the framework — use :func:`parse_enum_csv` explicitly if a
+  router needs to accept CSV. Each list-valued field documents which
+  convention it expects.
+
+* **List lengths are bounded.** Unbounded list-valued query parameters
+  are a cheap DoS vector (a client sends 10 000 ``?filters=x``). Each
+  list-valued field caps its length via ``max_length`` on the ``Field``
+  — well above any legitimate use, low enough to keep per-request cost
+  bounded.
+
 * **Time ranges are inclusive.** :class:`TimeRangeParams` rejects
   ``since > until`` up front, before any service sees the values.
 """
@@ -102,6 +121,11 @@ DEFAULT_PER_PAGE: int = 20
 #: :data:`schemas.responses.MAX_PAGE_SIZE`. Kept identical so requests and
 #: responses can never disagree.
 MAX_PER_PAGE: int = 100
+
+#: Hard cap on the number of items in a single list-valued query
+#: parameter (``filters``, ``statuses``, …). Well above any legitimate
+#: use, low enough to keep per-request cost bounded.
+MAX_LIST_QUERY_ITEMS: int = 50
 
 
 # ===========================================================================
@@ -185,6 +209,11 @@ class SortParams(QueryParams):
     trimmed, ``None`` when empty). Whether the field actually exists on
     the resource is a business concern owned by the router — see the
     module docstring.
+
+    **Query parameter names**: ``?sort=<field>&order=asc|desc``. Do not
+    send ``?descending=true`` — that is not a query parameter; use
+    ``order=desc`` instead. :attr:`descending` is a service-layer
+    convenience property only.
     """
 
     sort: str | None = Field(
@@ -196,7 +225,7 @@ class SortParams(QueryParams):
     )
     order: SortOrder = Field(
         default=SortOrder.DESC,
-        description="Sort direction.",
+        description="Sort direction: 'asc' or 'desc'.",
         examples=[SortOrder.DESC.value],
     )
 
@@ -210,7 +239,10 @@ class SortParams(QueryParams):
 
     @property
     def descending(self) -> bool:
-        """Convenience boolean for service-layer use."""
+        """Convenience boolean for service-layer use.
+
+        Not a query parameter name. Derived from :attr:`order`.
+        """
         return self.order == SortOrder.DESC
 
 
@@ -247,11 +279,20 @@ class LibraryQueryParams(QueryParams):
     ids of the filter chips it has activated, and the service maps them to
     DB predicates. ``manga_status`` / ``language`` / ``search`` are
     convenience shortcuts for the most common filters.
+
+    **``filters`` uses query-param repetition**:
+    ``?filters=unread&filters=reading``. FastAPI parses repeated params
+    into a list. CSV (``?filters=unread,reading``) is **not** parsed by
+    the framework — use :func:`parse_csv_query` in the router if that
+    convention is required.
     """
 
     filters: list[str] = Field(
         default_factory=list,
-        description="Filter ids (data-driven, client-defined).",
+        max_length=MAX_LIST_QUERY_ITEMS,
+        description="Filter ids (data-driven, client-defined). "
+                    f"Repeat the param (max {MAX_LIST_QUERY_ITEMS} items): "
+                    "`?filters=unread&filters=reading`.",
         examples=[["unread", "reading"]],
     )
     manga_status: MangaStatus | None = Field(
@@ -287,12 +328,21 @@ class LibraryQueryParams(QueryParams):
 
 
 class DownloadQueryParams(QueryParams):
-    """Resource-specific filters for ``GET /api/v1/download``."""
+    """Resource-specific filters for ``GET /api/v1/download``.
 
-    status: list[DownloadStatus] = Field(
-        default_factory=list,
-        description="Filter by status. Empty list = all statuses.",
-        examples=[["running", "pending"]],
+    The :attr:`status` filter is a **single** status. Multi-status
+    filtering (e.g. "running or pending") is done via the ``?status=``
+    filter combined with the caller's own client-side merge, or via a
+    dedicated bulk endpoint if the deployment needs it. Keeping the API
+    contract single-value avoids the "list vs scalar" ambiguity that
+    FastAPI's ``list[T]`` supports differently from a scalar ``T``
+    depending on whether the client uses repetition or CSV.
+    """
+
+    status: DownloadStatus | None = Field(
+        default=None,
+        description="Filter by status. ``null`` = all statuses.",
+        examples=[DownloadStatus.RUNNING.value],
     )
     manga_id: str | None = Field(
         default=None,
@@ -302,17 +352,6 @@ class DownloadQueryParams(QueryParams):
         default=None,
         description="Restrict to tasks belonging to this chapter.",
     )
-
-    @field_validator("status")
-    @classmethod
-    def _dedupe(cls, v: list[DownloadStatus]) -> list[DownloadStatus]:
-        seen: set[DownloadStatus] = set()
-        out: list[DownloadStatus] = []
-        for s in v:
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
 
 
 class ChapterQueryParams(QueryParams):
@@ -371,6 +410,10 @@ def parse_csv_query(value: str | None) -> list[str]:
 
     Empty items are dropped; surrounding whitespace is stripped. ``None``
     or an empty string yields ``[]``.
+
+    Note: this parses a **single** string value. If the transport
+    supports repeated parameters (``?tag=a&tag=b``), FastAPI's native
+    ``list[str]`` field type parses that form directly — use it instead.
     """
     if not value:
         return []

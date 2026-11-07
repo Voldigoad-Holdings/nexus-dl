@@ -77,6 +77,11 @@ Design decisions
   ``BaseException`` subclass, so the ``except Exception`` clause does
   not catch it. Cancellation always propagates. No special-casing
   required.
+* **Predicate and backoff exceptions are surfaced, not swallowed.** A
+  buggy ``retry_on`` predicate or ``backoff`` strategy would otherwise
+  replace the operation's exception with its own, making the real
+  failure invisible. Both are wrapped so that the original exception
+  stays chained as ``__cause__`` in the traceback the caller sees.
 
 Non-goals
 ---------
@@ -466,7 +471,7 @@ class RetryPolicy:
         max_elapsed_seconds: Optional wall-clock budget, from the start
             of the first attempt. When the budget is exhausted (checked
             **before** sleeping between attempts — see
-            :func:`retry_async`), the loop raises
+            :func:`_check_time_budget`), the loop raises
             :class:`~nexusdl.core.exceptions.RetryTimeoutError` with the
             last exception chained as ``__cause__``. ``None`` means "no
             wall-clock budget" — the loop is bounded only by
@@ -523,13 +528,48 @@ class RetryPolicy:
 def _should_retry(policy: RetryPolicy, exc: Exception) -> bool:
     """Return ``True`` iff *exc* warrants a retry under *policy*.
 
+    If the caller-supplied predicate raises, the raised exception is
+    chained (``__cause__``) to *exc* and propagates — a buggy predicate
+    must not silently replace the operation's real error.
+
     Args:
         policy: The active policy.
         exc: The exception raised by the operation.
+
+    Raises:
+        Exception: Whatever the predicate raised. Chained to *exc* via
+            ``from`` so the caller's traceback shows both the real
+            operation error and the predicate bug.
     """
     if policy.retry_on is None:
         return True
-    return policy.retry_on(exc)
+    try:
+        return policy.retry_on(exc)
+    except Exception as predicate_exc:
+        raise predicate_exc from exc
+
+
+def _compute_delay(
+    policy: RetryPolicy, attempt: int, last_exc: Exception
+) -> float:
+    """Return the delay to sleep before the next attempt.
+
+    If the caller-supplied strategy raises, the raised exception is
+    chained to *last_exc* and propagates — a buggy strategy must not
+    silently replace the operation's real error.
+
+    Args:
+        policy: The active policy.
+        attempt: 1-based index of the attempt that just failed.
+        last_exc: The exception that just failed.
+
+    Raises:
+        Exception: Whatever the strategy raised. Chained to *last_exc*.
+    """
+    try:
+        return policy.backoff(attempt)
+    except Exception as strategy_exc:
+        raise strategy_exc from last_exc
 
 
 def _check_time_budget(
@@ -542,8 +582,14 @@ def _check_time_budget(
 
     Called **after** an attempt has failed and **before** sleeping.
     Sleeping past the budget only to raise immediately wastes the wait;
-    raising at the point where the wait would exceed the budget gives
-    the caller the same error message without the wasted time.
+    raising at the point where the wait would *strictly* exceed the
+    budget gives the caller the same error message without the wasted
+    time.
+
+    Boundary: ``elapsed + delay == max_elapsed_seconds`` is accepted —
+    the sleep finishes exactly at the budget, which is what the caller
+    asked for ("retry for up to 30 s"). Only ``elapsed + delay >
+    max_elapsed_seconds`` triggers the error.
 
     Args:
         policy: The active policy.
@@ -553,12 +599,12 @@ def _check_time_budget(
             :class:`RetryTimeoutError`).
 
     Raises:
-        RetryTimeoutError: If ``elapsed + delay >= max_elapsed_seconds``.
+        RetryTimeoutError: If ``elapsed + delay > max_elapsed_seconds``.
     """
     if policy.max_elapsed_seconds is None:
         return
     elapsed = time.monotonic() - started_at
-    if elapsed + delay >= policy.max_elapsed_seconds:
+    if elapsed + delay > policy.max_elapsed_seconds:
         raise RetryTimeoutError(
             f"retry budget of {policy.max_elapsed_seconds}s exceeded "
             f"after {elapsed:.2f}s of elapsed time "
@@ -592,11 +638,14 @@ async def retry_async(
       If it returns ``False``, the exception is re-raised unchanged.
     * If ``max_attempts`` is reached, the last exception is re-raised.
     * If the wall-clock budget (``max_elapsed_seconds``) would be
-      exceeded by sleeping the computed backoff, a
+      strictly exceeded by sleeping the computed backoff, a
       :class:`~nexusdl.core.exceptions.RetryTimeoutError` is raised
       with the last exception chained as ``__cause__``.
     * ``asyncio.CancelledError`` is never caught — cancellation always
       propagates.
+    * A buggy ``retry_on`` predicate or ``backoff`` strategy is
+      surfaced (chained to the operation's exception) rather than
+      silently swallowing the original error.
 
     Args:
         operation: The operation to run. Called once per attempt.
@@ -612,6 +661,8 @@ async def retry_async(
         RetryTimeoutError: If the wall-clock budget is exceeded.
         Exception: The last exception raised by *operation*, unchanged,
             when retries are exhausted or ``retry_on`` returns ``False``.
+            A predicate/backoff failure is chained onto it via
+            ``__cause__``.
         asyncio.CancelledError: Always propagates.
     """
     pol = policy if policy is not None else RetryPolicy()
@@ -627,7 +678,7 @@ async def retry_async(
                 raise
             if attempt >= pol.max_attempts:
                 raise
-            delay = pol.backoff(attempt)
+            delay = _compute_delay(pol, attempt, exc)
             _check_time_budget(pol, started_at, delay, exc)
             await asyncio.sleep(delay)
 
@@ -662,6 +713,8 @@ def retry_sync(
         RetryTimeoutError: If the wall-clock budget is exceeded.
         Exception: The last exception raised by *operation*, unchanged,
             when retries are exhausted or ``retry_on`` returns ``False``.
+            A predicate/backoff failure is chained onto it via
+            ``__cause__``.
     """
     pol = policy if policy is not None else RetryPolicy()
     started_at = time.monotonic()
@@ -676,6 +729,6 @@ def retry_sync(
                 raise
             if attempt >= pol.max_attempts:
                 raise
-            delay = pol.backoff(attempt)
+            delay = _compute_delay(pol, attempt, exc)
             _check_time_budget(pol, started_at, delay, exc)
             time.sleep(delay)

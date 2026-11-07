@@ -26,10 +26,10 @@ Three protocols, three concerns
 * :class:`HttpSessionProtocol` — the **minimal HTTP surface** parsers
   need. A concrete
   :class:`~nexusdl.core.session.http_session.HttpSession` satisfies it
-  structurally; so does every test double. It deliberately declares only
-  the four methods that a parser realistically uses — ``get``,
-  ``get_html``, ``get_json``, ``stream_download`` — so a test double only
-  has to implement what it actually exercises.
+  structurally; so does every test double. It declares only the five
+  methods that a parser realistically uses — ``get``, ``post``,
+  ``get_html``, ``get_json``, ``stream_download`` — so a test double
+  only has to implement what it actually exercises.
 * :class:`ParserProtocol` — the **complete parser surface** as consumed
   by :mod:`nexusdl.core`. It is the union of every method that any core
   module calls:
@@ -58,7 +58,7 @@ Three protocols, three concerns
 
 Name aliases
 ------------
-Two names are exported for each of the two main protocols:
+Two names are exported for the HTTP protocol:
 
 * :class:`HttpSessionProtocol` (canonical) and :data:`HttpSession`
   (alias, imported by :mod:`nexusdl.core.registry.site_registry` under
@@ -95,6 +95,35 @@ The rule of thumb across the codebase:
   can share them and a parser author has one canonical target to
   satisfy.
 
+.. warning::
+   **Contract note on :meth:`ParserProtocol.search`.**
+
+   The signature below declares ``search`` as returning a
+   :class:`~nexusdl.core.models.search.SearchResultPage` object
+   (``await parser.search(...)``). However,
+   :meth:`~nexusdl.core.registry.site_registry.SiteRegistry.search_all`
+   in ``site_registry.py`` was written against an **async-generator**
+   contract (``async for hit in parser.search(...)``). The two cannot
+   both be right for the same implementation:
+
+   * If the shipped ``BaseParser.search`` returns a
+     ``SearchResultPage``, then ``site_registry.search_all`` must
+     ``await`` the call before iterating its ``.items`` — and the
+     adapter ``_call_parser_search`` there (added to support both
+     shapes defensively) is doing work that is not necessary.
+   * If the shipped ``BaseParser.search`` is an ``async generator``
+     (yielding individual ``SearchResult`` objects), then this
+     protocol's return type is **wrong** and should be
+     ``AsyncIterator[SearchResult]`` — a change that would make
+     ``site_registry.search_all`` (as shipped) the correct
+     implementation and this docstring the one that is behind.
+
+   **Verify against ``parsers/base.py::BaseParser.search`` in the next
+   audit and align the two files in the same commit.** The rest of this
+   module is unaffected by the choice — only ``search``'s return
+   annotation and the corresponding code path in ``search_all`` depend
+   on it.
+
 Why the protocols are not ``@runtime_checkable``
 ------------------------------------------------
 :class:`ParserProtocol` declares data members (``site``, ``site_id``)
@@ -130,7 +159,7 @@ matters because it sits on the critical path of
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -152,6 +181,14 @@ __all__ = [
 ]
 
 
+#: Signature of the progress callback accepted by
+#: :meth:`HttpSessionProtocol.stream_download`. Called once per chunk
+#: with ``(bytes_downloaded, bytes_total_or_-1)`` — the same convention
+#: :mod:`tqdm` and :mod:`rich.progress` use, and the one the image
+#: downloader and the worker already expect.
+ProgressCallback = Callable[[int, int], None]
+
+
 # --------------------------------------------------------------------------- #
 # HttpSessionProtocol                                                         #
 # --------------------------------------------------------------------------- #
@@ -162,13 +199,13 @@ class HttpSessionProtocol(Protocol):
 
     Satisfied structurally by
     :class:`~nexusdl.core.session.http_session.HttpSession` and by any
-    test double that implements the four methods below. Parsers accept an
+    test double that implements the five methods below. Parsers accept an
     ``HttpSessionProtocol`` — never a concrete ``HttpSession`` — so a
     test that constructs a parser against a fake session does not have to
     stand up the full session machinery (rate limiter, circuit breaker,
     cookie manager, cache, …).
 
-    The four methods are the only operations a parser realistically
+    The five methods are the only operations a parser realistically
     performs on a session. Anything else (circuit-breaker introspection,
     cookie mutation, cache control) is a session-layer concern that a
     parser must not reach into — exposing those would be a leak of the
@@ -182,14 +219,42 @@ class HttpSessionProtocol(Protocol):
         url: str,
         *,
         headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         timeout: float | None = None,
-        **kwargs: Any,
     ) -> httpx.Response:
         """Perform a GET request and return the raw response.
 
         Used when a parser needs to inspect status code, headers, or
         stream the response body itself (Cloudflare mixin, image
         streaming with per-chunk progress, …).
+
+        The four keyword arguments mirror the corresponding parameters
+        of :meth:`httpx.AsyncClient.get`, minus the ones that would
+        let a parser bypass the session's own policy (rate limiting,
+        circuit breaker, retries). Anything else a caller needs is a
+        session concern, not a parser concern.
+        """
+        ...
+
+    async def post(
+        self,
+        url: str,
+        *,
+        data: Any = None,
+        json: Any = None,
+        headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        """Perform a POST request and return the raw response.
+
+        Used by parsers that drive a form login, a JSON-based API, or a
+        search endpoint that requires a body. The session layer applies
+        the same rate limiting, circuit breaker, and retry policy as
+        :meth:`get` — the choice of HTTP verb does not change the
+        pipeline's safety envelope.
         """
         ...
 
@@ -198,8 +263,9 @@ class HttpSessionProtocol(Protocol):
         url: str,
         *,
         headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         timeout: float | None = None,
-        **kwargs: Any,
     ) -> str:
         """Perform a GET request and return the response body as text.
 
@@ -212,8 +278,9 @@ class HttpSessionProtocol(Protocol):
         url: str,
         *,
         headers: dict[str, str] | None = None,
+        params: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         timeout: float | None = None,
-        **kwargs: Any,
     ) -> Any:
         """Perform a GET request and decode the body as JSON.
 
@@ -227,15 +294,22 @@ class HttpSessionProtocol(Protocol):
         url: str,
         dest: Path,
         *,
-        on_progress: Any = None,
+        on_progress: ProgressCallback | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Stream *url* into the file at *dest*.
 
-        *on_progress* is typed as ``Any`` rather than the actual callback
-        signature because different call sites use different progress
-        shapes (image downloader uses ``(bytes, total)``, the worker uses
-        a no-op, …) — the session's implementation decides what it emits,
-        and the type system does not need to constrain it here.
+        ``on_progress`` follows the :data:`ProgressCallback` convention
+        — ``(bytes_downloaded, bytes_total_or_-1)`` — the same shape
+        :mod:`tqdm` and :mod:`rich.progress` expect, and the one the
+        image downloader and the worker already consume. A caller that
+        does not care about progress passes ``None``.
+
+        ``headers``, ``cookies``, and ``timeout`` mirror
+        :meth:`get` — a streaming download often needs the same auth
+        headers and per-site timeout as a regular GET.
         """
         ...
 
@@ -319,6 +393,15 @@ class ParserProtocol(Protocol):
         :class:`~nexusdl.core.exceptions.ParserResponseError` — the
         registry's eligibility filter normally prevents the call, but a
         defensive raise is allowed.
+
+        .. warning::
+           The return type and the ``await``-vs-``async for``
+           consumption differ between this protocol and the current
+           implementation of
+           :meth:`~nexusdl.core.registry.site_registry.SiteRegistry.search_all`.
+           Verify against ``parsers/base.py::BaseParser.search`` before
+           relying on either shape. See the module docstring's contract
+           note.
 
         Args:
             query: The user-supplied query string, verbatim.

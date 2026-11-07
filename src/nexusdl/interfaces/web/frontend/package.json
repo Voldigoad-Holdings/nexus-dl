@@ -9,6 +9,7 @@
     "pnpm": ">=9.0.0"
   },
   "packageManager": "pnpm@9.12.3",
+  "sideEffects": false,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -29,7 +30,6 @@
     "react-dom": "^18.3.1",
     "sonner": "^1.7.0",
     "tailwind-merge": "^2.5.4",
-    "tailwindcss-animate": "^1.0.7",
     "zustand": "^5.0.1"
   },
   "devDependencies": {
@@ -46,6 +46,7 @@
     "prettier": "^3.3.3",
     "prettier-plugin-tailwindcss": "^0.6.8",
     "tailwindcss": "^3.4.14",
+    "tailwindcss-animate": "^1.0.7",
     "typescript": "~5.5.4"
   },
   "browserslist": {

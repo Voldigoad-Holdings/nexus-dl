@@ -36,6 +36,37 @@ user returns **404** (never 403) — the server does not leak the
 existence of other users' tasks. Admins bypass the ownership check (via
 :func:`~..security.role_at_least`), which is required for moderation.
 
+**Ownership is fail-closed.** When a task object does not expose any of
+``requested_by`` / ``user_id`` / ``owner_id``, the router treats it as
+**foreign** and returns 404 (except for admins). This is a deliberate
+departure from "single-user deployments without ownership tracking"
+— the previous behaviour (returning ``True``) turned a missing domain
+attribute into a cross-user access vulnerability.
+
+Service-side scoping
+====================
+
+Where the service accepts ``user_id`` as a keyword (``list_tasks``,
+``get_task``, ``pause_all``, …), the router forwards it so the DB layer
+can scope the query. Where it does **not**, the router refuses the
+request rather than silently running a global operation:
+
+* **Bulk operations** (``pause-all``, ``resume-all``, ``cancel-all``,
+  ``clear-finished``) require a service method that accepts ``user_id``.
+  A service that only exposes ``pause_all()`` (global) is rejected with
+  500 — the composition root must supply a user-scoped bulk method.
+  This prevents an unprivileged user from pausing every other user's
+  tasks (which is exactly what the previous silent-drop behaviour did).
+
+* **``delete_files=true``** requires the service's ``forget`` method to
+  accept ``delete_files`` as a keyword. If it does not, the router
+  returns **400** — never a fake success message claiming files were
+  deleted.
+
+Silent kwarg filtering is **only** used for optional, non-safety
+keywords. Safety-relevant keywords (``user_id``, ``delete_files``) are
+checked explicitly with :func:`_require_kwarg_support`.
+
 Status transitions
 ==================
 
@@ -69,13 +100,14 @@ Any method may be sync or async (``inspect.isawaitable`` handles both).
 * **Get**: ``get_task(task_id)``, ``get(task_id)``.
 * **Pause / resume / cancel / retry**: ``pause(task_id)``,
   ``pause_task(task_id)``, etc. Return the updated task, or ``None``.
-* **Bulk**: ``pause_all()``, ``resume_all()``, ``cancel_all()``,
-  ``forget_all_terminal()``. Return the count of affected tasks (or
-  ``None``).
+* **Bulk**: ``pause_all(user_id=...)``, ``resume_all(user_id=...)``,
+  ``cancel_all(user_id=...)``, ``forget_all_terminal(user_id=...)``.
+  **Must** accept ``user_id`` — see "Service-side scoping" above.
+  Return the count of affected tasks (or ``None``).
 * **Queue state**: ``is_queue_paused()`` method or ``queue_paused``
   attribute.
-* **Counts**: ``counts(...)`` (preferred) **or** fall back to a full
-  unfiltered list and :func:`compute_status_counts`.
+* **Counts**: ``counts(user_id=...)`` (preferred) **or** fall back to a
+  full unfiltered list and :func:`compute_status_counts`.
 """
 from __future__ import annotations
 
@@ -87,7 +119,7 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from loguru import logger as _logger
 
-from nexusdl.core.models.enums import DownloadStatus, UserRole
+from nexusdl.core.models.enums import DownloadStatus, Priority, UserRole
 
 from ..dependencies import CurrentUser, ServicesDep
 from ..schemas.common import DownloadQueryParams
@@ -123,6 +155,10 @@ _RESUMABLE: frozenset[DownloadStatus] = frozenset({DownloadStatus.PAUSED})
 _RETRIABLE: frozenset[DownloadStatus] = frozenset(
     {DownloadStatus.FAILED, DownloadStatus.CANCELLED}
 )
+
+#: Keywords whose silent drop by :func:`_filter_kwargs` would be a
+#: security-relevant bug. Any of these dropped triggers a rejection.
+_SAFETY_KEYWORDS: frozenset[str] = frozenset({"user_id", "delete_files"})
 
 
 # ===========================================================================
@@ -438,8 +474,6 @@ async def pause_download(
             exc, context=f"pause task {task_id}"
         ) from exc
 
-    # Some services return ``None`` on success — refetch to get the
-    # post-transition state. Otherwise use the returned task directly.
     if result is None:
         return _to_task_schema(
             await _get_owned_task(
@@ -561,6 +595,10 @@ async def retry_download(
     ),
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "Task not found."},
+        status.HTTP_400_BAD_REQUEST: {
+            "description": "`delete_files=true` is not supported by this "
+                           "deployment's download service.",
+        },
     },
 )
 async def delete_download(
@@ -581,6 +619,16 @@ async def delete_download(
     task = await _get_owned_task(task_id, payload=payload, services=services)
     previous_status = _task_status(task)
     was_active = previous_status not in _TERMINAL
+
+    # Refuse early if the caller requested file deletion but the
+    # service does not support it — better than lying about success.
+    if delete_files:
+        _require_kwarg_support(
+            services.downloader,
+            ("forget", "forget_task", "remove", "remove_task", "delete"),
+            "delete_files",
+            context="delete download files",
+        )
 
     # Cancel if still active, forget in either case.
     try:
@@ -640,15 +688,17 @@ async def _get_owned_task(
     A task that does not exist and a task owned by another user both
     produce the same 404 — no existence leak. Admins bypass the
     ownership check (necessary for moderation tooling).
+
+    **Ownership is fail-closed**: a task object with no owner attribute
+    is treated as foreign (404) unless the caller is an admin. This
+    prevents a missing domain attribute from silently granting
+    cross-user access.
     """
     try:
         task = await _invoke_service(
             services.downloader,
             ("get_task", "get"),
             task_id,
-            # Pass the user id where possible; services that scope in
-            # the DB will then return ``None`` for foreign tasks. Services
-            # that do not scope still get the post-fetch check below.
             user_id=_uid(payload),
         )
     except Exception as exc:
@@ -668,15 +718,17 @@ async def _get_owned_task(
 def _task_belongs_to(task: Any, user_id: str) -> bool:
     """Return whether ``task`` is owned by ``user_id``.
 
-    Looks for the common owner attribute names; a task with no owner
-    attribute is treated as belonging to the caller (single-user
-    deployments without ownership tracking).
+    Looks for the common owner attribute names. **A task with no owner
+    attribute is treated as belonging to NOBODY** — the router returns
+    404 for non-admins. Prior behaviour (``return True``) granted
+    cross-user access whenever the domain object omitted the owner
+    attribute; that turned a missing field into a security bug.
     """
     for attr in ("requested_by", "user_id", "owner_id"):
         owner = getattr(task, attr, None)
         if owner is not None:
             return str(owner) == user_id
-    return True
+    return False
 
 
 def _is_admin(payload: CurrentUser) -> bool:
@@ -694,8 +746,10 @@ def _is_admin(payload: CurrentUser) -> bool:
 def _task_status(task: Any) -> DownloadStatus:
     """Return the task's status, coerced to :class:`DownloadStatus`.
 
-    Falls back to :attr:`DownloadStatus.PENDING` for malformed values
-    (defensive — never raises from a status read).
+    Raises a 500 on malformed values — a status that does not parse is
+    a **domain bug**, not a client error. Prior behaviour silently fell
+    back to ``PENDING``, which allowed invalid transitions to be
+    attempted and produced confusing 502 responses downstream.
     """
     raw = getattr(task, "status", None)
     if isinstance(raw, DownloadStatus):
@@ -703,7 +757,19 @@ def _task_status(task: Any) -> DownloadStatus:
     try:
         return DownloadStatus(str(raw))
     except (ValueError, TypeError):
-        return DownloadStatus.PENDING
+        _log.error(
+            "download task has malformed status: {!r} (type: {})",
+            raw,
+            type(raw).__name__,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Download task has an invalid status. "
+                "This is a server-side bug.",
+            ).model_dump(),
+        )
 
 
 def _invalid_transition(
@@ -741,12 +807,21 @@ async def _invoke_service(
     :func:`inspect.signature`), awaits if the result is awaitable, and
     raises :class:`AttributeError` if no method exists (translated by the
     caller via :func:`_translate_service_error`).
+
+    **Safety-relevant keywords** (``_SAFETY_KEYWORDS``) are checked
+    explicitly: if such a keyword is dropped because the target does
+    not accept it, the call is refused with 500. Silently dropping
+    ``user_id`` would let a bulk operation escalate to global scope;
+    silently dropping ``delete_files`` would let a fake success reach
+    the client.
     """
     method = None
+    method_name = ""
     for name in names:
         candidate = getattr(service, name, None)
         if callable(candidate):
             method = candidate
+            method_name = name
             break
     if method is None:
         raise AttributeError(
@@ -754,10 +829,55 @@ async def _invoke_service(
         )
 
     filtered_kwargs = _filter_kwargs(method, kwargs)
+    _enforce_safety_keywords(
+        method, method_name, kwargs, filtered_kwargs,
+    )
+
     result = method(*args, **filtered_kwargs)
     if inspect.isawaitable(result):
         result = await result
     return result
+
+
+def _enforce_safety_keywords(
+    method: Any,
+    method_name: str,
+    requested: Mapping[str, Any],
+    filtered: Mapping[str, Any],
+) -> None:
+    """Reject calls where a safety keyword was silently dropped.
+
+    Called from :func:`_invoke_service` after :func:`_filter_kwargs`.
+    Checks ``_SAFETY_KEYWORDS``: if the caller passed one of them and
+    the filter removed it, the target method does not accept the safety
+    parameter — running it anyway would degrade the operation.
+    """
+    for key in _SAFETY_KEYWORDS:
+        if key in requested and key not in filtered:
+            _log.error(
+                "download service method {!r} does not accept safety "
+                "keyword {!r}; refusing the call",
+                method_name,
+                key,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=error_response(
+                    ErrorCode.INTERNAL_ERROR,
+                    f"The download service does not support the "
+                    f"{key!r} parameter required for this operation.",
+                    details={
+                        "method": method_name,
+                        "missing_keyword": key,
+                        "hint": (
+                            "The composition root must supply a "
+                            "method that accepts this keyword, "
+                            "or the request must be refused for "
+                            "safety."
+                        ),
+                    },
+                ).model_dump(),
+            )
 
 
 async def _safe_await(
@@ -790,6 +910,10 @@ def _filter_kwargs(method: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
     On ``ValueError`` (e.g. builtins with no signature), returns the
     kwargs as-is — a potential ``TypeError`` there is caught by
     :func:`_translate_service_error`.
+
+    Safety-relevant keywords (``_SAFETY_KEYWORDS``) are checked by
+    :func:`_enforce_safety_keywords` in the caller; this function
+    filters them like any other.
     """
     try:
         sig = inspect.signature(method)
@@ -811,10 +935,62 @@ def _filter_kwargs(method: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in accepted}
 
 
+def _require_kwarg_support(
+    service: Any,
+    names: Sequence[str],
+    keyword: str,
+    *,
+    context: str,
+) -> None:
+    """Raise 400 if none of ``names`` accepts ``keyword``.
+
+    Used for ``delete_files``: the router refuses early rather than
+    sending a request that a service will silently ignore, or than
+    faking success with a message that claims files were deleted.
+    """
+    for name in names:
+        method = getattr(service, name, None)
+        if not callable(method):
+            continue
+        try:
+            sig = inspect.signature(method)
+        except (ValueError, TypeError):
+            # Cannot introspect — assume the contract holds.
+            return
+        # ``**kwargs`` accepts anything.
+        for p in sig.parameters.values():
+            if p.kind is inspect.Parameter.VAR_KEYWORD:
+                return
+        if keyword in sig.parameters:
+            return
+    _log.warning(
+        "{}: none of {} accepts {!r}",
+        context, names, keyword,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=error_response(
+            ErrorCode.VALIDATION_ERROR,
+            f"This deployment does not support `{keyword}=true`.",
+            details={
+                "keyword": keyword,
+                "supported_methods": list(names),
+            },
+        ).model_dump(),
+    )
+
+
 async def _bulk_op(
     services: ServicesDep, name: str, *, user_id: str
 ) -> int:
-    """Run a bulk operation, returning the number of affected tasks."""
+    """Run a bulk operation, returning the number of affected tasks.
+
+    **Requires the service to accept ``user_id``.** A service that only
+    exposes a global ``pause_all()`` (no user scoping) would affect
+    every user's queue — that is a security regression, so
+    :func:`_invoke_service` will reject the call via
+    :func:`_enforce_safety_keywords` if ``user_id`` is not accepted.
+    """
     try:
         result = await _invoke_service(
             services.downloader, (name,), user_id=user_id
@@ -842,7 +1018,17 @@ def _normalize_tasks_result(raw: Any) -> list[Any]:
         return list(raw[0] or [])
     items = getattr(raw, "items", None)
     if items is not None:
-        return list(items or [])
+        # ``items`` may be an attribute (the common case) or a method
+        # (rare but legal — some "paginated result" wrappers expose
+        # ``.items()``). Normalize both.
+        try:
+            items = items() if callable(items) else items
+        except Exception:
+            items = None
+        try:
+            return list(items or [])
+        except TypeError:
+            return []
     try:
         return list(raw)
     except TypeError:
@@ -872,8 +1058,21 @@ def _to_task_schema(task: Any) -> DownloadTaskSchema:
     ``speed_bps``, ``requested_by`` vs ``user_id``, …). Each field has a
     safe default so a partial task never 500s the endpoint.
     """
+    raw_id = _get(task, "id", "task_id", default=None)
+    if raw_id is None:
+        _log.error(
+            "download task has no id (type: {})", type(task).__name__
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Download task is missing an id. This is a server-side bug.",
+            ).model_dump(),
+        )
+
     return DownloadTaskSchema(
-        task_id=str(_get(task, "id", "task_id", default="")),
+        task_id=str(raw_id),
         manga_id=_maybe_str(_get(task, "manga_id")),
         manga_title=str(_get(task, "manga_title", default="")),
         chapter_id=_maybe_str(_get(task, "chapter_id")),
@@ -881,7 +1080,7 @@ def _to_task_schema(task: Any) -> DownloadTaskSchema:
         site_id=str(_get(task, "site_id", default="")),
         site_name=str(_get(task, "site_name", default="")),
         status=_task_status(task),
-        priority=_get(task, "priority", default=None) or _default_priority(),
+        priority=_get(task, "priority", default=None) or Priority.NORMAL,
         completed=int(_get(task, "completed", default=0) or 0),
         total=_maybe_int(_get(task, "total")),
         bytes_completed=int(
@@ -908,22 +1107,37 @@ async def _full_queue_counts(
 ) -> dict[str, int]:
     """Return ``{status: count}`` across the caller's **entire** queue.
 
-    Prefers a dedicated ``counts()`` method when available. Falls back to
-    a full unfiltered list + :func:`compute_status_counts`, and finally
-    to an empty dict with per-status zeros if neither exists (readiness
-    over correctness — the response stays well-formed).
+    Prefers a dedicated ``counts(user_id=...)`` method when available
+    **and accepts the ``user_id`` keyword**. Falls back to a full
+    unfiltered list + :func:`compute_status_counts`.
+
+    A ``counts()`` method that does not accept ``user_id`` returns a
+    **global** count — that is a privacy leak (a user learns how many
+    tasks exist on the whole server), so we skip it in favour of the
+    local fallback.
     """
-    # 1) Dedicated method.
+    # 1) Dedicated method — only if it accepts user_id.
     counts_fn = getattr(services.downloader, "counts", None)
     if callable(counts_fn):
+        accepts_user = False
         try:
-            result = counts_fn(user_id=user_id)
-            if inspect.isawaitable(result):
-                result = await result
-            if isinstance(result, Mapping):
-                return {str(k): int(v) for k, v in result.items()}
-        except Exception:
-            _log.exception("download.counts() raised")
+            sig = inspect.signature(counts_fn)
+            accepts_user = "user_id" in sig.parameters or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            # Cannot introspect; assume it accepts user_id.
+            accepts_user = True
+        if accepts_user:
+            try:
+                result = counts_fn(user_id=user_id)
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, Mapping):
+                    return {str(k): int(v) for k, v in result.items()}
+            except Exception:
+                _log.exception("download.counts() raised")
 
     # 2) Fallback: full unfiltered list.
     try:
@@ -981,6 +1195,11 @@ def _translate_service_error(
     * Anything else → **502** (bad gateway — the parser or a subsystem
       failed on the upstream side)
     """
+    # If the caller already raised an HTTPException, preserve it — it
+    # was deliberately constructed (e.g. by :func:`_enforce_safety_keywords`).
+    if isinstance(exc, HTTPException):
+        return exc
+
     name = type(exc).__name__
     msg = str(exc) or name
 
@@ -1043,7 +1262,7 @@ def _translate_service_error(
 
 def _uid(payload: CurrentUser) -> str:
     """Return the caller's user id, raising 401 if somehow absent."""
-    if not payload or not payload.sub:
+    if not getattr(payload, "sub", None):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=error_response(
@@ -1087,12 +1306,6 @@ def _maybe_float(value: Any) -> float | None:
         return None
 
 
-def _default_priority() -> Any:
-    """Import lazily to keep the module importable without the enum."""
-    from nexusdl.core.models.enums import Priority  # noqa: PLC0415
-    return Priority.NORMAL
-
-
 # ===========================================================================
 # Self-audit checklist
 # ===========================================================================
@@ -1102,6 +1315,9 @@ def _default_priority() -> Any:
 # [ ] Any new per-task endpoint uses :func:`_get_owned_task` — never
 #     fetches the task directly. This is the single ownership choke
 #     point; bypassing it would create a cross-user access bug.
+# [ ] ``_task_belongs_to`` defaults to ``False`` for unknown owner
+#     attributes. Do not change this without a coordinated migration of
+#     every deployment that relies on the fallback.
 # [ ] Any new status transition is a member of the relevant status set
 #     (``_PAUSABLE``, ``_RESUMABLE``, ``_RETRIABLE``) or documents why it
 #     does not fit.
@@ -1111,6 +1327,11 @@ def _default_priority() -> Any:
 # [ ] New service method names are added to the corresponding names list
 #     passed to :func:`_invoke_service`. Do not call ``getattr`` directly
 #     in a handler.
+# [ ] Any new safety-relevant keyword (``user_id``, ``delete_files``, …)
+#     is added to ``_SAFETY_KEYWORDS`` so
+#     :func:`_enforce_safety_keywords` refuses silent drops.
+# [ ] Any new bulk operation method must accept ``user_id`` —
+#     :func:`_enforce_safety_keywords` will reject the call otherwise.
 # [ ] New return shapes are handled in :func:`_normalize_tasks_result`
 #     or :func:`_extract_task_id` — never ``model_validate`` a raw
 #     service result.

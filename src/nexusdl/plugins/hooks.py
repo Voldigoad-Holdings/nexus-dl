@@ -35,6 +35,22 @@ two files: this one and :mod:`nexusdl.plugins.api`. Every other module in
 the package adapts automatically, and :func:`verify_protocol_consistency`
 guarantees the two stay in sync.
 
+Single source of truth
+----------------------
+Two representations of the hook set coexist in this module:
+
+* the six ``HOOK_ON_*`` **string constants**, each annotated
+  ``Final[HookName]`` so that renaming a constant without updating
+  :data:`HookName` fails under ``mypy --strict``; and
+* :data:`HookName`, a ``Literal`` union that is the compiler-visible
+  contract for anything that takes "a hook" as a parameter.
+
+These two cannot be mechanically derived from each other — Python's
+``Literal`` is a static construct, while the constants are runtime values
+— so :func:`verify_protocol_consistency` also asserts
+``set(get_args(HookName)) == ALL_HOOK_NAMES``. That check is what turns a
+silent drift between the two representations into a CI failure.
+
 Dependency graph (no cycles)::
 
     core.exceptions.PluginError
@@ -52,7 +68,13 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, Literal, TypeAlias
+from typing import (
+    Final,
+    Literal,
+    TypeAlias,
+    TypeGuard,
+    get_args,
+)
 
 from nexusdl.core.exceptions import PluginError
 
@@ -93,32 +115,38 @@ __all__ = [
 # These literals are the source of truth. Never write "on_load" (or any other
 # hook name) as a string literal elsewhere in the codebase — import the
 # constant instead.
+#
+# Each constant is annotated ``Final[HookName]`` so that renaming it to a
+# value not present in ``HookName`` below fails under ``mypy --strict``. The
+# reverse direction (adding a name to ``HookName`` without a constant) is
+# caught by :func:`verify_protocol_consistency` at test time.
 # --------------------------------------------------------------------------- #
 
-HOOK_ON_LOAD: Final = "on_load"
-HOOK_ON_UNLOAD: Final = "on_unload"
-HOOK_ON_BEFORE_DOWNLOAD: Final = "on_before_download"
-HOOK_ON_AFTER_DOWNLOAD: Final = "on_after_download"
-HOOK_ON_PAGE_DOWNLOADED: Final = "on_page_downloaded"
-HOOK_ON_ERROR: Final = "on_error"
-
-
 #: Closed union of every hook name. Used wherever a function takes or returns
-#: "a hook" so ``mypy --strict`` catches typos at compile time. It mirrors the
-#: six constants above; :func:`verify_protocol_consistency` does **not** check
-#: this alias directly, but the fact that :data:`HOOK_SPECS` uses ``HookName``
-#: as its ``name`` field type means a mismatch is caught by mypy.
+#: "a hook" so ``mypy --strict`` catches typos at compile time.
+#:
+#: Kept in **alphabetical** order (``on_after_download`` first) so that
+#: additions are always inserted at the same position. The lifecycle order
+#: used by the CLI listing is the order of :data:`HOOK_SPECS`, not this one.
 HookName: TypeAlias = Literal[
-    "on_load",
-    "on_unload",
-    "on_before_download",
     "on_after_download",
-    "on_page_downloaded",
+    "on_before_download",
     "on_error",
+    "on_load",
+    "on_page_downloaded",
+    "on_unload",
 ]
 
 #: Whether a hook must be declared as a regular ``def`` or an ``async def``.
 HookFlavour: TypeAlias = Literal["sync", "async"]
+
+
+HOOK_ON_LOAD: Final[HookName] = "on_load"
+HOOK_ON_UNLOAD: Final[HookName] = "on_unload"
+HOOK_ON_BEFORE_DOWNLOAD: Final[HookName] = "on_before_download"
+HOOK_ON_AFTER_DOWNLOAD: Final[HookName] = "on_after_download"
+HOOK_ON_PAGE_DOWNLOADED: Final[HookName] = "on_page_downloaded"
+HOOK_ON_ERROR: Final[HookName] = "on_error"
 
 
 # --------------------------------------------------------------------------- #
@@ -155,37 +183,37 @@ class HookSpec:
 #: the CLI listing but is otherwise not significant.
 HOOK_SPECS: Final[tuple[HookSpec, ...]] = (
     HookSpec(
-        name="on_load",
+        name=HOOK_ON_LOAD,
         flavour="sync",
         summary="Receive the plugin context and initialize state",
         mandatory=True,
     ),
     HookSpec(
-        name="on_before_download",
+        name=HOOK_ON_BEFORE_DOWNLOAD,
         flavour="async",
         summary="Inspect or transform a task before it starts downloading",
         mandatory=False,
     ),
     HookSpec(
-        name="on_after_download",
+        name=HOOK_ON_AFTER_DOWNLOAD,
         flavour="async",
         summary="Observe or transform a completed download result",
         mandatory=False,
     ),
     HookSpec(
-        name="on_page_downloaded",
+        name=HOOK_ON_PAGE_DOWNLOADED,
         flavour="async",
         summary="Be notified of each page written to disk",
         mandatory=False,
     ),
     HookSpec(
-        name="on_error",
+        name=HOOK_ON_ERROR,
         flavour="async",
         summary="Be notified when a download task fails",
         mandatory=False,
     ),
     HookSpec(
-        name="on_unload",
+        name=HOOK_ON_UNLOAD,
         flavour="sync",
         summary="Persist state and release resources before shutdown",
         mandatory=True,
@@ -221,8 +249,13 @@ ASYNC_HOOK_NAMES: Final[frozenset[str]] = frozenset(
 # --------------------------------------------------------------------------- #
 
 
-def is_known_hook(name: str) -> bool:
+def is_known_hook(name: str) -> TypeGuard[HookName]:
     """Return ``True`` iff *name* is a hook declared in :data:`HOOK_SPECS`.
+
+    The return type is :class:`typing.TypeGuard` so that a caller doing
+    ``if is_known_hook(x): ...`` narrows ``x`` to :data:`HookName` in the
+    true branch — no cast needed, no risk of passing an arbitrary string to
+    a function that requires ``HookName``.
 
     Args:
         name: Candidate hook name (arbitrary string).
@@ -309,7 +342,9 @@ def check_hook_flavour(cls: type, name: HookName) -> None:
         cls: The plugin class to inspect.
         name: A known hook name (typed ``HookName`` so a caller passing an
             unknown literal fails under ``mypy --strict``; a caller passing a
-            dynamic string should call :func:`is_known_hook` first).
+            dynamic string should call :func:`is_known_hook` first to narrow
+            it — the :class:`TypeGuard` return type makes that narrowing
+            automatic).
 
     Raises:
         PluginError: If *cls* does not implement *name*, or if the
@@ -345,8 +380,14 @@ def check_hook_flavour(cls: type, name: HookName) -> None:
 def verify_protocol_consistency() -> None:
     """Assert that :class:`~nexusdl.plugins.api.NexusPlugin` matches this module.
 
-    Three things are verified:
+    Five things are verified:
 
+    0. **Self-consistency** — the two representations of the hook set in
+       this module agree: ``set(get_args(HookName)) == ALL_HOOK_NAMES``.
+       This catches a developer who adds a hook constant without adding it
+       to the ``Literal`` (or vice-versa) — a drift that ``mypy`` cannot
+       see because the ``Literal`` is static and the constants are runtime
+       values.
     1. Every hook declared on ``NexusPlugin`` is a known hook in
        :data:`ALL_HOOK_NAMES` (no typo or stale name in the protocol).
     2. Every **mandatory** sync hook (:data:`SYNC_HOOK_NAMES`) is declared on
@@ -367,10 +408,25 @@ def verify_protocol_consistency() -> None:
         AssertionError: On any drift. The message names the offending hook
             and, where relevant, its two conflicting flavours.
     """
+    # 0. Self-consistency: the Literal and the runtime constants agree.
+    literal_names = frozenset(get_args(HookName))
+    if literal_names != ALL_HOOK_NAMES:
+        missing_from_literal = ALL_HOOK_NAMES - literal_names
+        missing_from_specs = literal_names - ALL_HOOK_NAMES
+        raise AssertionError(
+            f"HookName and HOOK_SPECS disagree. "
+            f"In HOOK_SPECS but not in HookName: {sorted(missing_from_literal)}. "
+            f"In HookName but not in HOOK_SPECS: {sorted(missing_from_specs)}."
+        )
+
     from nexusdl.plugins.api import NexusPlugin  # noqa: PLC0415
 
     protocol_hooks: frozenset[str] = frozenset(
-        name for name in dir(NexusPlugin) if name.startswith("on_")
+        name
+        for name in dir(NexusPlugin)
+        # Filter out Python's own dunders (``__init__``, ``__subclasshook__``,
+        # ``__class_getitem__``, …) — none of them is a hook.
+        if name.startswith("on_") and not (name.startswith("__") and name.endswith("__"))
     )
 
     # 1. No unknown hook in the protocol.

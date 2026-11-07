@@ -54,14 +54,19 @@
  * Name collisions
  * ---------------
  * If a future change introduces the same symbol name in both modules (e.g.
- * a shared ``selectActive`` selector), TypeScript does **not** raise an
- * error at this file — it silently excludes the ambiguous name from the
- * barrel's exports.  Consumers that try to import the ambiguous name from
- * ``@/store`` will then get a "not exported" error and must import it from
- * the specific module.  This is the standard, well-understood TypeScript
- * behaviour, and it is preferrable to the alternative of a compile-time
- * failure at the barrel site: the failure is always caught on first use,
- * so a stray ambiguity never reaches production.
+ * a shared ``selectActive`` selector), **TypeScript emits a compile-time
+ * error on this file** — specifically ``TS2308: Module '"./downloads"' has
+ * already exported a member named 'X'. Consider explicitly re-exporting to
+ * resolve the ambiguity.``  The build fails, and the ambiguity cannot
+ * silently reach production.
+ *
+ * This is the safe outcome, and it must not be silenced by adding an
+ * explicit re-export from one module (``export { X } from "./downloads"``).
+ * Doing so hides the underlying design problem — two modules genuinely own
+ * the same concept — and turns the collision into a runtime mystery the
+ * next time a consumer changes their mind about which one they wanted.
+ * The correct fix is to rename one of the two symbols (or move it to a
+ * shared module) and let ``export *`` resolve the ambiguity naturally.
  *
  * To minimise the risk, the two stores follow a shared naming convention:
  * store-specific selectors are prefixed with what they select
@@ -83,13 +88,15 @@
  *   exposing them from the barrel would encourage consumers to build
  *   their own persistence wrappers around shared state, which violates
  *   the single-owner principle.
- * * **Hydration helpers** (``rehydrateSettings``,
- *   ``useSettingsHydrated``).  These are exported by
- *   :mod:`./settings` and therefore forwarded by ``export *`` — they are
- *   *not* re-exported separately because doing so would be redundant.  A
- *   consumer importing ``useSettingsHydrated`` from ``@/store`` gets it
- *   via the ``settings`` forward, identically to importing it from
- *   ``@/store/settings``.
+ *
+ * Note on hydration helpers
+ * -------------------------
+ * ``rehydrateSettings`` and ``useSettingsHydrated`` **are** re-exported by
+ * this barrel, because ``./settings`` exports them and ``export *``
+ * forwards every named export.  They are listed here for the avoidance of
+ * doubt: a consumer importing ``useSettingsHydrated`` from ``@/store``
+ * gets exactly the same binding as a consumer importing it from
+ * ``@/store/settings``.
  *
  * Server-side rendering
  * ---------------------

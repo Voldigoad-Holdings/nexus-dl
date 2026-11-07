@@ -32,14 +32,11 @@ Error handling
 
 If a schema module cannot be imported because an optional dependency is
 missing, :func:`__getattr__` raises an :class:`ImportError` pointing at
-the ``[web]`` extra instead of the raw ``ModuleNotFoundError``.
-
-Chain of ``__getattr__`` calls
-------------------------------
-
-``schemas.X`` → ``schemas.__getattr__`` → ``import_module(".ws", __name__)``
-→ ``ws.X`` (which, for ``WSCloseCode`` / ``WSEventType``, itself falls
-through ``ws.__getattr__``). Everything composes transparently.
+the ``[web]`` extra instead of the raw ``ModuleNotFoundError``. The
+``except ImportError`` catch is intentionally broader than
+``ModuleNotFoundError`` so that a missing symbol (``from X import Y``
+where ``Y`` does not exist) or a partially initialized module also gets
+the ``[web]`` hint — never a raw traceback with an ambiguous message.
 
 Introspection
 -------------
@@ -141,7 +138,7 @@ __all__ = [
     "SettingsResponse",
     "SettingsUpdateResponse",
     "compute_status_counts",
-    # ----- ws.py: WebSocket messages (WSCloseCode / WSEventType are re-exports) -----
+    # ----- ws.py: WebSocket messages -----
     "MAX_MESSAGE_SIZE",
     "CLIENT_PROTOCOL_TYPES",
     "KNOWN_CLIENT_TYPES",
@@ -283,9 +280,11 @@ _SCHEMAS: dict[str, str] = {
     "SettingsUpdateResponse": "responses",
     "compute_status_counts": "responses",
     # ----- ws -----
-    # NOTE: WSCloseCode and WSEventType are not defined in ws.py directly;
-    # they are resolved through ws.py's own __getattr__, which forwards to
-    # ..websocket. The chain works transparently.
+    # ``WSCloseCode`` and ``WSEventType`` are defined in
+    # :mod:`..websocket` and *re-exported* from ``ws.py`` via a plain
+    # top-level import plus ``__all__``. ``getattr(ws_module, name)``
+    # finds them in ``ws``'s ``globals()`` without needing a nested
+    # ``__getattr__``.
     "MAX_MESSAGE_SIZE": "ws",
     "CLIENT_PROTOCOL_TYPES": "ws",
     "KNOWN_CLIENT_TYPES": "ws",
@@ -329,13 +328,15 @@ _SCHEMAS: dict[str, str] = {
 
 
 #: The four schema submodules — name → tuple of its public symbols.
-#: Derived from :data:`_SCHEMAS` on first use; kept separate so
-#: :func:`list_submodules` does not need to scan the registry each call.
+#: Derived from :data:`_SCHEMAS` on first use; sorted alphabetically so
+#: :func:`list_submodules` returns a stable, reproducible order across
+#: runs (PEP 562 caching preserves dict insertion order, which is not
+#: the same as alphabetical order).
 _SUBMODULES: dict[str, tuple[str, ...]] = {
-    "common": tuple(s for s, m in _SCHEMAS.items() if m == "common"),
-    "requests": tuple(s for s, m in _SCHEMAS.items() if m == "requests"),
-    "responses": tuple(s for s, m in _SCHEMAS.items() if m == "responses"),
-    "ws": tuple(s for s, m in _SCHEMAS.items() if m == "ws"),
+    "common": tuple(sorted(s for s, m in _SCHEMAS.items() if m == "common")),
+    "requests": tuple(sorted(s for s, m in _SCHEMAS.items() if m == "requests")),
+    "responses": tuple(sorted(s for s, m in _SCHEMAS.items() if m == "responses")),
+    "ws": tuple(sorted(s for s, m in _SCHEMAS.items() if m == "ws")),
 }
 
 
@@ -434,7 +435,6 @@ if TYPE_CHECKING:
         ClientMessageTyped,
         ClientPingMessage,
         ClientPongMessage,
-        ClientProtocol_TYPES,
         ClientSubscribeMessage,
         ClientUnsubscribeMessage,
         CLIENT_PROTOCOL_TYPES,
@@ -497,7 +497,12 @@ def __getattr__(name: str) -> Any:
 
     try:
         module = importlib.import_module(f".{submodule}", __name__)
-    except ModuleNotFoundError as exc:
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose: a partially-initialized submodule (missing symbol,
+        # circular import resolved differently across Python versions)
+        # also surfaces as ``ImportError``, and it deserves the same
+        # ``[web]`` hint rather than a raw traceback.
         if exc.name in {"pydantic", "python_jose", "jose"}:
             raise ImportError(
                 f"{name!r} requires the Web extra. "
@@ -505,9 +510,9 @@ def __getattr__(name: str) -> Any:
             ) from exc
         raise
 
-    # ``getattr(module, name)`` transparently resolves through the
-    # submodule's own lazy loader if it has one (as ws.py does for
-    # WSCloseCode / WSEventType).
+    # ``getattr(module, name)`` uses ``module.__dict__`` — the plain
+    # top-level import of ``WSCloseCode`` / ``WSEventType`` in ``ws.py``
+    # places them there, so no nested ``__getattr__`` chain is needed.
     value = getattr(module, name)
 
     # Cache in the module namespace so subsequent lookups bypass
@@ -517,8 +522,14 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Expose the full public API to ``dir()``, IDEs and tab-completion."""
-    return sorted(list(globals().keys()) + list(__all__))
+    """Expose the full public API to ``dir()``, IDEs and tab-completion.
+
+    Uses a **set** union so that symbols already cached in ``globals()``
+    by :func:`__getattr__` are not listed twice (a plain list
+    concatenation would produce duplicates once the symbol has been
+    accessed).
+    """
+    return sorted(set(globals()) | set(__all__))
 
 
 # ===========================================================================
@@ -542,6 +553,10 @@ def get_schema(name: str) -> Any:
     message when the name is unknown. Convenient for dynamic lookups
     (schema registries, plugin code, parametrized tests).
 
+    The lookup goes through :func:`__getattr__` so the resolution is
+    cached in ``globals()`` and subsequent calls do not pay the
+    ``importlib`` overhead again.
+
     Raises:
         KeyError: If ``name`` is not a registered schema symbol.
     """
@@ -550,7 +565,7 @@ def get_schema(name: str) -> Any:
         raise KeyError(
             f"Unknown schema {name!r}. Available schemas: {available}"
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    return __getattr__(name)
 
 
 def list_submodules() -> dict[str, tuple[str, ...]]:
@@ -558,6 +573,7 @@ def list_submodules() -> dict[str, tuple[str, ...]]:
 
     The returned mapping is a shallow copy — safe to mutate by the caller
     without affecting the package. Useful for building a schema browser
-    or for generating per-module documentation.
+    or for generating per-module documentation. Symbol tuples are sorted
+    alphabetically so the output is reproducible.
     """
     return {name: tuple(symbols) for name, symbols in _SUBMODULES.items()}

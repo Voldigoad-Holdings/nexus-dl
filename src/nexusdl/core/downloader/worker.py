@@ -5,7 +5,7 @@ take one chapter from "pending" to "packaged file on disk", and nothing
 else: it does not manage queues, cross-chapter retries, pause/resume, or
 task-lifecycle events. Those are the manager's responsibility. Keeping the
 worker focused on a single task makes it trivial to test with a mock parser
-and an in-memory packager.
+and an in-memory packager. 
 
 Dependency inversion
 --------------------

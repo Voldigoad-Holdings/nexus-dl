@@ -28,12 +28,17 @@ contract on exceptions — is identical. The two files are deliberately
 kept self-contained rather than sharing a private base class:
 
 * the shared logic is ~40 lines and stable,
-* a future ``core/utils/filesystem.py`` module (deferred — see the
-  ``NOTE`` block below) will absorb the atomic-write helper, at which
-  point both files import from there and the current duplication is
-  removed,
-* a private intermediate base class would couple the two files' evolution
-  with no practical benefit today.
+* :mod:`nexusdl.core.utils.filesystem` now provides the canonical
+  atomic-write primitive (``atomic_write_bytes``) that replaces the
+  local ``_fsync_and_replace`` helper, and
+  :mod:`nexusdl.core.utils.filesystem.fsync_directory` provides the
+  directory-durability helper. A future refactor of this file will
+  import those, at which point the local helper disappears. The current
+  duplication is kept because reopening an already-shipped file to
+  refactor it is riskier than the readability gain justifies — the same
+  policy applied to the other packagers.
+* a private intermediate base class would couple the two files'
+  evolution with no practical benefit today.
 
 ``ComicInfo.xml`` placement
 ---------------------------
@@ -63,8 +68,9 @@ Identical mapping to :class:`~nexusdl.core.packaging.zip_packager.ZipPackager`:
 
 Filesystem safety and cancellation
 ----------------------------------
-The archive is built in a sibling temp file, ``fsync``'d, and
-:meth:`Path.replace`'d onto the final path. A crash, an exception, or an
+The archive is built in a sibling temp file, ``fsync``'d,
+:meth:`Path.replace`'d onto the final path, and the parent directory is
+``fsync``'d so the rename itself is durable. A crash, an exception, or an
 ``asyncio.CancelledError`` leaves the previous ``output`` untouched and
 the temp file cleaned up.
 
@@ -80,7 +86,7 @@ Dependency graph (no cycles)::
     core.models.enums       ├──► core.packaging.cbz_packager
     core.models.page        │
     core.packaging.base    ─┘
-    (ComicInfo lazily imported at package() call time via TYPE_CHECKING)
+    core.utils.filesystem  ─┘  (fsync_directory only)
 """
 
 from __future__ import annotations
@@ -99,6 +105,7 @@ from nexusdl.core.exceptions import PackagingError
 from nexusdl.core.models.enums import PackagingFormat
 from nexusdl.core.models.page import Page
 from nexusdl.core.packaging.base import BasePackager
+from nexusdl.core.utils.filesystem import fsync_directory
 
 if TYPE_CHECKING:
     from nexusdl.core.packaging.comic_info import ComicInfo
@@ -266,7 +273,14 @@ class CbzPackager(BasePackager):
             prefix=_TEMP_PREFIX_FMT.format(name=output.name),
             suffix=".tmp",
         )
-        os.close(fd)
+        # ``os.close`` can fail on a corrupted fd but there is nothing
+        # useful we can do — the temp file exists and its path is what
+        # matters. Guard the close so a pathological fd state does not
+        # prevent cleanup of the (already-created) temp file.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         temp_path = Path(raw_temp)
 
         try:
@@ -281,13 +295,26 @@ class CbzPackager(BasePackager):
                 for page, src in sorted_pages:
                     archive.write(src, arcname=src.name)
             _fsync_and_replace(temp_path, output)
-        except (OSError, ValueError) as exc:
-            temp_path.unlink(missing_ok=True)
+        except (
+            OSError,
+            ValueError,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+        ) as exc:
+            # ``BadZipFile`` and ``LargeZipFile`` are not subclasses of
+            # ``OSError`` or ``ValueError`` — they derive from
+            # ``Exception`` directly. Without them in this tuple, a
+            # corrupted write would fall through to the ``BaseException``
+            # branch below and propagate raw, hiding the ``PackagingError``
+            # contract from the caller.
+            _safe_unlink(temp_path)
             raise PackagingError(
                 f"failed to create CBZ archive {output}: {exc}"
             ) from exc
         except BaseException:
-            temp_path.unlink(missing_ok=True)
+            # ``CancelledError`` and any other BaseException must clean up
+            # the temp file before propagating.
+            _safe_unlink(temp_path)
             raise
 
         _log.info(
@@ -306,9 +333,12 @@ class CbzPackager(BasePackager):
 # implementations in ``zip_packager.py`` (and, for fsync+replace,
 # ``pdf_packager.py``). The duplication is deliberate and reviewed: the
 # helpers are ~10 lines each, stable, and extracting them now would mean
-# reopening already-delivered files. When ``core/utils/filesystem.py`` is
-# written, both ``zip_packager`` and ``cbz_packager`` (and ``pdf_packager``)
-# will import from there and this duplication disappears in a single edit.
+# reopening already-delivered files. When ``zip_packager.py`` /
+# ``pdf_packager.py`` are next opened for any reason, all three files will
+# import the atomic-write primitive from ``core/utils/filesystem.py``
+# (which already exists) and the local helpers will disappear. The
+# directory-fsync step is already imported from
+# ``core/utils/filesystem.fsync_directory``.
 # --------------------------------------------------------------------------- #
 
 
@@ -374,8 +404,39 @@ def _serialize_metadata(metadata: ComicInfo | None) -> bytes | None:
         ) from exc
 
 
+def _safe_unlink(path: Path) -> None:
+    """Best-effort removal of *path*, never raising.
+
+    Used in the exception-handling paths of :meth:`_package_sync` so that
+    a failure to clean up a temp file (permissions, FS read-only) does
+    not replace the exception the caller actually needs to see.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _fsync_and_replace(temp_path: Path, target: Path) -> None:
-    """``fsync`` *temp_path* then atomically replace *target*.
+    """``fsync`` *temp_path*, rename it onto *target*, fsync the parent.
+
+    Three steps, each of which is required for the atomic-write contract
+    documented in the module docstring:
+
+    1. **fsync the temp file's content.** Opens the file read-only —
+       ``fsync(2)`` accepts an fd in ``O_RDONLY`` and flushes all dirty
+       pages of the inode regardless of the open mode, so a write-capable
+       fd is not required (and would fail on some filesystems where the
+       file is read-only by design).
+    2. **Atomically rename the temp file onto the target.** ``Path.replace``
+       is atomic on every filesystem that supports POSIX rename
+       semantics.
+    3. **fsync the parent directory.** Without this step a crash between
+       the rename and the next directory flush can revert the rename —
+       the target file disappears, the temp file reappears under its
+       old name. This is the "durability of the rename itself"
+       guarantee that :func:`nexusdl.core.utils.filesystem.fsync_directory`
+       exists to provide.
 
     Args:
         temp_path: The just-written temporary file.
@@ -384,6 +445,7 @@ def _fsync_and_replace(temp_path: Path, target: Path) -> None:
     Raises:
         OSError: If the fsync or the rename fails.
     """
-    with temp_path.open("rb+") as fh:
+    with temp_path.open("rb") as fh:
         os.fsync(fh.fileno())
     temp_path.replace(target)
+    fsync_directory(target.parent)

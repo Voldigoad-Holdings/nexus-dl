@@ -69,6 +69,14 @@ The storage key is ``sha256(json.dumps(key_parts, sort_keys=True))``
 short of a SHA-256 break, which is not a realistic concern for this
 threat model.
 
+**Lookup strategy.** The cache stores every ``Vary`` variant under a
+distinct storage key. To resolve a ``get(url, request_headers)`` call
+without knowing the ``Vary`` headers in advance, the index is queried by
+the **base key** ``(site_id, url)`` — the ``.meta.json`` of each
+candidate is checked for a ``vary_values`` match against the request
+headers. This lets a stale request hit a ``Vary``-keyed entry correctly
+while still allowing the common case (no ``Vary``) to be a direct lookup.
+
 Sensitive ``Vary`` headers
 --------------------------
 A response with ``Vary: Cookie`` or ``Vary: Authorization`` is **not
@@ -102,6 +110,15 @@ Without this batching, a 100-entry eviction would do 100 sequential
 for up to a second. A batch is capped at 100 entries (see
 ``_EVICT_BATCH_LIMIT``) so a pathological case never holds the lock
 for more than a hundred deletions.
+
+**Write ordering** (avoiding orphan files across crashes):
+:meth:`HttpCache.put` writes the ``.meta.json`` first, then the
+``.body``, then updates the in-memory index and flushes it. A crash
+between the two file writes leaves an **indexed** metadata record whose
+body file is missing — the ``get`` path detects the body-size mismatch
+and returns a miss. A crash after both writes but before the index
+flush leaves an unindexed pair of files, which are reclaimed by
+``clear()``. Neither case corrupts existing entries.
 
 Expiry
 ------
@@ -150,7 +167,7 @@ Dependency graph (no cycles)::
     httpx
     aiofiles
     loguru
-    asyncio, hashlib, json, os, time (stdlib)
+    asyncio, hashlib, json, os, tempfile, time (stdlib)
 
 No dependency on any other ``core.session`` module — this file is a leaf.
 """
@@ -160,6 +177,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -615,6 +634,15 @@ class HttpCache:
         revalidate with the entry's validators). Use
         :meth:`CacheEntry.is_fresh` to discriminate.
 
+        **Vary-keyed lookup.** The storage key at write time includes the
+        ``Vary`` values of the response. On the ``get`` path we cannot
+        know those values in advance, so the cache first looks up the
+        entry under the "no Vary" key and, failing that, walks any
+        entries the index has for the same ``(site_id, url)`` and picks
+        the one whose ``vary_values`` match the request headers. This
+        keeps the common case (no Vary) a single-file read while still
+        resolving ``Vary``-keyed entries correctly.
+
         Updates the entry's last-access timestamp so that LRU eviction
         sees this read as "used". A read that returns ``None`` (miss)
         increments the miss counter but does not touch disk beyond the
@@ -638,49 +666,19 @@ class HttpCache:
         """
         await self._ensure_index()
 
-        key = self._storage_key(url, site_id, request_headers)
         async with self._index_lock:
-            entry_path = self._meta_path(site_id, key)
-            if not entry_path.is_file():
-                self._misses += 1
-                return None
-            try:
-                raw = await asyncio.to_thread(
-                    entry_path.read_bytes
-                )
-            except OSError as exc:
-                _log.warning(
-                    "Cannot read cache metadata {}: {}: {}",
-                    entry_path,
-                    type(exc).__name__,
-                    exc,
-                )
-                self._misses += 1
-                return None
-
-            try:
-                document = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                _log.warning(
-                    "Cache metadata {} is corrupted; deleting: {}",
-                    entry_path,
-                    exc,
-                )
-                await self._delete_entry_unlocked(site_id, key)
-                self._misses += 1
-                return None
-
-            entry = await self._load_entry_from_doc(
-                site_id, key, document
+            # Fast path: no-Vary entry.
+            base_key = self._storage_key(url, site_id, None, {})
+            entry = await self._try_load_entry_unlocked(
+                site_id, base_key, request_headers, set()
             )
-            if entry is None:
-                self._misses += 1
-                return None
+            if entry is not None:
+                return entry
 
-            # Touch the access timestamp for LRU.
-            self._touch_unlocked(site_id, key)
-            self._hits += 1
-            return entry
+            # Slow path: any Vary-keyed entry for this (site_id, url).
+            return await self._try_load_vary_entry_unlocked(
+                url, site_id, request_headers
+            )
 
     async def put(
         self,
@@ -716,7 +714,11 @@ class HttpCache:
         Returns:
             ``True`` iff the entry was written.
         """
-        if response.request.method not in _CACHEABLE_METHODS:
+        # ``response.request`` is always set on a Response produced by
+        # ``httpx.AsyncClient``, but a caller that constructed a Response
+        # manually (a test) may omit it. Defend accordingly.
+        request = getattr(response, "request", None)
+        if request is None or request.method not in _CACHEABLE_METHODS:
             return False
         if response.status_code != 200:
             return False
@@ -849,23 +851,25 @@ class HttpCache:
             ``True`` iff an entry existed and was refreshed.
         """
         await self._ensure_index()
-        key = self._storage_key(url, site_id, request_headers)
-        async with self._index_lock:
-            entry_path = self._meta_path(site_id, key)
-            if not entry_path.is_file():
-                return False
-            try:
-                raw = await asyncio.to_thread(entry_path.read_bytes)
-            except OSError:
-                return False
-            try:
-                document = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                return False
 
-            entry = await self._load_entry_from_doc(site_id, key, document)
+        # Reuse the same resolution logic as ``get``: prefer the no-Vary
+        # entry, fall back to any Vary entry whose values match.
+        async with self._index_lock:
+            base_key = self._storage_key(url, site_id, None, {})
+            entry = await self._try_load_entry_unlocked(
+                site_id, base_key, request_headers, set()
+            )
+            resolved_key: str = base_key
             if entry is None:
-                return False
+                entry = await self._try_load_vary_entry_unlocked(
+                    url, site_id, request_headers
+                )
+                if entry is None:
+                    return False
+                # Recompute the exact storage key used by the entry.
+                resolved_key = self._storage_key(
+                    url, site_id, request_headers, entry.vary_values
+                )
 
             now = float(self._clock())
             cache_control = parse_cache_control(
@@ -895,7 +899,7 @@ class HttpCache:
                 ),
                 vary_values=entry.vary_values,
             )
-            await self._write_entry_unlocked(site_id, key, refreshed)
+            await self._write_entry_unlocked(site_id, resolved_key, refreshed)
             self._revalidations += 1
             return True
 
@@ -918,9 +922,24 @@ class HttpCache:
             ``True`` iff an entry existed and was removed.
         """
         await self._ensure_index()
-        key = self._storage_key(url, site_id, request_headers)
+
         async with self._index_lock:
-            return await self._delete_entry_unlocked(site_id, key)
+            base_key = self._storage_key(url, site_id, None, {})
+            entry = await self._try_load_entry_unlocked(
+                site_id, base_key, request_headers, set()
+            )
+            if entry is not None:
+                return await self._delete_entry_unlocked(site_id, base_key)
+
+            entry = await self._try_load_vary_entry_unlocked(
+                url, site_id, request_headers
+            )
+            if entry is None:
+                return False
+            resolved_key = self._storage_key(
+                url, site_id, request_headers, entry.vary_values
+            )
+            return await self._delete_entry_unlocked(site_id, resolved_key)
 
     async def clear(self) -> None:
         """Delete every cached entry and reset the index.
@@ -931,12 +950,17 @@ class HttpCache:
         """
         await self._ensure_index()
         async with self._index_lock:
-            # Delete entry files first, so a crash mid-clear leaves the
-            # index pointing at (soon to be stale) files that we then
-            # clean on the next startup rather than at (nonexistent)
-            # files the index thinks exist.
-            for site_id, key in list(self._index):
-                await self._delete_entry_unlocked(site_id, key, touch_stats=False)
+            # Snapshot the index so iteration is stable while we mutate
+            # ``self._index`` via ``_delete_entry_unlocked``.
+            entries = list(self._index.items())
+            for compound_key, meta in entries:
+                site_id = meta.get("site_id") or None
+                key = meta.get("key")
+                if not isinstance(key, str):
+                    continue
+                await self._delete_entry_unlocked(
+                    site_id, key, touch_stats=False, persist_index=False
+                )
             self._index.clear()
             self._total_size = 0
             await self._save_index_unlocked()
@@ -1037,9 +1061,6 @@ class HttpCache:
         ).encode("utf-8")
 
         def _write() -> None:
-            import os
-            import tempfile
-
             fd, raw_temp = tempfile.mkstemp(
                 dir=self._cache_dir,
                 prefix=_TEMP_PREFIX,
@@ -1081,13 +1102,12 @@ class HttpCache:
 
         The key is ``sha256`` of a canonical JSON encoding of the tuple
         ``(site_id, url, sorted_vary_values)``. ``request_headers`` is
-        used only to compute the ``vary_values`` when they were not
-        already provided by the caller (the ``put`` path); the ``get``
-        path passes them explicitly because it does not yet know the
-        ``Vary`` headers of the cached entry.
-
-        The nested storage path is ``<cache_dir>/<sha256(site_id)>/`` so
-        that a cache directory can be inspected by site without a lookup.
+        accepted for API symmetry but not used: the ``vary_values``
+        that participate in the key are derived from the response's
+        ``Vary`` header (at write time) or reconstructed from the cached
+        entry (at read time). Passing ``request_headers`` and a
+        non-matching ``vary_values`` would produce two different keys
+        for the same logical entry — a mistake worth avoiding.
         """
         if vary_values is None:
             vary_values = {}
@@ -1112,6 +1132,128 @@ class HttpCache:
     def _body_path(self, site_id: str | None, key: str) -> Path:
         """Return the body file path for an entry."""
         return self._site_dir(site_id) / f"{key}{_BODY_SUFFIX}"
+
+    # ------------------------------------------------------------------ #
+    # Internals — Vary-keyed lookup helpers                              #
+    # ------------------------------------------------------------------ #
+
+    async def _try_load_entry_unlocked(
+        self,
+        site_id: str | None,
+        key: str,
+        request_headers: Mapping[str, str] | None,
+        tried_keys: set[str],
+    ) -> CacheEntry | None:
+        """Try to load *key*, verify its Vary values match, and return it.
+
+        Updates the LRU timestamp and the hit counter on success. All
+        reads happen under the index lock; the ``tried_keys`` argument
+        lets the caller avoid re-reading the same key twice.
+        """
+        tried_keys.add(key)
+        entry_path = self._meta_path(site_id, key)
+        if not entry_path.is_file():
+            return None
+        try:
+            raw = await asyncio.to_thread(entry_path.read_bytes)
+        except OSError as exc:
+            _log.warning(
+                "Cannot read cache metadata {}: {}: {}",
+                entry_path,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            _log.warning(
+                "Cache metadata {} is corrupted; deleting: {}",
+                entry_path,
+                exc,
+            )
+            await self._delete_entry_unlocked(site_id, key)
+            return None
+
+        if not _vary_matches(document, request_headers):
+            return None
+
+        entry = await self._load_entry_from_doc(site_id, key, document)
+        if entry is None:
+            return None
+
+        self._touch_unlocked(site_id, key)
+        self._hits += 1
+        return entry
+
+    async def _try_load_vary_entry_unlocked(
+        self,
+        url: str,
+        site_id: str | None,
+        request_headers: Mapping[str, str] | None,
+    ) -> CacheEntry | None:
+        """Search every entry for *url* and pick the matching Vary one.
+
+        Iterates the index (which contains every cached entry) and calls
+        :meth:`_try_load_entry_unlocked` on each candidate whose
+        ``site_id`` and ``url`` match. The base path is tried first by
+        the caller; this method only runs when the base-key path missed
+        — so any entry the index contains for this ``(site_id, url)``
+        with a non-empty ``vary_values`` is a candidate.
+
+        In practice the number of entries per ``(site_id, url)`` is
+        tiny (one per distinct ``Accept-Language`` / ``Accept-Encoding``
+        combination), so the linear scan is acceptable. The common case
+        of "no Vary" never reaches this path.
+        """
+        if request_headers is None:
+            # A Vary-keyed entry cannot be matched without headers.
+            self._misses += 1
+            return None
+
+        target_site = site_id or ""
+        tried_keys: set[str] = set()
+        for compound_key, meta in self._index.items():
+            entry_site = meta.get("site_id") or ""
+            entry_key = meta.get("key")
+            if not isinstance(entry_key, str):
+                continue
+            if entry_site != target_site:
+                continue
+            if entry_key in tried_keys:
+                continue
+            entry_meta_path = self._meta_path(site_id, entry_key)
+            if not entry_meta_path.is_file():
+                continue
+            # Quick reject: if the metadata's stored URL does not match
+            # (possible when the index is stale relative to disk), skip
+            # without reading the body. A full read of the metadata is
+            # required to check both URL and Vary; the index does not
+            # carry them to keep the index small.
+            try:
+                raw = await asyncio.to_thread(entry_meta_path.read_bytes)
+            except OSError:
+                continue
+            try:
+                document = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if document.get("url") != url:
+                continue
+            if not _vary_matches(document, request_headers):
+                continue
+            entry = await self._load_entry_from_doc(
+                site_id, entry_key, document
+            )
+            if entry is None:
+                continue
+            self._touch_unlocked(site_id, entry_key)
+            self._hits += 1
+            return entry
+
+        self._misses += 1
+        return None
 
     # ------------------------------------------------------------------ #
     # Internals — entry load / store                                     #
@@ -1217,13 +1359,15 @@ class HttpCache:
             metadata, indent=2, sort_keys=True
         ).encode("utf-8")
 
-        # Write both files atomically. The body goes first — if a crash
-        # happens after body write but before metadata write, the
-        # metadata write never happens and the index never learns about
-        # the orphan body. That orphan is harmless: it is not referenced
-        # from the index and :meth:`clear` reclaims it.
-        await asyncio.to_thread(_atomic_write_bytes, body_path, entry.body)
+        # Write metadata FIRST, then body, then update the index. The
+        # ordering guarantees that a crash between the two file writes
+        # leaves an *indexed* metadata record with a missing body — the
+        # ``get`` path detects the body-size mismatch and treats it as a
+        # miss. The inverse ordering (body first) would leave an
+        # *orphan* body that the index never references, and no code
+        # path can reclaim it short of ``clear()``.
         await asyncio.to_thread(_atomic_write_bytes, meta_path, meta_bytes)
+        await asyncio.to_thread(_atomic_write_bytes, body_path, entry.body)
 
         # Update the index in memory and persist it.
         compound_key = self._compound_key(site_id, key)
@@ -1433,6 +1577,35 @@ class HttpCache:
 # --------------------------------------------------------------------------- #
 
 
+def _vary_matches(
+    document: Mapping[str, Any],
+    request_headers: Mapping[str, str] | None,
+) -> bool:
+    """Return ``True`` iff *document*'s Vary values match the request.
+
+    A document with no ``vary_values`` matches any request (the common
+    case). A document with ``vary_values`` requires the same header
+    values on the incoming request — a missing header counts as a
+    mismatch because the Vary contract requires the header to be
+    present at both write and read time.
+    """
+    raw_vary = document.get("vary_values") or {}
+    if not isinstance(raw_vary, dict) or not raw_vary:
+        return True
+    if request_headers is None:
+        return False
+    request_lower = {
+        name.lower(): value for name, value in request_headers.items()
+    }
+    for name, expected in raw_vary.items():
+        if not isinstance(name, str) or not isinstance(expected, str):
+            return False
+        actual = request_lower.get(name.lower())
+        if actual != expected:
+            return False
+    return True
+
+
 def _content_type_is_cacheable(headers: httpx.Headers) -> bool:
     """Return ``True`` iff the response content type is cacheable."""
     content_type = headers.get("content-type", "").lower()
@@ -1513,9 +1686,6 @@ def _atomic_write_bytes(target: Path, payload: bytes) -> None:
     Raises:
         OSError: On any I/O failure. The previous target is untouched.
     """
-    import os
-    import tempfile
-
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_temp = tempfile.mkstemp(
         dir=target.parent,

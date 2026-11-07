@@ -149,10 +149,11 @@ CHAPTER_ID_LENGTH: Final[int] = 16
 
 #: The separator used between the components of an id's preimage string.
 #: ``":"`` is chosen because it (a) cannot appear in a site id (schema
-#: pattern ``^[a-z][a-z0-9_-]*$``), (b) cannot appear in a chapter id
-#: (hex), and (c) is visually distinct in a debug dump
-#: (``"mangadex:one-piece"``). Any future change is a **breaking**
-#: change to every stored id and requires a migration.
+#: pattern ``^[a-z][a-z0-9_-]*$``), (b) cannot appear in a manga id
+#: (hex digest — see :data:`MANGA_ID_LENGTH`), and (c) is visually
+#: distinct in a debug dump (``"mangadex:one-piece"``). Any future
+#: change is a **breaking** change to every stored id and requires a
+#: migration.
 _ID_SEPARATOR: Final[str] = ":"
 
 #: The encoding used to turn the preimage string into bytes. UTF-8 is
@@ -224,18 +225,25 @@ def sha256_truncated(
         length: The number of leading hex characters to return. Must be
             in ``[1, 64]`` — a value below 1 is meaningless and a value
             above 64 cannot be satisfied (SHA-256's digest is exactly 64
-            hex characters).
+            hex characters). ``bool`` values are rejected: a caller who
+            passes ``True`` almost certainly meant ``1``, not "the
+            default length".
         encoding: As in :func:`sha256_hex`.
 
     Returns:
         The first *length* hex characters of the digest, lowercase.
 
     Raises:
-        ValueError: If *length* is not in ``[1, 64]``. The check is at
-            the call site, not deferred — a caller that passes
-            ``length=128`` should get a clear error, not silently
-            receive the full 64 characters.
+        ValueError: If *length* is not in ``[1, 64]``, or if *length* is
+            a ``bool``. The check is at the call site, not deferred — a
+            caller that passes ``length=128`` should get a clear error,
+            not silently receive the full 64 characters.
     """
+    if isinstance(length, bool) or not isinstance(length, int):
+        raise ValueError(
+            f"length must be an int in [1, {SHA256_HEX_LENGTH}], "
+            f"got {type(length).__name__}"
+        )
     if not (1 <= length <= SHA256_HEX_LENGTH):
         raise ValueError(
             f"length must be in [1, {SHA256_HEX_LENGTH}], got {length}"
@@ -286,12 +294,6 @@ def make_manga_id(site_id: str, source_id: str) -> str:
             ``source_id`` is not a caller bug this module can safely
             ignore; the resulting id would silently collide with every
             other empty-input id.
-
-    Examples:
-        >>> make_manga_id("mangadex", "a1b2c3d4")
-        'a1b2c3d4e5f6a7b8'
-        >>> make_manga_id("mangadex", "a1b2c3d4") == make_manga_id("mangadex", "a1b2c3d4")
-        True
     """
     if not site_id:
         raise ValueError("make_manga_id() requires a non-empty site_id")
@@ -340,10 +342,6 @@ def make_chapter_id(manga_id: str, source_id: str) -> str:
 
     Raises:
         ValueError: If either argument is empty.
-
-    Examples:
-        >>> make_chapter_id("a1b2c3d4e5f6a7b8", "ch-001")
-        'f1e2d3c4b5a69788'
     """
     if not manga_id:
         raise ValueError(

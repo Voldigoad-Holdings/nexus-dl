@@ -89,6 +89,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias
+from uuid import uuid4
 
 from loguru import logger
 from slugify import slugify
@@ -294,8 +295,8 @@ class DownloadManager:
         self._running_workers: dict[str, asyncio.Task[None]] = {}
 
         #: Id → future resolved when the worker finishes. Populated by
-        #: :meth:`submit` when the caller wants the result (typically
-        #: :meth:`download_manga`); absent otherwise.
+        #: :meth:`download_manga` when the caller wants the result; absent
+        #: otherwise.
         self._futures: dict[str, asyncio.Future[DownloadResult]] = {}
 
         #: Set by :meth:`stop`. Once ``True``, :meth:`submit` raises and
@@ -349,16 +350,26 @@ class DownloadManager:
             status: When provided, only tasks in that exact status are
                 returned. When ``None``, every task ever submitted is
                 returned, including terminal ones.
+
+        Returns:
+            A new list. The returned tasks are the queue's own objects —
+            the caller must not mutate their ``status`` field directly
+            (use :meth:`pause`, :meth:`resume`, :meth:`cancel` instead).
         """
         return await self._queue.list(status)
 
     async def pause(self, task_id: str) -> bool:
-        """Stop a running task (best-effort).
+        """Stop a running task and wait for the worker to actually stop.
 
         The queue transitions RUNNING → PAUSED and the underlying worker's
-        :class:`asyncio.Task` is cancelled. The worker's ``finally`` blocks
-        clean up temporary files; the task becomes resumable via
-        :meth:`resume`, which spawns a fresh worker.
+        :class:`asyncio.Task` is cancelled and **awaited** before this
+        method returns. Awaiting is essential: without it, a caller that
+        does ``pause(t); resume(t)`` would spawn a second worker while the
+        first is still unwinding its ``finally`` block — two workers for
+        the same task id, double downloads, and inconsistent events.
+
+        The worker's ``finally`` blocks clean up temporary files; the task
+        becomes resumable via :meth:`resume`, which spawns a fresh worker.
 
         Args:
             task_id: The task's id, as a string.
@@ -375,12 +386,17 @@ class DownloadManager:
         if task is None:
             return False
 
-        # Queue validates the transition before we touch the worker.
+        # Queue validates the transition before we touch the worker. If the
+        # task is not RUNNING, this raises and we never cancel the worker.
         await self._queue.pause(task_id)
 
         worker_task = self._running_workers.get(task_id)
         if worker_task is not None and not worker_task.done():
             worker_task.cancel()
+            # Wait for the worker's ``finally`` to complete. ``return_exceptions``
+            # swallows the CancelledError we just induced — the cancellation
+            # is intentional, not an error.
+            await asyncio.gather(worker_task, return_exceptions=True)
 
         await self._emit_event(
             _EVENT_DOWNLOAD_PAUSED,
@@ -396,9 +412,9 @@ class DownloadManager:
         """Restart a paused task.
 
         The queue transitions PAUSED → RUNNING and a fresh worker is
-        spawned. Because the previous worker was cancelled, the chapter is
-        re-downloaded from scratch — there is no partial-page checkpoint in
-        the current design.
+        spawned. Because the previous worker was fully stopped by
+        :meth:`pause`, the task is re-downloaded from scratch — there is
+        no partial-page checkpoint in the current design.
 
         Args:
             task_id: The task's id, as a string.
@@ -418,7 +434,7 @@ class DownloadManager:
         await self._queue.resume(task_id)
         if self._stopping:
             # Manager is shutting down; queue status is now RUNNING but no
-            # worker will run. Callers should not reach this path.
+            # worker will run. ``stop`` will cancel and resolve any futures.
             return True
 
         worker_task = asyncio.create_task(
@@ -578,7 +594,12 @@ class DownloadManager:
             One :class:`DownloadResult` per non-skipped chapter. Failed
             chapters yield a FAILED result rather than raising, so the
             generator can continue with the next chapter unless the
-            generator itself is cancelled.
+            generator itself is cancelled. If the generator is cancelled
+            while a chapter's worker has not yet produced a result, the
+            pending future is cancelled by :meth:`_run_task` and the
+            :class:`asyncio.CancelledError` propagates — the caller sees
+            cancellation, not a synthetic failure, for the *currently
+            pending* chapter.
         """
         if chapters is None:
             parser = self._registry.get_parser(manga.site_id)
@@ -624,6 +645,12 @@ class DownloadManager:
 
             try:
                 await self.submit(task)
+            except asyncio.CancelledError:
+                # The generator itself was cancelled while submitting. Pop
+                # the future so it does not leak; the outer ``finally``
+                # below will not run because we are not inside it yet.
+                self._futures.pop(task_id, None)
+                raise
             except Exception as exc:
                 self._futures.pop(task_id, None)
                 self._log.exception(
@@ -728,6 +755,12 @@ class DownloadManager:
         6. Resolve the task's future (if any).
         7. Trigger the next dispatch.
 
+        The plugin hook is allowed to mutate the task's *content* but not
+        its **id**: the manager, the queue, and any waiting future are all
+        keyed by the original id, and a hook that changes it would orphan
+        those registrations. A hook that returns a task with a different
+        id is rejected with a warning; the original task is used instead.
+
         Cancellation is propagated so the ``asyncio.Task`` is marked
         cancelled, but the associated future is resolved to a synthetic
         failed result so ``download_manga`` does not hang.
@@ -739,7 +772,21 @@ class DownloadManager:
         result: DownloadResult | None = None
         try:
             task = await self._dispatch_on_before_download(task)
-            task_id = str(task.id)
+            # The plugin contract forbids changing the id; enforce it.
+            post_plugin_id = str(task.id)
+            if post_plugin_id != task_id:
+                self._log.warning(
+                    "Plugin changed task id from {} to {}; reverting to "
+                    "original id (queue and futures are keyed by it)",
+                    task_id,
+                    post_plugin_id,
+                )
+                # Use the task the plugin returned (mutated content) but
+                # restore the original id so queue and futures stay
+                # consistent.
+                task = task.model_copy(update={"id": UUID(task_id)}) \
+                    if hasattr(task, "model_copy") else task
+                task_id = str(task.id)
 
             parser = self._registry.get_parser(task.manga.site_id)
             worker = self._worker_factory(parser)
@@ -937,7 +984,7 @@ class DownloadManager:
                     type=event_type,
                     timestamp=datetime.now(UTC),
                     payload=payload,
-                    id=__import__("uuid").uuid4(),
+                    id=uuid4(),
                 )
             )
         except asyncio.CancelledError:

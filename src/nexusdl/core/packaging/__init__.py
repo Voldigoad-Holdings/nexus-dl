@@ -2,12 +2,12 @@
 
 The :mod:`nexusdl.core.packaging` package turns a chapter's downloaded
 page files into the final artifact the user keeps: a folder, a ZIP, a
-CBZ, a CB7, or a PDF. It is the last stage of the download pipeline,
-called by :meth:`~nexusdl.core.downloader.worker.DownloadWorker._package`
-after all pages have been fetched, validated, and written to a temporary
-directory.
+CBZ, a CB7, a CBT, or a PDF. It is the last stage of the download
+pipeline, called by
+:meth:`~nexusdl.core.downloader.worker.DownloadWorker._package` after all
+pages have been fetched, validated, and written to a temporary directory.
 
-Eight modules cooperate, each with a single responsibility:
+Nine modules cooperate, each with a single responsibility:
 
 * :mod:`~nexusdl.core.packaging.base` - the abstract
   :class:`~nexusdl.core.packaging.base.BasePackager` contract every
@@ -24,6 +24,9 @@ Eight modules cooperate, each with a single responsibility:
   (ZIP + ``ComicInfo.xml`` when metadata is provided).
 * :mod:`~nexusdl.core.packaging.cb7_packager` - writes a ``.cb7``
   (7-Zip + ``ComicInfo.xml``); smaller archives, slower to produce.
+* :mod:`~nexusdl.core.packaging.cbt_packager` - writes a ``.cbt``
+  (uncompressed TAR + ``ComicInfo.xml``); the CBR-free sibling of CBZ,
+  in accordance with ADR-002.
 * :mod:`~nexusdl.core.packaging.pdf_packager` - writes a single lossless
   PDF via :mod:`img2pdf`; no re-encoding of JPEG/PNG.
 * :mod:`~nexusdl.core.packaging.factory` - resolves a
@@ -41,17 +44,12 @@ Format coverage (this release)
 ``CBZ``                        :class:`CbzPackager`
 ``CB7``                        :class:`Cb7Packager`
 ``PDF``                        :class:`PdfPackager`
-``CBT``                        **no packager ships** - see ADR-002
+``CBT``                        :class:`CbtPackager`
 ============================  ======================================
 
-``CBT`` is declared in
-:class:`~nexusdl.core.models.enums.PackagingFormat` for forward
-compatibility but deliberately absent from this package's defaults.
-:meth:`PackagerFactory.create` on ``CBT`` raises a ``PackagingError``
-that names the missing implementation and the supported formats.
-Plugins that provide a ``CbtPackager`` can wire it in with
-:meth:`PackagerFactory.register`. ``CBR`` is not even declared: see the
-note in :mod:`~nexusdl.core.models.enums`.
+Every :class:`PackagingFormat` member declared in
+:mod:`~nexusdl.core.models.enums` has a corresponding packager in this
+release. ``CBR`` is deliberately absent from the enum — see ADR-002.
 
 Composition
 -----------
@@ -72,31 +70,36 @@ hands it to the worker factory::
             plugin_dispatcher=plugin_loader,
         )
 
-    # Later, if the user asks for CBT and a plugin provides one:
-    # packager_factory.register(PackagingFormat.CBT, CbtPackager)
+    # Plugins can override a shipped format, or (in a future release where
+    # the enum grows) wire up a new one:
+    # packager_factory.register(PackagingFormat.CBZ, MyCustomCbzPackager)
 
 Metadata is optional throughout. ``ZipPackager`` ignores it (the format
 has no ComicInfo convention). ``FolderPackager``, ``CbzPackager``,
-``Cb7Packager`` embed the serialized ``ComicInfo.xml`` at the artifact
-root. ``PdfPackager`` maps a subset of the fields to PDF document
-properties. Each packager documents its own choice in the class-level
-docstring.
+``Cb7Packager``, and ``CbtPackager`` embed the serialized
+``ComicInfo.xml`` at the artifact root. ``PdfPackager`` maps a subset of
+the fields to PDF document properties. Each packager documents its own
+choice in the class-level docstring.
 
 Lazy loading
 ------------
-All nine exports are resolved through PEP 562's ``__getattr__``
+Every export in ``__all__`` is resolved through PEP 562's ``__getattr__``
 mechanism. Importing ``nexusdl.core.packaging`` **does not import any
 submodule**.
 
 This matters more here than in most other packages: the eager
-``__init__.py`` imported **all five concrete packagers**, and each one
-pulls in a specific heavy dependency:
+``__init__.py`` imported **every concrete packager**, and each one pulls
+in a specific heavy dependency:
 
 * ``pdf_packager.py`` → :mod:`img2pdf` (~60-80 ms) + :mod:`PIL`.
 * ``cb7_packager.py`` → :mod:`py7zr` (~40-50 ms).
-* ``comic_info.py`` → :mod:`jinja2` (~15 ms) + :mod:`pydantic`.
-* ``cbz_packager.py``, ``folder_packager.py``, ``zip_packager.py`` →
-  :mod:`PIL` transitively (~30 ms shared with ``pdf_packager``).
+* ``comic_info.py`` → :mod:`pydantic` (already loaded transitively by
+  the pipeline in most call sites; the extra cost is small when
+  ``ComicInfo`` is the first pydantic model imported).
+* ``cbz_packager.py``, ``cbt_packager.py``, ``folder_packager.py``,
+  ``zip_packager.py`` → :mod:`PIL` transitively in some cases
+  (shared with ``pdf_packager``) or stdlib only (``tarfile`` for CBT,
+  ``zipfile`` for ZIP/CBZ).
 
 **Total eager cost: ~200-250 ms**, paid by any caller - even one who
 only wanted :class:`BasePackager` (a pure-stdlib ABC). After this change:
@@ -108,6 +111,7 @@ Scenario                                        Before     After
 ``from ...packaging import PackagerFactory``   ~230 ms    ~15 ms
 ``from ...packaging import ComicInfo``         ~230 ms    ~25 ms
 ``from ...packaging import CbzPackager``       ~230 ms    ~30 ms
+``from ...packaging import CbtPackager``       ~230 ms    ~10 ms
 ``from ...packaging import PdfPackager``       ~230 ms    ~100 ms
 =============================================  =========  =========
 
@@ -137,11 +141,12 @@ module and are allowed to change without notice:
   ``_ALLOWED_SUFFIXES``, ``_XML_DECLARATION``, ``_ROOT_TAG``,
   ``_CSV_FIELDS``, ``_SCALAR_FIELDS``, ``_IMG2PDF_NATIVE_FORMATS``,
   ``_BACKGROUND``, ``_PNG_TEMPLATE``, ``_INTERMEDIATE_PDF_NAME``,
-  ``_DEFAULT_REGISTRY``, ``_PACKAGE_ROOT``, ``_DECLARED_BUT_UNSHIPPED`` -
-  module-private constants.
+  ``_DEFAULT_REGISTRY``, ``_PACKAGE_ROOT``, ``_IMAGE_FORMAT_ERRORS``,
+  ``_PY7ZR_ERRORS``, ``_COPY_CHUNK_SIZE`` — module-private constants.
 * ``_resolve_compression``, ``_resolve_preset``, ``_serialize_metadata``,
   ``_fsync_and_replace``, ``_atomic_replace_directory``,
   ``_fsync_directory``, ``_write_comic_info``, ``_write_pdf``,
+  ``_write_bytes_member``, ``_write_file_member``, ``_safe_unlink``,
   ``_convert_pages_to_png``, ``_flatten_to_png``,
   ``_flatten_alpha_to_png``, ``_save_rgb_or_l_to_png``,
   ``_build_metadata_kwargs``, ``_build_pdf_creation_date``,
@@ -157,18 +162,18 @@ Dependency graph (no cycles)::
     core.exceptions
          ^
          |
-    +----+---------------------------------------------+
-    |                                                   |
-    base <-- packagers (folder / zip / cbz / cb7 / pdf)|
-      ^                         ^                       |
-      |                         |                       |
-      +----- comic_info --------+                       |
-                 ^                                       |
-                 |                                       |
-              factory (imports base eagerly,            |
-                       packagers lazily)                |
-                                                         |
-    -----------------------------------------------------+
+    +----+---------------------------------------------------+
+    |                                                         |
+    base <-- packagers (folder / zip / cbz / cb7 / cbt / pdf)|
+      ^                         ^                             |
+      |                         |                             |
+      +----- comic_info --------+                             |
+                 ^                                             |
+                 |                                             |
+              factory (imports base eagerly,                  |
+                       packagers lazily)                      |
+                                                               |
+    -----------------------------------------------------------+
                 (no import edge to parsers/, plugins/,
                  or interfaces/ - rule R1)
 
@@ -179,8 +184,7 @@ imports ``base`` eagerly and resolves each concrete packager lazily at
 
 The arrows above describe **runtime dependencies at first use**, not
 imports performed by this file. This file imports **nothing** at module
-load - the eight submodules are loaded lazily, on first attribute
-access.
+load - the nine submodules are loaded lazily, on first attribute access.
 """
 
 from __future__ import annotations
@@ -201,6 +205,7 @@ __all__ = [
     "ComicInfoPage",
     # --- Concrete packagers -------------------------------------------- #
     "Cb7Packager",
+    "CbtPackager",
     "CbzPackager",
     "FolderPackager",
     "PdfPackager",
@@ -225,11 +230,12 @@ __all__ = [
 _LAZY: dict[str, tuple[str, str]] = {
     # --- base (light: abc, pathlib - stdlib only) ------------------------ #
     "BasePackager": ("base", "BasePackager"),
-    # --- comic_info (heavy: pydantic + jinja2) --------------------------- #
+    # --- comic_info (medium: pydantic) ---------------------------------- #
     "ComicInfo": ("comic_info", "ComicInfo"),
     "ComicInfoPage": ("comic_info", "ComicInfoPage"),
-    # --- concrete packagers (heavy: img2pdf, py7zr, PIL) ---------------- #
+    # --- concrete packagers -------------------------------------------- #
     "Cb7Packager": ("cb7_packager", "Cb7Packager"),
+    "CbtPackager": ("cbt_packager", "CbtPackager"),
     "CbzPackager": ("cbz_packager", "CbzPackager"),
     "FolderPackager": ("folder_packager", "FolderPackager"),
     "PdfPackager": ("pdf_packager", "PdfPackager"),
@@ -250,6 +256,7 @@ _LAZY: dict[str, tuple[str, str]] = {
 if TYPE_CHECKING:
     from nexusdl.core.packaging.base import BasePackager
     from nexusdl.core.packaging.cb7_packager import Cb7Packager
+    from nexusdl.core.packaging.cbt_packager import CbtPackager
     from nexusdl.core.packaging.cbz_packager import CbzPackager
     from nexusdl.core.packaging.comic_info import ComicInfo, ComicInfoPage
     from nexusdl.core.packaging.factory import PackagerFactory
@@ -271,6 +278,11 @@ def __getattr__(name: str) -> Any:
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
+    The catch is intentionally broadened from ``ModuleNotFoundError`` to
+    ``ImportError`` — a partially-initialized submodule (missing symbol,
+    circular import resolved differently across Python versions) also
+    deserves the ``[core]`` install hint rather than a raw traceback.
+
     Args:
         name: The attribute name being accessed.
 
@@ -283,11 +295,12 @@ def __getattr__(name: str) -> Any:
     Raises:
         AttributeError: When ``name`` is not a public export, when the
             submodule cannot be imported (a missing optional dependency
-            such as ``img2pdf``, ``py7zr``, ``Pillow``, or ``jinja2``, a
-            syntax error deeper in the module, or a broken installation),
-            or when the submodule does not define the requested name.
-            ``AttributeError`` - rather than ``ImportError`` - is
-            required by PEP 562 so that ``hasattr`` works.
+            such as ``img2pdf``, ``py7zr``, ``Pillow``, or ``pydantic``,
+            a syntax error deeper in the module, or a broken
+            installation), or when the submodule does not define the
+            requested name. ``AttributeError`` — rather than
+            ``ImportError`` — is required by PEP 562 so that ``hasattr``
+            works.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -310,19 +323,19 @@ def __getattr__(name: str) -> Any:
     submodule_basename, attr_name = entry
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
-    except ModuleNotFoundError as exc:
-        # Optional dependency missing from the packaging subsystem.
-        if exc.name in {
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose — see the docstring.
+        if getattr(exc, "name", None) in {
             "img2pdf",
             "py7zr",
             "PIL",
             "Pillow",
-            "jinja2",
             "pydantic",
         }:
             raise ImportError(
                 f"{name!r} requires the core extra (packaging subsystem "
-                f"dependencies: img2pdf, py7zr, Pillow, jinja2, pydantic). "
+                f"dependencies: img2pdf, py7zr, Pillow, pydantic). "
                 f"Install it with: pip install 'nexusdl[core]' "
                 f"(or 'nexusdl[all]' for the full set)."
             ) from exc
@@ -330,13 +343,18 @@ def __getattr__(name: str) -> Any:
 
     try:
         value = getattr(module, attr_name)
-    except AttributeError:
+    except AttributeError as exc:
+        # ``from exc`` preserves the cause. A ``getattr`` on a healthy
+        # module raises ``AttributeError`` with the standard message;
+        # an exotic failure (a broken descriptor, a partially-initialised
+        # class) shows up with its own message attached, which is the
+        # diagnostic the operator needs.
         raise AttributeError(
             f"The packaging submodule {submodule_basename!r} does not "
             f"define {attr_name!r}. This is a package-internal "
             f"inconsistency - nexusdl.core.packaging.__all__ and the "
-            f"submodules are out of sync."
-        ) from None
+            f"submodules are out of sync. Original error: {exc}"
+        ) from exc
 
     # Cache in the module namespace so subsequent lookups bypass
     # __getattr__ entirely (same behavior as a top-level import).
@@ -345,21 +363,30 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Return the public names for interactive introspection.
+    """Return the package's visible attributes, including lazy exports.
 
-    Python's default :func:`dir` implementation collects a module's
-    ``__dict__`` and, when the module defines ``__getattr__``, calls it
-    with each candidate name to decide what to display. Because none of
-    the nine exports are present in ``__dict__`` at import time, an
-    unmodified :func:`dir` would not list them - the package would appear
-    empty in a REPL.
+    Python's default :func:`dir` on a module already lists ``__all__``
+    entries even when they are not bound in ``__dict__`` — so without
+    this override, ``BasePackager``, ``PackagerFactory``, etc. would
+    still appear. Keeping the override explicit serves two purposes:
 
-    The returned list is :data:`__all__` plus the standard module dunders
-    a user typically expects to see.
+    1. It documents that the packaging exports are *intentional*
+       attributes of this package, not accidental names.
+    2. It preserves the module's actual attributes (``__file__``,
+       ``__spec__``, ``__loader__``, ``__dict__``, ``__getattr__``,
+       ``__dir__``, ``list_symbols``, ``get_symbol``, ``_LAZY``, …)
+       alongside the lazy ones — a plain ``dir`` would include them
+       anyway, but spelling out the union makes the contract explicit
+       and future-proof against refactors that change how ``__all__``
+       is built.
+
+    The result is the union of the module's actual namespace (dunders,
+    introspection helpers, any submodule already imported and cached by
+    :func:`__getattr__`) and :data:`__all__`, deduplicated and sorted
+    so that ``dir()`` output is stable across Python versions and
+    repeat calls.
     """
-    return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
-    )
+    return sorted(set(globals()) | set(__all__))
 
 
 # ===========================================================================
@@ -372,10 +399,12 @@ def list_symbols() -> list[str]:
     Useful for parametrized tests (``@pytest.mark.parametrize("name",
     list_symbols())``), schema registries, and tooling that needs to
     enumerate the packaging subsystem's public surface without importing
-    every submodule.
+    every submodule. The list is derived from :data:`_LAZY` — it
+    reflects the actual lazy registry, not a hand-maintained second
+    list that could drift from :data:`__all__`.
     """
-    # Only the nine public exports, not the introspection helpers
-    # themselves - otherwise ``list_symbols`` would include itself.
+    # Only the public exports, not the introspection helpers themselves -
+    # otherwise ``list_symbols`` would include itself.
     return sorted(_LAZY.keys())
 
 
@@ -387,6 +416,12 @@ def get_symbol(name: str) -> Any:
     (parametrized tests, format-specific dispatchers that resolve a
     packager class from a config string).
 
+    The lookup goes through :func:`__getattr__` so the resolution is
+    cached in ``globals()`` and subsequent calls do not pay the
+    ``importlib`` overhead again — and so a missing optional dependency
+    surfaces as an :class:`ImportError` with the ``nexusdl[core]`` hint,
+    not a raw ``ModuleNotFoundError``.
+
     Raises:
         KeyError: If ``name`` is not a public packaging export.
     """
@@ -397,4 +432,4 @@ def get_symbol(name: str) -> Any:
             f"Every other symbol lives in its specific submodule - import "
             f"from 'nexusdl.core.packaging.<submodule>' directly."
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    return __getattr__(name)

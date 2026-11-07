@@ -7,13 +7,13 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "display_override": ["window-controls-overlay", "standalone", "minimal-ui", "browser"],
+  "display_override": ["standalone", "minimal-ui", "browser"],
   "orientation": "any",
   "background_color": "#0a0a0a",
   "theme_color": "#0a0a0a",
   "lang": "en",
   "dir": "ltr",
-  "categories": ["entertainment", "utilities", "productivity"],
+  "categories": ["entertainment", "utilities", "books"],
   "prefer_related_applications": false,
   "icons": [
     {
@@ -39,12 +39,6 @@
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
-    },
-    {
-      "src": "/icons/icon-512x512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "maskable"
     },
     {
       "src": "/icons/apple-touch-icon.png",

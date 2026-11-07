@@ -57,7 +57,7 @@
  * should call :func:`getWebSocketClient` directly with the same token —
  * the singleton ensures they receive the same instance the hook is using.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   getWebSocketClient,
@@ -115,8 +115,12 @@ export interface UseWebSocketOptions {
 
   /**
    * Whether to emit ``console.debug`` diagnostics from the underlying
-   * client.  Defaults to ``false``.  Passed straight through to
-   * :class:`~../lib/ws.NexusWebSocketClient`.
+   * client.  Defaults to ``false``.  Passed to the underlying client on
+   * **first construction only** — changing it later has no effect, because
+   * the singleton is not reconfigured.  This is deliberate: toggling
+   * ``debug`` at runtime should not silently replace a live WebSocket with
+   * a differently-configured one.  Call :func:`resetWebSocketClient` first
+   * if you need to change it on a live client.
    */
   debug?: boolean;
 }
@@ -355,9 +359,29 @@ function acquireDownloadWiring(
 export function useWebSocket(
   options: UseWebSocketOptions = {},
 ): UseWebSocketReturn {
-  const token = options.token ?? readStoredToken();
+  // Resolve the token once per ``options.token`` value.  When ``options.token``
+  // is provided, it wins; otherwise we read from ``localStorage`` — but only
+  // once, not on every render.  A component that re-renders per WebSocket
+  // event (the download list) would otherwise call ``localStorage.getItem``
+  // on each tick, which is measurable at 20+ events/second.  The
+  // ``options.token`` dependency means an auth store that passes the token
+  // explicitly (the future delivery) triggers a re-read when the token
+  // changes, without falling back to the storage read.
+  const token = useMemo<string | null>(
+    () => options.token ?? readStoredToken(),
+    [options.token],
+  );
+
   const webEventsEnabled = useSettingsStore((s) => s.web_events_enabled);
+  // ``debug`` is captured once at mount.  It is forwarded to
+  // ``getWebSocketClient`` only on first construction of the singleton;
+  // changing it later cannot reconfigure a live client (see the docstring
+  // on ``UseWebSocketOptions.debug``).  It is therefore **not** in the
+  // effect's dependency array — doing so would tear down and rebuild the
+  // subscription for a purely diagnostic flag.
   const debug = options.debug ?? false;
+  const debugRef = useRef(debug);
+  debugRef.current = debug;
 
   const [clientState, setClientState] = useState<ConnectionState>("idle");
   const [lastError, setLastError] = useState<NexusWebSocketError | null>(
@@ -385,8 +409,13 @@ export function useWebSocket(
     }
 
     // ``token`` is guaranteed non-null here by the ``isDisabled`` guard.
+    // The cast narrows it for the compiler; the runtime check above is what
+    // actually guarantees it.
     const liveToken = token as string;
-    const client = getWebSocketClient({ token: liveToken, debug });
+    const client = getWebSocketClient({
+      token: liveToken,
+      debug: debugRef.current,
+    });
 
     // Sync initial state, in case the client is already connected from a
     // previous mount of a sibling hook (singleton reuse).
@@ -408,30 +437,49 @@ export function useWebSocket(
     });
 
     // Trigger connection.  If the client is already connected (singleton
-    // reuse), this is a no-op.
-    client.connect();
+    // reuse), this is a no-op.  ``connect()`` can throw synchronously if
+    // the URL cannot be built (no ``window``) — in that case the effect
+    // must not crash the whole component tree, so the error is captured
+    // and surfaced through ``lastError``.
+    try {
+      client.connect();
+    } catch (err) {
+      const wsError =
+        err instanceof Error
+          ? err
+          : new Error(String(err));
+      // eslint-disable-next-line no-console
+      console.error("Failed to connect WebSocket:", wsError);
+      // ``client.connect()`` already routes most failures through
+      // ``_fail`` and ``lastError``; this catch only matters for the
+      // synchronous ``_buildUrl`` failure, which is not a
+      // ``NexusWebSocketError``.  Store it so the UI can display it.
+      setLastError(wsError as NexusWebSocketError);
+    }
 
     return () => {
       unsubState();
       unsubDownloadWiring();
       unsubOnEvent();
     };
-  }, [token, isDisabled, debug]);
+    // ``debug`` is intentionally **not** in the dependency array: it is a
+    // diagnostic flag, not a lifecycle input.  See the comment on
+    // ``debugRef`` above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, isDisabled]);
 
   const reconnect = useCallback(() => {
-    if (isDisabled) {
+    if (isDisabled || token === null) {
       return;
     }
-    const liveToken = token as string;
-    getWebSocketClient({ token: liveToken }).connect();
+    getWebSocketClient({ token }).connect();
   }, [isDisabled, token]);
 
   const disconnect = useCallback(() => {
-    if (isDisabled) {
+    if (isDisabled || token === null) {
       return;
     }
-    const liveToken = token as string;
-    getWebSocketClient({ token: liveToken }).disconnect();
+    getWebSocketClient({ token }).disconnect();
   }, [isDisabled, token]);
 
   return {

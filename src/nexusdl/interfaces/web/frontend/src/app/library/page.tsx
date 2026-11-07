@@ -72,9 +72,9 @@
  * URL sanitisation
  * ----------------
  * ``?page`` is parsed with :func:`parsePositiveInt`, which falls back to
- * ``1`` for any non-positive or non-numeric value.  An invalid page in the
- * URL should not leave the page in a broken state — the fallback makes
- * the page usable and lets the user navigate from there.
+ * ``1`` for any non-positive, non-numeric or malformed value.  An invalid
+ * page in the URL should not leave the page in a broken state — the
+ * fallback makes the page usable and lets the user navigate from there.
  */
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import {
@@ -96,6 +96,8 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
+  useRef,
   useState,
   type FormEvent,
 } from "react";
@@ -130,12 +132,13 @@ const LIBRARY_STALE_TIME_MS = 30 * 1000;
 /**
  * Parse *raw* as a strictly positive integer, or return *fallback*.
  *
- * Used to sanitise ``?page``.  ``Number.parseInt("12abc")`` yields ``12``,
- * which is what we want (forgiving input), but ``Number.parseInt("")``
- * yields ``NaN``, which is not — hence the explicit range check.
+ * **Strict**: the entire string must be decimal digits.  Values like
+ * ``"12abc"`` (``parseInt`` would silently accept them as ``12``) are
+ * rejected so that a malformed ``?page=`` never becomes a silently
+ * different URL after the router replaces it.
  */
 function parsePositiveInt(raw: string | null, fallback: number): number {
-  if (raw === null) {
+  if (raw === null || !/^\d+$/.test(raw)) {
     return fallback;
   }
   const parsed = Number.parseInt(raw, 10);
@@ -225,7 +228,14 @@ function LibraryBody() {
 
   const goToPage = useCallback(
     (next: number) => {
-      setUrlParams({ page: next === 1 ? null : String(next) });
+      // Defensive clamp: the buttons below are disabled out of range, but
+      // a programmatic call (keyboard shortcut, future code) must never
+      // push ``?page=0`` or ``?page=N+1`` into the URL.
+      if (next < 1) {
+        setUrlParams({ page: null });
+      } else {
+        setUrlParams({ page: next === 1 ? null : String(next) });
+      }
     },
     [setUrlParams],
   );
@@ -262,25 +272,34 @@ function LibraryBody() {
   });
 
   // Reconcile after the OS suspends the socket in a background tab.
+  // ``refetch`` is stashed in a ref so the listener is attached **once**
+  // for the component lifetime, regardless of whether React Query ever
+  // changes the callback identity.
+  const refetchRef = useRef(libraryQuery.refetch);
+  refetchRef.current = libraryQuery.refetch;
+
   useEffect(() => {
     if (typeof document === "undefined") {
       return;
     }
     const handleVisibility = (): void => {
       if (document.visibilityState === "visible") {
-        void libraryQuery.refetch();
+        void refetchRef.current();
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [libraryQuery.refetch]);
+  }, []);
 
   // -------------------------------------------------------------------
   // Derived display state
   // -------------------------------------------------------------------
-  const entries = libraryQuery.data?.items ?? [];
+  const entries = useMemo(
+    () => libraryQuery.data?.items ?? [],
+    [libraryQuery.data],
+  );
   const total = libraryQuery.data?.total ?? 0;
   const totalPages = libraryQuery.data?.total_pages ?? 0;
   const hasNext = libraryQuery.data?.has_next ?? false;
@@ -301,9 +320,7 @@ function LibraryBody() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {total > 0
-              ? `${formatNumber(total)} ${
-                  total === 1 ? "series" : "series"
-                } in your library.`
+              ? `${formatNumber(total)} ${total === 1 ? "series" : "series"} in your library.`
               : "Your personal manga collection."}
           </p>
         </div>
@@ -428,7 +445,15 @@ function LibraryBody() {
         <select
           value={siteIdParam ?? ""}
           onChange={(event) => handleSiteChange(event.target.value)}
+          disabled={sitesQuery.isLoading || sitesQuery.isError}
           aria-label="Filter by site"
+          title={
+            sitesQuery.isError
+              ? "Could not load the sites list"
+              : sitesQuery.isLoading
+                ? "Loading sites…"
+                : undefined
+          }
           className={cn(
             "h-9 rounded-md border bg-background px-3 text-sm",
             "focus-visible:outline-none focus-visible:ring-2",
@@ -437,7 +462,13 @@ function LibraryBody() {
             "disabled:cursor-not-allowed disabled:opacity-50",
           )}
         >
-          <option value="">All sites</option>
+          <option value="">
+            {sitesQuery.isLoading
+              ? "Loading sites…"
+              : sitesQuery.isError
+                ? "Sites unavailable"
+                : "All sites"}
+          </option>
           {sitesQuery.data?.items.map((site) => (
             <option key={site.id} value={site.id}>
               {site.name}
@@ -638,9 +669,10 @@ function LibraryListRow({ entry }: { entry: LibraryEntry }) {
   }
 
   if (entry.file_size_bytes > 0) {
-    // Rendered inline rather than through ``formatBytes`` to keep the
-    // meta line compact — library entries are usually small and the
-    // compact "12 MB" form reads better here than "12.4 MB".
+    // Rendered through the local ``formatBytesShort`` rather than
+    // ``formatBytes`` from ``lib/utils``: the shared helper inserts a
+    // thousands separator, which reads as a stray comma inside a
+    // sentence like ``"mangadex · 12 MB"``.
     parts.push(formatBytesShort(entry.file_size_bytes));
   }
 
@@ -858,15 +890,16 @@ function PageButton({
  *
  * Adapts to the caller's current view mode so that a switch to list view
  * while the page is loading does not flash a grid skeleton.
+ *
+ * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
+ * is static, so an ``aria-live`` region would never announce anything
+ * (screen readers only announce *changes*).  ``aria-busy`` is the
+ * correct signal for "content is loading".
  */
 function LibrarySkeleton({ view }: { view: "grid" | "list" }) {
   if (view === "list") {
     return (
-      <div
-        className="flex flex-col gap-2"
-        aria-busy="true"
-        aria-live="polite"
-      >
+      <div className="flex flex-col gap-2" aria-busy="true">
         <span className="sr-only">Loading library…</span>
         {[0, 1, 2, 3].map((index) => (
           <div
@@ -889,7 +922,6 @@ function LibrarySkeleton({ view }: { view: "grid" | "list" }) {
     <div
       className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6"
       aria-busy="true"
-      aria-live="polite"
     >
       <span className="sr-only">Loading library…</span>
       {Array.from({ length: 12 }, (_, index) => (
@@ -953,12 +985,12 @@ function EmptyState({
 /**
  * Format a byte count as a compact string for the list meta line.
  *
- * Same algorithm as :func:`~../../lib/utils.formatBytes`, but without the
- * thousands separator — inside a sentence like ``"mangadex · 12 MB"`` a
- * separator would read as a stray comma.  Keeping the compact variant
- * local to this page is deliberate: no other component needs it yet, and
- * adding an unused helper to the shared utils module would violate the
- * project's "no dead code" rule.
+ * Same magnitude logic as :func:`~../../lib/utils.formatBytes`, but
+ * without the thousands separator — inside a sentence like
+ * ``"mangadex · 12 MB"`` a separator would read as a stray comma.
+ * Keeping the compact variant local to this page is deliberate: no other
+ * component needs it yet, and adding an unused helper to the shared
+ * utils module would violate the project's "no dead code" rule.
  */
 function formatBytesShort(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {

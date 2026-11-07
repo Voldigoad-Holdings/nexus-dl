@@ -285,10 +285,11 @@ DEFAULT_TIMEOUTS: Final[HttpTimeouts] = HttpTimeouts()
 class CircuitBreakerProtocol(Protocol):
     """Minimal circuit-breaker surface required by :class:`HttpSession`.
 
-    The concrete :class:`~nexusdl.core.session.circuit_breaker.CircuitBreaker`
-    (future) will implement a full state machine (CLOSED / OPEN /
-    HALF_OPEN) with per-site tracking. This protocol captures only what
-    the session needs to call:
+    The concrete
+    :class:`~nexusdl.core.session.circuit_breaker.CircuitBreaker` (future)
+    will implement a full state machine (CLOSED / OPEN / HALF_OPEN) with
+    per-site tracking. This protocol captures only what the session needs
+    to call:
 
     * :meth:`allow_request` — ``True`` when a request may proceed
       (CLOSED or HALF_OPEN), ``False`` when the site is considered down
@@ -443,7 +444,13 @@ class HttpSession:
         # Merge the fixed defaults with any caller-supplied base headers.
         merged_headers: dict[str, str] = dict(_DEFAULT_HEADERS)
         if base_headers is not None:
-            merged_headers.update(base_headers)
+            for key, value in base_headers.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    raise ValueError(
+                        f"base_headers must map str to str, got "
+                        f"{type(key).__name__} -> {type(value).__name__}"
+                    )
+                merged_headers[key] = value
 
         self._base_headers: Mapping[str, str] = MappingProxyType(
             merged_headers
@@ -532,7 +539,9 @@ class HttpSession:
         avoids acquiring the lock at all in steady state.
 
         Raises:
-            SessionError: If the session has been closed.
+            SessionError: If the session has been closed, or if httpx
+                cannot be configured (e.g. ``http2=True`` without the
+                ``httpx[http2]`` extra installed).
         """
         # Fast path — no lock needed once the client exists and the
         # session is open. ``self._client`` is only ever set under the
@@ -556,18 +565,34 @@ class HttpSession:
                     "continue making requests"
                 )
             if self._client is None:
-                self._client = httpx.AsyncClient(
-                    headers=dict(self._base_headers),
-                    timeout=self._timeouts.to_httpx(),
-                    http2=self._http2,
-                    follow_redirects=self._follow_redirects,
-                    limits=httpx.Limits(
-                        max_connections=self._max_connections,
-                        max_keepalive_connections=(
-                            self._max_keepalive_connections
+                try:
+                    self._client = httpx.AsyncClient(
+                        headers=dict(self._base_headers),
+                        timeout=self._timeouts.to_httpx(),
+                        http2=self._http2,
+                        follow_redirects=self._follow_redirects,
+                        limits=httpx.Limits(
+                            max_connections=self._max_connections,
+                            max_keepalive_connections=(
+                                self._max_keepalive_connections
+                            ),
                         ),
-                    ),
-                )
+                    )
+                except ImportError as exc:
+                    # Most likely ``http2=True`` without ``httpx[http2]``
+                    # installed. The raw message is technically accurate
+                    # but does not name the fix.
+                    raise SessionError(
+                        "cannot create HTTP client: "
+                        f"{type(exc).__name__}: {exc}. "
+                        "Install with: pip install 'httpx[http2]' "
+                        "(or set `http2=False`)"
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001
+                    raise SessionError(
+                        "cannot create HTTP client: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 self._log.debug(
                     "HTTP client initialised (http2={}, max_conn={})",
                     self._http2,
@@ -614,8 +639,8 @@ class HttpSession:
         Returns:
             The :class:`httpx.Response`. The caller owns it and is
             responsible for reading the body if it needs to (the response
-            is fully buffered by default; use :meth:`stream_download` or
-            :meth:`get_stream` for streaming).
+            is fully buffered by default; use :meth:`stream_download` for
+            streaming).
 
         Raises:
             CircuitBreakerOpenError: If the site's circuit breaker is
@@ -651,9 +676,29 @@ class HttpSession:
     ) -> httpx.Response:
         """Perform a POST request. Same layering as :meth:`get`.
 
+        At most one of ``content``, ``data``, or ``json`` may be provided
+        — this is an httpx contract, validated here so the failure is a
+        clear ``ValueError`` at the session boundary rather than a
+        ``TypeError`` deep inside httpx.
+
+        Args:
+            Same as :meth:`get`, plus:
+
+            content: Raw body bytes/str.
+            data: Form-encoded body (``Mapping`` or list of tuples).
+            json: JSON-serialisable body.
+
         Raises:
-            Same as :meth:`get`.
+            ValueError: If more than one of ``content``, ``data``,
+                ``json`` is provided.
+            Same as :meth:`get` otherwise.
         """
+        provided = sum(x is not None for x in (content, data, json))
+        if provided > 1:
+            raise ValueError(
+                "HttpSession.post accepts at most one of 'content', "
+                "'data', or 'json'"
+            )
         return await self._request(
             "POST",
             url,
@@ -687,7 +732,8 @@ class HttpSession:
                 sites ship broken ``Content-Type`` headers.
 
         Raises:
-            Same as :meth:`get`.
+            SessionError: On an invalid ``encoding`` name, or any of the
+                exceptions :meth:`get` raises.
         """
         response = await self._request(
             "GET",
@@ -698,8 +744,541 @@ class HttpSession:
             **kwargs,
         )
         if encoding is not None:
-            return response.content.decode(encoding, errors="replace")
+            try:
+                return response.content.decode(encoding, errors="replace")
+            except LookupError as exc:
+                raise SessionError(
+                    f"invalid text encoding {encoding!r} for {url!r}: "
+                    f"{exc}"
+                ) from exc
         return response.text
 
     async def get_json(
-       
+        self,
+        url: str,
+        *,
+        site_id: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Perform a GET and return the body decoded as JSON.
+
+        Used by API-first parsers and the API-based mixin. Delegates to
+        :meth:`get`, then calls :meth:`httpx.Response.json`.
+
+        Raises:
+            SessionError: If the response body is not valid JSON. The
+                underlying :class:`json.JSONDecodeError` is chained as
+                ``__cause__`` for debugging.
+            Same as :meth:`get` otherwise.
+        """
+        response = await self._request(
+            "GET",
+            url,
+            site_id=site_id,
+            headers=headers,
+            timeout=timeout,
+            **kwargs,
+        )
+        try:
+            return response.json()
+        except Exception as exc:  # noqa: BLE001 — json may raise more than JSONDecodeError
+            raise SessionError(
+                f"invalid JSON response from {url!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+    async def stream_download(
+        self,
+        url: str,
+        dest: Path,
+        *,
+        site_id: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Stream *url* into the file at *dest*.
+
+        Applies the same layering as :meth:`get` (circuit breaker, rate
+        limit, user-agent, cookies, proxy) and then streams the response
+        body into *dest* in ``_STREAM_CHUNK_SIZE``-byte blocks.
+
+        *on_progress* follows the ``(bytes_downloaded, bytes_total)``
+        convention — the same shape ``tqdm`` and ``rich.progress``
+        expect. It is throttled to at most once per
+        ``_PROGRESS_THROTTLE_SECONDS``; a page of 60 images generates
+        a manageable number of callbacks, not thousands. Passing
+        ``None`` disables progress reporting.
+
+        Partial files are the caller's responsibility: if the method
+        raises (network error, cancellation, non-2xx status), *dest*
+        may contain a partial body. The canonical consumer
+        (:mod:`nexusdl.core.image.downloader`) writes to a temporary
+        path and renames on success; callers that write directly must
+        clean up on failure.
+
+        Args:
+            url: Absolute URL.
+            dest: Destination path. The file is created or truncated.
+            site_id: See :meth:`get`.
+            headers: See :meth:`get`.
+            timeout: Per-request total timeout.
+            on_progress: Optional progress callback.
+            **kwargs: Forwarded to :meth:`httpx.AsyncClient.stream`.
+
+        Raises:
+            Same as :meth:`get` — every error is translated into a
+            :class:`SessionError` subclass before propagating.
+            OSError: If *dest* cannot be written.
+        """
+        # Rate limit + circuit breaker + proxy selection + headers are
+        # all handled by the same helper used for ``_request`` so a
+        # streaming download respects the exact same per-site policy
+        # as a one-shot GET.
+        proxy_config = await self._prepare_request(
+            url, site_id=site_id
+        )
+        request_headers = self._build_request_headers(
+            url, site_id=site_id, headers=headers
+        )
+        proxy_url: str | None = (
+            proxy_config.url.get_secret_value()
+            if proxy_config is not None
+            else None
+        )
+
+        client = await self._ensure_client()
+        request_kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        if proxy_url is not None:
+            request_kwargs["proxy"] = proxy_url
+        request_kwargs.update(kwargs)
+
+        response: httpx.Response | None = None
+        try:
+            async with client.stream(
+                "GET",
+                url,
+                headers=request_headers,
+                **request_kwargs,
+            ) as response:
+                self._raise_for_status(response, url)
+                total = _content_length(response)
+                downloaded = 0
+                last_progress = 0.0
+
+                async with aiofiles.open(dest, "wb") as fh:
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=_STREAM_CHUNK_SIZE
+                    ):
+                        await fh.write(chunk)
+                        downloaded += len(chunk)
+                        if on_progress is not None:
+                            now = time.monotonic()
+                            if (
+                                now - last_progress
+                                >= _PROGRESS_THROTTLE_SECONDS
+                            ):
+                                last_progress = now
+                                on_progress(downloaded, total)
+
+                # Final progress callback so the caller sees the last
+                # byte even if the throttle swallowed it.
+                if on_progress is not None and downloaded > 0:
+                    on_progress(downloaded, total)
+        except httpx.TimeoutException as exc:
+            await self._record_failure(site_id, proxy_config)
+            raise SessionTimeoutError(
+                f"timeout streaming {url!r}: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            await self._record_failure(site_id, proxy_config)
+            raise SessionError(
+                f"network error streaming {url!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        except asyncio.CancelledError:
+            # Do not touch proxy health on cancellation — the request
+            # did not fail, the caller gave up.
+            raise
+        else:
+            await self._record_success(site_id, proxy_config)
+
+    # ------------------------------------------------------------------ #
+    # Core request pipeline                                              #
+    # ------------------------------------------------------------------ #
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        site_id: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Shared implementation of :meth:`get` and :meth:`post`.
+
+        Order of operations — each step's failure aborts the pipeline:
+
+        1. Circuit-breaker check (per-site).
+        2. Rate-limiter wait (per-site).
+        3. User-Agent, cookies, base headers, caller headers merge.
+        4. Proxy selection (per-site, sticky).
+        5. The actual request.
+        6. Proxy-health and cookie-store updates.
+        7. Status classification (2xx / 3xx accepted, 4xx/5xx
+           translated into the appropriate :class:`SessionError`).
+
+        The single ``_raise_for_status`` call at the end is what makes
+        the error contract uniform across all methods that call
+        ``_request`` (``get``, ``post``, ``get_html``, ``get_json``).
+        """
+        proxy_config = await self._prepare_request(url, site_id=site_id)
+        request_headers = self._build_request_headers(
+            url, site_id=site_id, headers=headers
+        )
+        proxy_url: str | None = (
+            proxy_config.url.get_secret_value()
+            if proxy_config is not None
+            else None
+        )
+
+        client = await self._ensure_client()
+
+        request_kwargs: dict[str, Any] = {
+            "headers": request_headers,
+        }
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        if proxy_url is not None:
+            request_kwargs["proxy"] = proxy_url
+        request_kwargs.update(kwargs)
+
+        try:
+            response = await client.request(
+                method, url, **request_kwargs
+            )
+        except httpx.TimeoutException as exc:
+            await self._record_failure(site_id, proxy_config)
+            raise SessionTimeoutError(
+                f"timeout on {method} {url!r}: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            await self._record_failure(site_id, proxy_config)
+            raise SessionError(
+                f"network error on {method} {url!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        except asyncio.CancelledError:
+            # Do not touch proxy health on cancellation.
+            raise
+
+        # Store any Set-Cookie values the server sent, even on error
+        # responses: some sites set a session cookie on a 4xx challenge
+        # response that the next request must present.
+        self._record_cookies(site_id, response)
+
+        try:
+            self._raise_for_status(response, url)
+        except SessionError:
+            await self._record_failure(site_id, proxy_config)
+            raise
+        await self._record_success(site_id, proxy_config)
+        return response
+
+    async def _prepare_request(
+        self, url: str, *, site_id: str | None
+    ) -> ProxyConfig | None:
+        """Run the pre-request pipeline: validation, breaker, rate, proxy.
+
+        Returns the selected :class:`ProxyConfig` (or ``None`` if no
+        proxy is in use) so the caller can pass it to the post-request
+        health report. Every failure here raises before any network
+        I/O is performed.
+        """
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise SessionError(
+                f"unsupported URL scheme {parsed.scheme!r} in {url!r}; "
+                "only http:// and https:// are supported"
+            )
+
+        if site_id is not None and self._circuit_breaker is not None:
+            try:
+                allowed = self._circuit_breaker.allow_request(site_id)
+            except Exception as exc:  # noqa: BLE001
+                raise SessionError(
+                    f"circuit breaker raised for site {site_id!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            if not allowed:
+                raise CircuitBreakerOpenError(
+                    f"circuit breaker is open for site {site_id!r}; "
+                    "refusing request"
+                )
+
+        if site_id is not None:
+            limiter = await self._get_rate_limiter(site_id)
+            if limiter is not None:
+                await limiter.acquire()
+
+        if self._proxy_manager is not None:
+            return await self._proxy_manager.get_proxy(site_id)
+        return None
+
+    async def _record_success(
+        self,
+        site_id: str | None,
+        proxy_config: ProxyConfig | None,
+    ) -> None:
+        """Feed a successful request into the breaker and proxy manager."""
+        if site_id is not None and self._circuit_breaker is not None:
+            try:
+                self._circuit_breaker.record_success(site_id)
+            except Exception:
+                self._log.exception(
+                    "circuit_breaker.record_success raised for site {!r}",
+                    site_id,
+                )
+        if self._proxy_manager is not None and proxy_config is not None:
+            try:
+                await self._proxy_manager.mark_success(proxy_config)
+            except Exception:
+                self._log.exception(
+                    "proxy_manager.mark_success raised for {}",
+                    proxy_config.redacted,
+                )
+
+    async def _record_failure(
+        self,
+        site_id: str | None,
+        proxy_config: ProxyConfig | None,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Feed a failed request into the breaker and proxy manager."""
+        if site_id is not None and self._circuit_breaker is not None:
+            try:
+                self._circuit_breaker.record_failure(site_id)
+            except Exception:
+                self._log.exception(
+                    "circuit_breaker.record_failure raised for site {!r}",
+                    site_id,
+                )
+        if self._proxy_manager is not None and proxy_config is not None:
+            try:
+                await self._proxy_manager.mark_failure(
+                    proxy_config, error=error
+                )
+            except Exception:
+                self._log.exception(
+                    "proxy_manager.mark_failure raised for {}",
+                    proxy_config.redacted,
+                )
+
+    # ------------------------------------------------------------------ #
+    # Headers and cookies                                                #
+    # ------------------------------------------------------------------ #
+
+    def _build_request_headers(
+        self,
+        url: str,
+        *,
+        site_id: str | None,
+        headers: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        """Build the final header dict for one request.
+
+        Order of precedence (later wins):
+
+        1. :data:`_DEFAULT_HEADERS` and any ``base_headers`` passed to
+           :meth:`__init__` — already merged at construction time into
+           :attr:`_base_headers`.
+        2. Per-site cookies (only when a cookie manager is injected).
+        3. Caller-supplied ``headers``.
+        4. Rotated ``User-Agent`` — always wins over any caller-supplied
+           ``User-Agent`` because the whole point of the rotator is
+           that it decides.
+
+        The hostname is used as the ``for_domain`` key so that the
+        rotator's sticky behaviour tracks per-site state naturally.
+        """
+        merged: dict[str, str] = dict(self._base_headers)
+        if self._cookie_manager is not None and site_id is not None:
+            try:
+                stored = self._cookie_manager.get_cookies(site_id)
+            except Exception:
+                self._log.exception(
+                    "cookie_manager.get_cookies raised for site {!r}",
+                    site_id,
+                )
+                stored = {}
+            if stored:
+                merged["Cookie"] = "; ".join(
+                    f"{k}={v}" for k, v in stored.items()
+                )
+        if headers:
+            merged.update(headers)
+
+        domain = urlparse(url).hostname or ""
+        merged["User-Agent"] = self._user_agents.for_domain(domain)
+        return merged
+
+    def _record_cookies(
+        self, site_id: str | None, response: httpx.Response
+    ) -> None:
+        """Persist any ``Set-Cookie`` headers on *response*."""
+        if self._cookie_manager is None or site_id is None:
+            return
+        cookies: dict[str, str] = {}
+        for name, value in response.headers.multi_items():
+            if name.lower() != "set-cookie":
+                continue
+            # ``Set-Cookie`` can carry attributes (``; Path=...``,
+            # ``; HttpOnly``) after the ``name=value`` pair. We only
+            # care about the pair itself.
+            first = value.split(";", 1)[0].strip()
+            if "=" not in first:
+                continue
+            cookie_name, _, cookie_value = first.partition("=")
+            cookie_name = cookie_name.strip()
+            if cookie_name:
+                cookies[cookie_name] = cookie_value.strip()
+        if not cookies:
+            return
+        try:
+            self._cookie_manager.update_cookies(site_id, cookies)
+        except Exception:
+            self._log.exception(
+                "cookie_manager.update_cookies raised for site {!r}",
+                site_id,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Per-site rate limiter                                              #
+    # ------------------------------------------------------------------ #
+
+    async def _get_rate_limiter(
+        self, site_id: str
+    ) -> RateLimiter | None:
+        """Return (or lazily create) the :class:`RateLimiter` for *site_id*.
+
+        Returns ``None`` when no ``rate_limit_source`` was injected or
+        when it returns ``None`` for the site. The creation is
+        serialised by ``_rate_limit_lock`` so two concurrent
+        first-requests cannot each construct a limiter and one silently
+        overwrite the other — which would let the site receive two
+        parallel requests during the startup window.
+        """
+        if self._rate_limit_source is None:
+            return None
+        # Fast path — no lock once the limiter exists.
+        existing = self._rate_limiters.get(site_id)
+        if existing is not None:
+            return existing
+        async with self._rate_limit_lock:
+            existing = self._rate_limiters.get(site_id)
+            if existing is not None:
+                return existing
+            try:
+                rate = self._rate_limit_source(site_id)
+            except Exception as exc:  # noqa: BLE001
+                raise SessionError(
+                    f"rate_limit_source raised for site {site_id!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            if rate is None:
+                # Cache the "no limit" answer by storing nothing but
+                # returning None; a second call takes the same path
+                # but only after re-querying the source. That is fine
+                # — the source is expected to be cheap (a dict lookup
+                # in the composition root).
+                return None
+            limiter = RateLimiter(rate_per_second=rate, name=site_id)
+            self._rate_limiters[site_id] = limiter
+            self._log.debug(
+                "rate limiter created for site {!r} at {}/s",
+                site_id,
+                rate,
+            )
+            return limiter
+
+    # ------------------------------------------------------------------ #
+    # Status classification                                              #
+    # ------------------------------------------------------------------ #
+
+    def _raise_for_status(
+        self, response: httpx.Response, url: str
+    ) -> None:
+        """Translate a non-2xx response into the appropriate SessionError.
+
+        Classification:
+
+        * 2xx, 3xx — accepted, return.
+        * 429 — :class:`SessionRateLimitError`.
+        * 403 / 503 with Cloudflare headers — :class:`SessionCloudflareError`.
+        * 5xx — :class:`SessionError` (server error).
+        * Other 4xx — :class:`SessionError` (client error).
+        """
+        status = response.status_code
+        if 200 <= status < 400:
+            return
+        if status == _RATE_LIMIT_STATUS:
+            retry_after = response.headers.get("Retry-After")
+            raise SessionRateLimitError(
+                f"rate limited (429) on {url!r}"
+                + (f"; retry after {retry_after}s" if retry_after else "")
+            )
+        if status in (403, 503) and _looks_like_cloudflare(response):
+            raise SessionCloudflareError(
+                f"Cloudflare challenge (status {status}) on {url!r}"
+            )
+        if 500 <= status < 600:
+            raise SessionError(
+                f"server error ({status}) on {url!r}"
+            )
+        raise SessionError(
+            f"client error ({status}) on {url!r}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Module helpers                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _content_length(response: httpx.Response) -> int:
+    """Return the body length from ``Content-Length``, or ``-1``.
+
+    ``-1`` is the convention ``tqdm`` and most progress bars use for
+    "unknown total". Never raises: a missing, malformed, or negative
+    header value all map to ``-1``.
+    """
+    raw = response.headers.get("Content-Length")
+    if raw is None:
+        return -1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return -1
+    return value if value >= 0 else -1
+
+
+def _looks_like_cloudflare(response: httpx.Response) -> bool:
+    """Return ``True`` iff any Cloudflare challenge header is present.
+
+    The header set is small and stable (``cf-ray`` is added to every
+    Cloudflare response; ``cf-mitigated`` is added specifically on
+    challenge pages; ``cf-chl-bypass`` appears on bypass-flow pages).
+    Presence of any of them on a 403/503 is the classifier's signal.
+    """
+    for header_name in _CLOUDFLARE_HEADERS:
+        if header_name in response.headers:
+            return True
+    return False

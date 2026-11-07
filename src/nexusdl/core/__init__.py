@@ -618,4 +618,101 @@ def __dir__() -> list[str]:
        contract explicit and future-proof against refactors that change
        how ``__all__`` is built.
 
-    The result is the union of the module's actual namespace (dunders
+    The result is the union of the module's actual namespace (dunders,
+    introspection helpers, the sanity-check constants, any submodule
+    already imported and cached by :func:`__getattr__`) and
+    :data:`__all__`, deduplicated and sorted so that ``dir()`` output is
+    stable across Python versions and repeat calls.
+    """
+    return sorted(set(globals()) | set(__all__))
+
+
+# ===========================================================================
+# Introspection helpers
+# ===========================================================================
+
+def list_symbols() -> list[str]:
+    """Return the sorted list of every top-level export (lazy + local).
+
+    The list is the union of:
+
+    * the fifteen **lazy** exports registered in :data:`_LAZY`, and
+    * the two **local** helpers (:func:`list_symbols` itself and
+      :func:`get_symbol`), which are defined in this module's body.
+
+    This matches :data:`__all__` exactly - the invariant is checked in
+    :mod:`tests.unit.core.test_core_init` (both directions). Useful for
+    parametrized tests (``@pytest.mark.parametrize("name",
+    list_symbols())``), schema registries, and tooling that needs to
+    enumerate the core's Tier-1 surface without importing every
+    submodule.
+
+    Returns:
+        A sorted list of strings, one per public export.
+    """
+    return sorted(set(_LAZY) | _LOCAL)
+
+
+def get_symbol(name: str) -> Any:
+    """Return the core symbol registered under ``name``.
+
+    Equivalent to ``getattr(package, name)`` but with a clearer error
+    message when the name is unknown. Convenient for dynamic lookups
+    (plugin introspection tools, parametrized tests, composition-root
+    builders that want to resolve a symbol from a config string).
+
+    For the two **local** helpers (:func:`list_symbols`,
+    :func:`get_symbol`), this is exactly a plain attribute access - they
+    are already bound in the module namespace.
+
+    For a **lazy** export, this routes through :func:`__getattr__` so
+    the cache is populated with the same value a plain attribute access
+    would return. This matters for the ``logger`` symbol: an
+    implementation that used ``__import__(__name__, fromlist=[name])``
+    would force the ``nexusdl.core.logger`` submodule to load and rebind
+    ``nexusdl.core.logger`` to the module object, silently returning
+    the **module** instead of the loguru logger. Routing through
+    :func:`__getattr__` avoids that.
+
+    Args:
+        name: The export name to resolve.
+
+    Returns:
+        The symbol, exactly as ``getattr(nexusdl.core, name)`` would
+        return it.
+
+    Raises:
+        KeyError: If ``name`` is not a public core export.
+    """
+    if name not in _LAZY and name not in _LOCAL:
+        available = ", ".join(list_symbols())
+        raise KeyError(
+            f"Unknown core symbol {name!r}. Available: {available}. "
+            f"Every other symbol lives in its specific submodule - "
+            f"import from 'nexusdl.core.<submodule>' directly."
+        )
+    # Local helpers are already bound; lazy ones go through __getattr__
+    # so the cache stays consistent with plain attribute access.
+    if name in _LOCAL:
+        return globals()[name]
+    return __getattr__(name)
+
+
+# ===========================================================================
+# Sanity: __all__ must exactly match the union of lazy + local exports
+# ===========================================================================
+# This assertion runs at import time and would fail on any future edit
+# that adds an entry to _LAZY without adding it to __all__ (or vice
+# versa), or that adds a local helper without registering it in _LOCAL.
+# The cost is a single set comparison at import; the benefit is that an
+# inconsistent public surface is caught the moment the package loads,
+# not on the first `from nexusdl.core import *` in a caller.
+
+if frozenset(__all__) != (frozenset(_LAZY) | _LOCAL):
+    _missing_from_all = (frozenset(_LAZY) | _LOCAL) - frozenset(__all__)
+    _missing_from_exports = frozenset(__all__) - (frozenset(_LAZY) | _LOCAL)
+    raise RuntimeError(
+        "nexusdl.core.__all__ does not match the union of _LAZY and "
+        f"_LOCAL. Missing from __all__: {sorted(_missing_from_all)}. "
+        f"Listed but not exported: {sorted(_missing_from_exports)}."
+    )

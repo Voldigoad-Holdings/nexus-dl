@@ -22,6 +22,15 @@ it, so it uses a **library-first** strategy analogous to
 3. **404** — if neither branch applies. The 404 body documents that
    ``?url=`` unlocks live parsing, so a well-behaved client can recover.
 
+**Parser contract on ids.** The parsers are expected to return
+:class:`Chapter` objects whose ``id`` is **already** the canonical
+``sha256(manga_id:source_id)[:16]`` value (see :class:`BaseParser`
+in PROMPT MASTER). The router does **not** recompute the hash — it
+compares the parser's ids verbatim. A parser that returns raw source
+ids (``"ch-42"``) will cause every live chapter lookup to 404; the
+router logs the observed ids at ``WARNING`` so operators can detect
+the contract violation in production.
+
 No ``?manga_id=`` is required. Adding it would be redundant (library
 already resolves it; live re-derives it from the parse) and would
 encourage clients to send stale state.
@@ -40,6 +49,13 @@ The ``/pages`` endpoint returns the same way:
 No mixing: a chapter is served from exactly one origin per request. The
 client knows which by inspecting ``downloaded: bool`` on the chapter
 detail response.
+
+**Empty library chapters are served as empty, never as 404.**
+When a chapter exists in the library but its pages are not (yet) stored
+(partial download, DB-only entry), ``/pages`` returns
+``200 {pages: [], downloaded: true, total: 0}``. It never falls through
+to the live parser (which would ignore local state and require a URL the
+client does not have) and never returns a 404 for a chapter that exists.
 
 Authorization
 =============
@@ -72,7 +88,10 @@ Service contract (duck-typed)
   iterable of domain :class:`Page` objects.
 * **Live path** — same registry methods as :mod:`manga`:
   ``resolve_site_from_url`` / ``resolve_url`` / ``find_site_for_url``
-  and ``get_parser`` / ``parser_for``. All may be sync or async.
+  and ``get_parser`` / ``parser_for``. All may be sync or async. The
+  router **awaits** them if they return awaitables — sync-only
+  implementations are still accepted, but a hosted async
+  ``SiteRegistry`` is the assumed shape (as in the rest of NexusDL).
 """
 from __future__ import annotations
 
@@ -186,7 +205,10 @@ async def get_chapter(
         "file on disk). `url` may also be present for reference.\n"
         "* **Live chapter** (via `?url=`): each page carries `url` (the "
         "remote source image). `filename` is `null`.\n"
-        "* The response tells the two apart via `downloaded: bool`.\n\n"
+        "* The response tells the two apart via `downloaded: bool`.\n"
+        "* A chapter that exists in the library but has no stored pages "
+        "yet returns `200 {pages: [], downloaded: true, total: 0}` — "
+        "never a 404.\n\n"
         "Pages are returned in reading order, `index` starting at 0."
     ),
     responses={
@@ -220,6 +242,7 @@ async def list_chapter_pages(
         chapter_id=chapter_id,
         pages=page_schemas,
         total=len(page_schemas),
+        downloaded=downloaded,
     )
 
 
@@ -299,8 +322,14 @@ async def _parse_live_chapter(
     site_id: str | None,
     services: ServicesDep,
 ) -> Any | None:
-    """Parse the parent manga and find a chapter whose id matches."""
-    resolved_site_id = site_id or _resolve_site_from_url(url, services)
+    """Parse the parent manga and find a chapter whose id matches.
+
+    Returns ``None`` when no chapter matches — the caller raises 404.
+    Logs a ``WARNING`` when chapters were parsed but none matched,
+    which is the signature of a parser that returns raw source ids
+    instead of the canonical ``sha256(manga_id:source_id)[:16]``.
+    """
+    resolved_site_id = site_id or await _resolve_site_from_url(url, services)
     if not resolved_site_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -324,9 +353,29 @@ async def _parse_live_chapter(
 
     manga = await _call_parser(parser, "get_manga", url)
     chapters = await _call_parser(parser, "get_chapters", manga)
-    for candidate in chapters or ():
+
+    chapters_list = list(chapters or [])
+    for candidate in chapters_list:
         if _extract_chapter_id(candidate) == chapter_id:
             return candidate
+
+    # Diagnostic: no match despite parsed chapters. Likely contract
+    # violation (parser returns raw source ids instead of the canonical
+    # hash). Log a bounded sample of the observed ids — the operator
+    # needs this to diagnose the parser without leaking full source URLs.
+    if chapters_list:
+        sample = [
+            _extract_chapter_id(c) for c in chapters_list[:5]
+        ]
+        _log.warning(
+            "live parse produced {} chapter(s) but none matched "
+            "chapter_id={!r} (sample ids: {!r}, url={!r}, site={!r})",
+            len(chapters_list),
+            chapter_id,
+            sample,
+            url,
+            resolved_site_id,
+        )
     return None
 
 
@@ -348,15 +397,21 @@ async def _resolve_pages(
     ``downloaded`` tells the caller whether the pages came from the
     library (``True``) or from a live parse (``False``). The two lists
     have different field semantics — see the module docstring.
+
+    If the chapter exists in the library but has no stored pages, returns
+    ``(chapter, [], True)`` — an empty-but-downloaded response. Never
+    falls through to the live parser in that case: the client did not
+    supply a URL (they got here from the library), and returning a 404
+    for a chapter that clearly exists would be wrong.
     """
     # 1. Library chapter + pages.
     library_chapter = await _library_get_chapter(services, chapter_id)
     if library_chapter is not None:
         library_pages = await _library_get_pages(services, chapter_id)
-        if library_pages is not None:
-            return library_chapter, list(library_pages), True
-        # Chapter exists in library but pages were not stored (partial
-        # download, DB-only entry, …). Fall through to live if possible.
+        # ``None`` (method missing / raised) means "no library pages
+        # source"; an empty list means "library has 0 pages" — both are
+        # authoritative for the fact that we are in the library path.
+        return library_chapter, list(library_pages or []), True
 
     # 2. Live fallback requires a URL.
     if not url:
@@ -374,8 +429,21 @@ async def _resolve_pages(
             "Verify the `url` points to the parent manga."
         ))
 
-    resolved_site_id = site_id or _resolve_site_from_url(url, services)
-    parser = await _get_parser(resolved_site_id or "", services)
+    resolved_site_id = site_id or await _resolve_site_from_url(url, services)
+    if not resolved_site_id:
+        # ``_parse_live_chapter`` already required a non-empty site id;
+        # reaching this branch means the registry gave different answers
+        # for two consecutive lookups. Fail clearly instead of passing
+        # ``""`` to ``_get_parser``.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_response(
+                ErrorCode.INTERNAL_ERROR,
+                "Registry site resolution is not deterministic.",
+            ).model_dump(),
+        )
+
+    parser = await _get_parser(resolved_site_id, services)
     if parser is None:
         raise _not_found_chapter(chapter_id, hint=(
             f"Site {resolved_site_id!r} is not enabled on this server."
@@ -390,8 +458,10 @@ async def _library_get_pages(
 ) -> list[Any] | None:
     """Fetch pages from the library, tolerant to shape.
 
-    Returns ``None`` when the method is absent or fails — the caller
-    falls through to the live path.
+    Returns ``None`` only when the method is absent or fails —
+    "library does not expose pages at all". An empty list from a
+    successful call is a valid result (the chapter exists but has no
+    stored pages).
     """
     method = getattr(services.library, "get_pages", None)
     if not callable(method):
@@ -404,7 +474,7 @@ async def _library_get_pages(
         _log.exception("library.get_pages raised for {}", chapter_id)
         return None
     if result is None:
-        return None
+        return []
     try:
         return list(result)
     except TypeError:
@@ -419,10 +489,22 @@ async def _library_get_pages(
 # share the same registry / parser contract but must remain independent
 # modules so each can evolve without touching the other. Any change to
 # the registry interface should land in both files in the same PR.
+#
+# **Async-first**: the ``SiteRegistry`` implementation in NexusDL is
+# async. Every candidate method is awaited if it returns an awaitable —
+# a sync-only implementation is still accepted (for tests), but skipping
+# the await (as a previous version did) silently disables the live
+# fallback on every async registry.
 
 
-def _resolve_site_from_url(url: str, services: ServicesDep) -> str | None:
-    """Try several method names to resolve a URL to a site id."""
+async def _resolve_site_from_url(
+    url: str, services: ServicesDep
+) -> str | None:
+    """Try several method names to resolve a URL to a site id.
+
+    Async-first: awaits the return value if it is awaitable. Sync-only
+    implementations (tests, alternate registries) are also supported.
+    """
     for name in (
         "resolve_site_from_url",
         "resolve_url",
@@ -434,10 +516,7 @@ def _resolve_site_from_url(url: str, services: ServicesDep) -> str | None:
         try:
             result = method(url)
             if inspect.isawaitable(result):
-                _log.debug(
-                    "registry.{} returned an awaitable; skipping", name
-                )
-                continue
+                result = await result
             if result is None:
                 continue
             if hasattr(result, "id"):
@@ -533,6 +612,12 @@ def _to_page_schema(page: Any, *, index: int) -> PageSchema:
     with ``url`` set. Both may be present when the domain object carries
     them. ``index`` is authoritative from the router — ensures pages are
     emitted in order even if the domain objects have stale indices.
+
+    On projection failure, emits ``PageSchema(index=index, url="")``
+    rather than raising — a single bad page must not fail the whole
+    response. The client can flag the gap and retry the specific page.
+    ``url=""`` (rather than ``None``) is used because the current
+    ``PageSchema`` contract declares ``url: str``.
     """
     try:
         if isinstance(page, PageSchema):
@@ -625,9 +710,16 @@ def _not_found_chapter(
 #     Do not import from ``manga.py`` — the routers are independent
 #     modules by design; the duplication is intentional and small.
 #
+# [ ] ``_resolve_site_from_url`` MUST await its result if awaitable.
+#     The ``SiteRegistry`` in NexusDL is async; skipping the await
+#     silently disables the live fallback for every request without an
+#     explicit ``site_id=``.
+#
 # [ ] Any new ``?url=`` based resolution preserves the "parser is
 #     deterministic" assumption. If a future parser violates it, the
-#     fix goes in the parser, not here.
+#     fix goes in the parser, not here. The router logs a ``WARNING``
+#     when a non-zero chapter list yields no id match — use it to spot
+#     contract violations in production.
 #
 # [ ] New page fields are added to ``PageSchema`` (responses.py) and
 #     populated in ``_to_page_schema``. Never ``model_validate`` a raw
@@ -637,3 +729,8 @@ def _not_found_chapter(
 # [ ] A failed page projection does **not** fail the whole response.
 #     ``_to_page_schema`` emits an empty ``url`` entry on error; the
 #     client can flag the gap and retry the specific page.
+#
+# [ ] A chapter that exists in the library but has no stored pages
+#     returns ``(chapter, [], True)`` — never falls through to the live
+#     path and never returns a 404. The client sees an empty-but-
+#     downloaded response, which is the correct semantic.

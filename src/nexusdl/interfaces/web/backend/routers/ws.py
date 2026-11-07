@@ -45,6 +45,21 @@ Browser clients see a generic ``onerror`` / ``onclose(1006)``; native
 clients (``websockets``, ``httpx``, curl) see the 403. Clients that need
 to distinguish "bad token" from "server down" should call
 ``GET /api/v1/auth/me`` first and open the socket only on 200.
+
+Logging
+=======
+
+Every authentication failure is logged:
+
+* missing token → ``debug`` (common: unauthenticated reconnect),
+* invalid / expired token → ``info`` (useful for abuse detection,
+  includes a bounded 8-char token prefix so operators can correlate
+  without exposing the full token),
+* unexpected ``verify_access`` exception (backend outage, bug) →
+  ``error`` with traceback.
+
+The client IP is included in every record. The full token is **never**
+logged.
 """
 from __future__ import annotations
 
@@ -57,6 +72,7 @@ from loguru import logger as _logger
 
 from ..dependencies import get_auth_service, get_connection_manager
 from ..schemas.ws import MAX_MESSAGE_SIZE, WSCloseCode, parse_client_message
+from ..security import TokenError
 from ..websocket import (
     AuthContext,
     TooManyConnectionsError,
@@ -100,6 +116,10 @@ async def events_endpoint(
     # --- 1. Extract and verify the token -------------------------------
     raw_token = _extract_token(websocket, token)
     if not raw_token:
+        _log.debug(
+            "WS auth rejected: missing token (client={})",
+            _client_of(websocket),
+        )
         await _reject(
             websocket,
             WSCloseCode.AUTH_FAILED,
@@ -109,14 +129,36 @@ async def events_endpoint(
 
     try:
         payload = await service.verify_access(raw_token)
-    except Exception:
-        # TokenExpired / Revoked / Invalid / TypeMismatch — all become
-        # the same 403 rejection. The client can't act differently on
-        # the subtypes at the HTTP layer, so we don't distinguish here.
+    except TokenError as exc:
+        # Expected auth failure (expired, revoked, invalid signature,
+        # wrong type). Log at INFO with a bounded token prefix — enough
+        # for operators to correlate client reports, not enough to
+        # reconstitute the secret.
+        _log.info(
+            "WS auth rejected: reason={} token_prefix={} client={}",
+            type(exc).__name__,
+            raw_token[:8],
+            _client_of(websocket),
+        )
         await _reject(
             websocket,
             WSCloseCode.AUTH_FAILED,
             "invalid or expired token",
+        )
+        return
+    except Exception:
+        # Programming error, backend outage (revocation store unreachable,
+        # DB error), or any other *non-credential* failure. Do NOT mask
+        # as 403 "invalid token" — the client's credential is not the
+        # problem, the server is. Log with traceback.
+        _log.exception(
+            "WS auth verification raised unexpectedly; client={}",
+            _client_of(websocket),
+        )
+        await _reject(
+            websocket,
+            WSCloseCode.INTERNAL_ERROR,
+            "authentication backend unavailable",
         )
         return
 
@@ -197,6 +239,16 @@ async def _receive_loop(
                 )
             )
             continue
+        except UnicodeDecodeError:
+            # Binary frame with invalid UTF-8 — ``receive_json`` decodes
+            # to text first, so this surfaces here.
+            conn.enqueue(
+                WSErrorPayload(
+                    code="INVALID_ENCODING",
+                    message="Message must be UTF-8 encoded text.",
+                )
+            )
+            continue
         except Exception:
             # Transport is dead (TCP reset, protocol error, etc.).
             # The manager's heartbeat / send loop will reap us; log at
@@ -209,14 +261,48 @@ async def _receive_loop(
             # and now (e.g. queue overflow triggered by an outgoing event).
             return
 
+        # --- Shape guard --------------------------------------------
+        # ``receive_json()`` already fully buffered the message, so the
+        # size check below is a **policy** limit, not a transport-level
+        # one. The transport-level guard is the ASGI server's
+        # ``--ws-max-size`` (or equivalent). We still enforce a policy
+        # cap because a single 100 MiB JSON blob is a DoS vector even
+        # if the server accepted it.
+        if not isinstance(raw, dict):
+            conn.enqueue(
+                WSErrorPayload(
+                    code="INVALID_MESSAGE",
+                    message="Message must be a JSON object.",
+                )
+            )
+            continue
+
         # --- Size guard ---------------------------------------------
-        if not isinstance(raw, (dict, list)) or len(str(raw)) > MAX_MESSAGE_SIZE:
+        # Use the actual UTF-8 wire bytes, not the Python ``repr`` size.
+        # ``str(raw)`` under-counts non-ASCII payloads and over-counts
+        # escaped ones, and — critically — raises ``RecursionError``
+        # on deeply nested JSON (10k+ levels fit under any reasonable
+        # ASGI max-size yet crash ``str(raw)``).
+        try:
+            serialized = json.dumps(
+                raw, ensure_ascii=False, separators=(",", ":"),
+            )
+            wire_bytes = len(serialized.encode("utf-8"))
+        except (TypeError, ValueError, RecursionError):
+            conn.enqueue(
+                WSErrorPayload(
+                    code="INVALID_MESSAGE",
+                    message="Message could not be serialized.",
+                )
+            )
+            continue
+
+        if wire_bytes > MAX_MESSAGE_SIZE:
             conn.enqueue(
                 WSErrorPayload(
                     code="MESSAGE_TOO_BIG",
                     message=(
-                        f"Message exceeds the {MAX_MESSAGE_SIZE} byte limit "
-                        "or is not a JSON object."
+                        f"Message exceeds the {MAX_MESSAGE_SIZE}-byte limit."
                     ),
                 )
             )
@@ -226,13 +312,33 @@ async def _receive_loop(
         try:
             parse_client_message(raw)
         except Exception as exc:
-            conn.enqueue(
-                WSErrorPayload(
-                    code="VALIDATION_ERROR",
-                    message="Invalid message envelope.",
-                    details={"errors": _safe_errors(exc)},
+            errors = _safe_errors(exc)
+            if errors:
+                # Expected Pydantic validation failure — report to the
+                # client with the normalized error shape.
+                conn.enqueue(
+                    WSErrorPayload(
+                        code="VALIDATION_ERROR",
+                        message="Invalid message envelope.",
+                        details={"errors": errors},
+                    )
                 )
-            )
+            else:
+                # ``parse_client_message`` raised something that is
+                # *not* a Pydantic validation error — that is a bug in
+                # the schema module or an unexpected condition. Do not
+                # lie to the client with "validation error" and no
+                # details; log it and return an honest internal error.
+                _log.exception(
+                    "parse_client_message raised unexpectedly id={}",
+                    conn.id[:8],
+                )
+                conn.enqueue(
+                    WSErrorPayload(
+                        code="INTERNAL_ERROR",
+                        message="Failed to validate message.",
+                    )
+                )
             continue
 
         # --- Dispatch -----------------------------------------------
@@ -243,6 +349,8 @@ async def _receive_loop(
         try:
             await manager.handle_message(conn, raw)
         except Exception:
+            # ``raw`` is guaranteed to be a ``dict`` at this point —
+            # the shape guard above would have ``continue``d otherwise.
             _log.exception(
                 "handle_message raised id={} type={}",
                 conn.id[:8],
@@ -291,6 +399,11 @@ async def _reject(
     response (the ``code`` argument is not transmitted over the wire in
     this path — it only affects the internal close state, which the ASGI
     server uses to log the rejection reason).
+
+    The caller is responsible for logging; this helper only closes the
+    transport. Splitting the two concerns keeps this function trivially
+    testable and avoids double-logging when the caller wants different
+    log levels for different reasons.
     """
     try:
         await websocket.close(code=int(code), reason=reason)
@@ -301,22 +414,76 @@ async def _reject(
         pass
 
 
+def _client_of(websocket: WebSocket) -> str:
+    """Return a printable client identifier (host) for logging.
+
+    ``websocket.client`` is an ``Address`` namedtuple in Starlette, but
+    the ASGI spec allows it to be ``None`` (e.g. Unix sockets). Falls
+    back to ``"?"`` in every ambiguous case — never raises.
+    """
+    try:
+        client = websocket.client
+    except Exception:
+        return "?"
+    if client is None:
+        return "?"
+    host = getattr(client, "host", None)
+    if host:
+        return str(host)
+    if isinstance(client, (tuple, list)) and client:
+        return str(client[0])
+    return "?"
+
+
 def _safe_errors(exc: BaseException) -> list[dict[str, Any]]:
     """Normalize a Pydantic ``ValidationError`` into a JSON-safe list.
 
+    Mirrors :func:`main._install_exception_handlers`'s normalization so
+    the wire format is identical between HTTP validation errors and
+    WebSocket validation errors. Only ``loc``, ``msg``, and ``type``
+    survive; ``ctx`` / ``input`` / ``url`` are stripped because they
+    may contain values that are not JSON-serializable (arbitrary
+    Python objects passed to validators). A non-serializable error
+    would crash the WebSocket send loop, killing the session — the
+    exact opposite of the intent.
+
+    Returns an empty list if the exception is not a Pydantic
+    ``ValidationError`` — the caller treats an empty list as "this was
+    not a validation error" and handles it accordingly.
+
     ``errors()`` in Pydantic v2 accepts ``include_url`` and
-    ``include_input`` kwargs; earlier versions only accept ``include_url``.
-    Both shapes are attempted so this helper works across versions.
+    ``include_input`` kwargs; earlier versions only accept
+    ``include_url``. Both shapes are attempted so this helper works
+    across versions.
     """
     errors_fn = getattr(exc, "errors", None)
     if not callable(errors_fn):
         return []
+
     try:
-        return list(errors_fn(include_url=False, include_input=False))
+        raw_errors = list(errors_fn(include_url=False, include_input=False))
     except TypeError:
         try:
-            return list(errors_fn(include_url=False))
+            raw_errors = list(errors_fn(include_url=False))
         except TypeError:
-            return list(errors_fn())
+            try:
+                raw_errors = list(errors_fn())
+            except Exception:
+                return []
+        except Exception:
+            return []
     except Exception:
         return []
+
+    out: list[dict[str, Any]] = []
+    for e in raw_errors:
+        if not isinstance(e, dict):
+            continue
+        out.append(
+            {
+                "loc": [str(p) for p in e.get("loc", ())],
+                "msg": str(e.get("msg", "")),
+                "type": str(e.get("type", "")),
+            }
+        )
+    return out

@@ -18,10 +18,10 @@ Three classes, three concerns
 * :class:`SiteCapabilities` — the nine booleans describing *what the site
   can do* (search, pagination, chapter list, …). A pure value object; its
   only job is to be readable and to validate its own field types.
-* :class:`SiteConfig` — the immutable configuration of a site, matching the
-  per-site schema validated against ``sites_schema.json``. Every field the
-  YAML can carry is represented here, with the same constraints the schema
-  enforces.
+* :class:`SiteConfig` — the immutable configuration of a site, matching
+  the per-site schema validated against ``sites_schema.json``. Every field
+  the YAML can carry is represented here, with the same constraints the
+  schema enforces.
 * :class:`SiteHealthSnapshot` — the mutable-in-the-registry but
   immutable-in-this-object record of a site's last observed health state.
   Not part of the persisted configuration; regenerated on every health
@@ -55,8 +55,8 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, fields
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -104,6 +104,12 @@ DEFAULT_MAX_CONCURRENT_DOWNLOADS: Final[int] = 4
 #: YAML omits ``rate_limit``. Conservative — the manager will still respect
 #: the global limiter, so this is a site-specific upper bound.
 DEFAULT_RATE_LIMIT: Final[float] = 1.0
+
+#: Tolerance applied to timestamp-ordering checks inside
+#: :class:`SiteHealthSnapshot`. Health checks occasionally run on hosts
+#: whose clocks disagree by a couple of seconds; a small skew is not a
+#: data-integrity bug.
+_MAX_CLOCK_SKEW_SECONDS: Final[int] = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -181,16 +187,20 @@ class SiteCapabilities:
         at the boundary instead of letting a truthy ``1`` mask a
         capability check.
 
+        The iteration uses :func:`dataclasses.fields` rather than
+        ``__slots__`` so the check is robust to a future ``weakref_slot=True``
+        on this dataclass (which would add ``__weakref__`` to ``__slots__``).
+
         Raises:
             TypeError: If any field is not exactly ``bool``. ``int`` is
                 rejected even though ``bool`` is a subclass of ``int`` — the
                 reverse is what matters here.
         """
-        for field_name in self.__slots__:
-            value = getattr(self, field_name)
+        for f in fields(self):
+            value = getattr(self, f.name)
             if not isinstance(value, bool):
                 raise TypeError(
-                    f"SiteCapabilities.{field_name} must be a bool, "
+                    f"SiteCapabilities.{f.name} must be a bool, "
                     f"got {type(value).__name__}"
                 )
 
@@ -205,7 +215,7 @@ class SiteCapabilities:
             A tuple of field names, in declaration order.
         """
         return tuple(
-            name for name in self.__slots__ if getattr(self, name)
+            f.name for f in fields(self) if getattr(self, f.name)
         )
 
 
@@ -415,7 +425,9 @@ class SiteConfig:
                 )
 
         # --- max_concurrent_downloads --------------------------------- #
-        if not isinstance(self.max_concurrent_downloads, int):
+        if not isinstance(self.max_concurrent_downloads, int) or isinstance(
+            self.max_concurrent_downloads, bool
+        ):
             raise TypeError(
                 f"SiteConfig.max_concurrent_downloads must be an int, got "
                 f"{type(self.max_concurrent_downloads).__name__}"
@@ -465,15 +477,17 @@ class SiteConfig:
         Raises:
             AttributeError: If *capability* is not a capability flag.
         """
-        # ``getattr`` on a frozen slots dataclass with an unknown name
-        # raises AttributeError, which is the desired behaviour — no silent
-        # ``False`` for a typo.
-        value = getattr(self.capabilities, capability)
-        if not isinstance(value, bool):  # pragma: no cover — defensive
+        if capability not in {
+            f.name for f in fields(self.capabilities)
+        }:
+            # Reject both unknown names and known non-flag names (e.g.
+            # ``"enabled"``, which is a method, not a field). Without this
+            # guard, ``getattr`` would return the bound method, which is
+            # truthy and would silently succeed.
             raise AttributeError(
                 f"{capability!r} is not a SiteCapabilities flag"
             )
-        return value
+        return bool(getattr(self.capabilities, capability))
 
 
 # --------------------------------------------------------------------------- #
@@ -496,13 +510,14 @@ class SiteHealthSnapshot:
         last_check_at: UTC timestamp of the health check that produced
             this snapshot.
         last_ok_at: UTC timestamp of the most recent successful check, or
-            ``None`` if the site has never been observed healthy.
+            ``None`` if the site has never been observed healthy. Must be
+            ``<= last_check_at`` (tolerating a small clock skew).
         last_error: Human-readable description of the last failure, or
             ``None`` when the site is healthy.
         consecutive_failures: How many health checks in a row have failed.
-            ``0`` for a healthy site. Used by the registry to decide when
-            to emit ``site.health.changed`` and by UIs to render a
-            degraded indicator.
+            ``0`` for a healthy site; ``> 0`` for a ``DOWN`` site. Used by
+            the registry to decide when to emit ``site.health.changed``
+            and by UIs to render a degraded indicator.
     """
 
     site_id: str
@@ -517,34 +532,58 @@ class SiteHealthSnapshot:
 
         Raises:
             TypeError: On wrong Python types.
-            ValueError: On negative ``consecutive_failures``, a tz-naive
-                timestamp, or a ``HEALTHY`` status combined with a
-                positive ``consecutive_failures`` count (an internally
-                inconsistent snapshot should never be constructible).
+            ValueError: On empty ``site_id``, negative
+                ``consecutive_failures``, a tz-naive timestamp, a
+                ``HEALTHY`` status with ``consecutive_failures > 0``, a
+                ``DOWN`` status with ``consecutive_failures == 0``, or
+                ``last_ok_at`` later than ``last_check_at`` (tolerating a
+                small clock skew).
         """
-        if not isinstance(self.site_id, str) or not self.site_id:
-            raise TypeError("SiteHealthSnapshot.site_id must be a non-empty str")
+        if not isinstance(self.site_id, str):
+            raise TypeError(
+                "SiteHealthSnapshot.site_id must be a str, got "
+                f"{type(self.site_id).__name__}"
+            )
+        if not self.site_id:
+            raise ValueError("SiteHealthSnapshot.site_id must be non-empty")
         if not isinstance(self.status, SiteHealth):
             raise TypeError(
                 f"SiteHealthSnapshot.status must be a SiteHealth, got "
                 f"{type(self.status).__name__}"
             )
-        for field_name, value in (
-            ("last_check_at", self.last_check_at),
-            ("last_ok_at", self.last_ok_at),
-        ):
-            if value is None and field_name == "last_ok_at":
-                continue
-            if not isinstance(value, datetime):
+
+        if not isinstance(self.last_check_at, datetime):
+            raise TypeError(
+                "SiteHealthSnapshot.last_check_at must be a datetime, got "
+                f"{type(self.last_check_at).__name__}"
+            )
+        if self.last_check_at.tzinfo is None:
+            raise ValueError(
+                "SiteHealthSnapshot.last_check_at must be timezone-aware"
+            )
+
+        if self.last_ok_at is not None:
+            if not isinstance(self.last_ok_at, datetime):
                 raise TypeError(
-                    f"SiteHealthSnapshot.{field_name} must be a datetime, "
-                    f"got {type(value).__name__}"
+                    "SiteHealthSnapshot.last_ok_at must be a datetime or "
+                    f"None, got {type(self.last_ok_at).__name__}"
                 )
-            if value.tzinfo is None:
+            if self.last_ok_at.tzinfo is None:
                 raise ValueError(
-                    f"SiteHealthSnapshot.{field_name} must be timezone-aware"
+                    "SiteHealthSnapshot.last_ok_at must be timezone-aware"
                 )
-        if not isinstance(self.consecutive_failures, int):
+            skew = timedelta(seconds=_MAX_CLOCK_SKEW_SECONDS)
+            if self.last_ok_at > self.last_check_at + skew:
+                raise ValueError(
+                    "SiteHealthSnapshot.last_ok_at must be <= "
+                    f"last_check_at (tolerating {_MAX_CLOCK_SKEW_SECONDS}s "
+                    f"clock skew) ({self.last_ok_at.isoformat()} > "
+                    f"{self.last_check_at.isoformat()})"
+                )
+
+        if not isinstance(self.consecutive_failures, int) or isinstance(
+            self.consecutive_failures, bool
+        ):
             raise TypeError(
                 "SiteHealthSnapshot.consecutive_failures must be an int, "
                 f"got {type(self.consecutive_failures).__name__}"
@@ -561,6 +600,15 @@ class SiteHealthSnapshot:
             raise ValueError(
                 "SiteHealthSnapshot cannot be HEALTHY with "
                 f"consecutive_failures={self.consecutive_failures}"
+            )
+        if (
+            self.status is SiteHealth.DOWN
+            and self.consecutive_failures == 0
+        ):
+            raise ValueError(
+                "SiteHealthSnapshot cannot be DOWN with "
+                "consecutive_failures=0 (a DOWN state implies at least "
+                "one consecutive failure)"
             )
         if self.last_error is not None and not isinstance(self.last_error, str):
             raise TypeError(

@@ -35,6 +35,20 @@ invoked when needed:
    retry once.
 3. If the retry also fails, raise :class:`~nexusdl.core.exceptions.PackagingError`.
 
+**The retry is targeted.** Only failures that indicate an *image format*
+problem trigger the PNG fallback:
+
+* ``img2pdf.ImageOpenError`` — img2pdf could not open the image.
+* ``img2pdf.AlphaChannelError`` — an alpha channel needs flattening.
+* ``ValueError`` — Pillow's decoder rejects the image.
+
+A ``PermissionError`` on a source file, an ``OSError`` from a disk-full
+condition, or a ``MemoryError`` from a pathological page **do not**
+trigger the fallback: retrying with the same source file will fail the
+same way, and the fallback only hides the real cause. Those exceptions
+propagate as ``PackagingError`` with the underlying error preserved as
+``__cause__``.
+
 Multi-frame images (multi-page TIFF, animated GIF — though the validator
 rejects GIFs) are converted to their **first frame** with a ``WARNING``
 log entry, matching the converter's behaviour. Silent page loss is never
@@ -64,10 +78,11 @@ Filesystem safety and cancellation
 ----------------------------------
 Writes are atomic: the PDF is built in a
 :class:`tempfile.TemporaryDirectory` inside the output directory, then
-``fsync``'d and :meth:`Path.replace`'d onto the final path. The temp
-directory is guaranteed to be cleaned up even if the async caller is
-cancelled mid-build, because cleanup happens inside the worker thread
-via the ``TemporaryDirectory`` context manager, not in the caller.
+``fsync``'d, :meth:`Path.replace`'d onto the final path, and the parent
+directory is ``fsync``'d to make the rename durable. The temp directory
+is guaranteed to be cleaned up even if the async caller is cancelled
+mid-build, because cleanup happens inside the worker thread via the
+``TemporaryDirectory`` context manager, not in the caller.
 
 Async model
 -----------
@@ -82,6 +97,7 @@ Dependency graph (no cycles)::
     core.models.enums       ├──► core.packaging.pdf_packager
     core.models.page        │
     core.packaging.base    ─┘
+    core.utils.filesystem  ─┘  (fsync_directory only)
 """
 
 from __future__ import annotations
@@ -101,6 +117,7 @@ from nexusdl.core.exceptions import PackagingError
 from nexusdl.core.models.enums import PackagingFormat
 from nexusdl.core.models.page import Page
 from nexusdl.core.packaging.base import BasePackager
+from nexusdl.core.utils.filesystem import fsync_directory
 
 if TYPE_CHECKING:
     from nexusdl.core.packaging.comic_info import ComicInfo
@@ -142,6 +159,19 @@ _BACKGROUND: Final[tuple[int, int, int]] = (255, 255, 255)
 
 
 _log = logger.bind(component="packaging.pdf")
+
+
+#: Exception types that indicate an *image format* problem — the only
+#: failures the PNG fallback is meant to handle. Anything else (a
+#: ``PermissionError`` on the source file, a ``MemoryError``, a
+#: ``KeyboardInterrupt``-adjacent ``Exception`` from an exotic Pillow
+#: plugin) must propagate unchanged so the caller can diagnose the real
+#: cause.
+_IMAGE_FORMAT_ERRORS: Final[tuple[type[BaseException], ...]] = (
+    img2pdf.ImageOpenError,
+    img2pdf.AlphaChannelError,
+    ValueError,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -270,23 +300,18 @@ class PdfPackager(BasePackager):
             direct_paths = [src for _, src in sorted_pages]
             try:
                 _write_pdf(direct_paths, intermediate, metadata_kwargs)
-            except Exception as exc:  # noqa: BLE001 — see rationale below
-                # ``img2pdf`` raises a number of format-specific
-                # exceptions (ImageOpenError, AlphaChannelError,
-                # PdfTooLargeError, and ``OSError``/``ValueError`` from
-                # Pillow's own decoder). Rather than enumerate them all —
-                # which would go stale as soon as a new Pillow plugin
-                # raises something new — we treat any failure as a signal
-                # to retry with the PNG-conversion fallback.
-                #
-                # ``BaseException`` (including ``CancelledError``) is
-                # **not** caught here, because that would swallow
-                # cancellation. The fallback only handles ordinary
-                # ``Exception`` subclasses, which is what image and I/O
-                # failures are.
+            except _IMAGE_FORMAT_ERRORS as exc:
+                # Targeted fallback — see the module docstring's
+                # "Format handling" section. Only image-format failures
+                # (img2pdf rejecting the file, Pillow's decoder raising
+                # ``ValueError``) trigger the PNG retry. A
+                # ``PermissionError`` on the source file, a disk-full
+                # ``OSError``, or a ``MemoryError`` propagate unchanged
+                # — retrying with the same source file would fail the
+                # same way and only hide the real cause.
                 _log.debug(
-                    "Direct img2pdf failed ({}: {}); converting all "
-                    "pages to PNG and retrying",
+                    "Direct img2pdf failed with {}: {}; converting "
+                    "all pages to PNG and retrying",
                     type(exc).__name__,
                     exc,
                 )
@@ -330,7 +355,8 @@ def _write_pdf(
     """Run ``img2pdf`` to build the PDF at *output_path*.
 
     No exception translation: the caller inspects any failure and decides
-    whether to retry with the PNG-conversion fallback.
+    whether to retry with the PNG-conversion fallback (via the tuple of
+    exception types in :data:`_IMAGE_FORMAT_ERRORS`).
 
     Args:
         image_paths: Paths to the images to embed, in reading order.
@@ -502,7 +528,15 @@ def _build_pdf_creation_date(comic_info: ComicInfo) -> str | None:
         present.
     """
     year = getattr(comic_info, "year", None)
-    if not isinstance(year, int) or year <= 0 or year > 9999:
+    # ``bool`` is a subclass of ``int`` and would pass the ``isinstance``
+    # check below, producing ``D:0001...`` from a truthy value that is
+    # not really a year. Reject it explicitly.
+    if (
+        isinstance(year, bool)
+        or not isinstance(year, int)
+        or year <= 0
+        or year > 9999
+    ):
         return None
     month = getattr(comic_info, "month", None)
     month = month if isinstance(month, int) and 1 <= month <= 12 else 1
@@ -512,7 +546,25 @@ def _build_pdf_creation_date(comic_info: ComicInfo) -> str | None:
 
 
 def _fsync_and_replace(temp_path: Path, target: Path) -> None:
-    """``fsync`` *temp_path* then atomically replace *target*.
+    """``fsync`` *temp_path*, rename it onto *target*, fsync the parent.
+
+    Three steps, each of which is required for the atomic-write contract
+    documented in the module docstring:
+
+    1. **fsync the temp file's content.** Opens the file read-only —
+       ``fsync(2)`` accepts an fd in ``O_RDONLY`` and flushes all dirty
+       pages of the inode regardless of the open mode, so a write-capable
+       fd is not required (and would fail on some filesystems where the
+       file is read-only by design).
+    2. **Atomically rename the temp file onto the target.** ``Path.replace``
+       is atomic on every filesystem that supports POSIX rename
+       semantics.
+    3. **fsync the parent directory.** Without this step a crash between
+       the rename and the next directory flush can revert the rename —
+       the target file disappears, the temp file reappears under its
+       old name. This is the "durability of the rename itself"
+       guarantee that :func:`nexusdl.core.utils.filesystem.fsync_directory`
+       exists to provide.
 
     Args:
         temp_path: The just-written intermediate file.
@@ -521,6 +573,7 @@ def _fsync_and_replace(temp_path: Path, target: Path) -> None:
     Raises:
         OSError: If the fsync or the rename fails.
     """
-    with temp_path.open("rb+") as fh:
+    with temp_path.open("rb") as fh:
         os.fsync(fh.fileno())
     temp_path.replace(target)
+    fsync_directory(target.parent)

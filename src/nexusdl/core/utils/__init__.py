@@ -146,9 +146,9 @@ acknowledged and documented rather than hidden.
 
 Lazy loading
 ------------
-All ~84 exports are resolved through PEP 562's ``__getattr__``
-mechanism. Importing ``nexusdl.core.utils`` **does not import any
-submodule**.
+Every export in ``__all__`` is resolved through PEP 562's
+``__getattr__`` mechanism. Importing ``nexusdl.core.utils`` **does not
+import any submodule**.
 
 The gain here is smaller than in other packages in the project (the
 utility modules are predominantly stdlib-only), but it is real and it
@@ -231,18 +231,21 @@ module and are allowed to change without notice:
 * ``_ID_SEPARATOR``, ``_ID_ENCODING`` in ``hash.py`` — the id formula's
   internal composition, not part of the API.
 * ``_SIZE_UNITS``, ``_SIZE_STEP``, ``_INVALID_FILENAME_CHARS``,
-  ``_TEMP_FILE_PREFIX_FMT``, ``_BACKUP_DIR_SUFFIX`` in
-  ``filesystem.py`` — internal implementation details.
+  ``_WINDOWS_RESERVED_NAMES``, ``_TEMP_FILE_PREFIX_FMT``,
+  ``_BACKUP_DIR_SUFFIX`` in ``filesystem.py`` — internal implementation
+  details.
 * ``_TRUE_STRINGS``, ``_FALSE_STRINGS``, ``_BLOCK_CLOSING_TAGS``,
   ``_BR_TAGS``, ``_HTML_TAG``, ``_WHITESPACE_RUN``, ``_NUMBER``,
-  ``_TEMPLATE``, ``DEFAULT_TRUNCATION_SUFFIX``,
-  ``DEFAULT_SLUG_FALLBACK``, ``DEFAULT_SLUG_MAX_LENGTH`` in
-  ``text.py`` — implementation details and defaults; a caller who
-  wants a specific truncation suffix passes it as an argument.
-* ``_background_tasks``, ``_log_background_exception`` in
-  ``async_helpers.py`` — module-private task registry and callback.
+  ``DEFAULT_TRUNCATION_SUFFIX``, ``DEFAULT_SLUG_FALLBACK``,
+  ``DEFAULT_SLUG_MAX_LENGTH`` in ``text.py`` — implementation details
+  and defaults; a caller who wants a specific truncation suffix passes
+  it as an argument.
+* ``_background_tasks``, ``_log_background_exception``,
+  ``_caller_is_being_cancelled`` in ``async_helpers.py`` —
+  module-private task registry and helpers.
 * ``_parse``, ``_sort_query`` in ``url.py``; ``_check_time_budget``,
-  ``_should_retry`` in ``retry.py`` — internal helpers.
+  ``_should_retry``, ``_compute_delay`` in ``retry.py`` — internal
+  helpers.
 * ``_TEMP_PREFIX_FMT`` (the packager-owned variant) — modules that
   share the convention reference their own copy; this module exports
   the canonical helper, not the constant.
@@ -612,6 +615,11 @@ def __getattr__(name: str) -> Any:
     :class:`AttributeError` so that ``hasattr``, ``getattr(x, name,
     default)`` and interactive introspection behave as users expect.
 
+    The catch is intentionally broadened from ``ModuleNotFoundError`` to
+    ``ImportError`` — a partially-initialized submodule (missing symbol,
+    circular import resolved differently across Python versions) also
+    deserves the install hint rather than a raw traceback.
+
     Args:
         name: The attribute name being accessed.
 
@@ -651,8 +659,9 @@ def __getattr__(name: str) -> Any:
     submodule_basename, attr_name = entry
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
-    except ModuleNotFoundError as exc:
-        # Optional dependency missing from the utilities package.
+    except ImportError as exc:
+        # ``ImportError`` is broader than ``ModuleNotFoundError`` on
+        # purpose — see the docstring.
         if exc.name in {"slugify", "loguru"}:
             raise ImportError(
                 f"{name!r} requires the core extra "
@@ -664,13 +673,18 @@ def __getattr__(name: str) -> Any:
 
     try:
         value = getattr(module, attr_name)
-    except AttributeError:
+    except AttributeError as exc:
+        # ``from exc`` preserves the cause. A ``getattr`` on a healthy
+        # module raises ``AttributeError`` with the standard message;
+        # an exotic failure (a broken descriptor, a partially-initialised
+        # class) shows up with its own message attached, which is the
+        # diagnostic the operator needs.
         raise AttributeError(
             f"The utility submodule {submodule_basename!r} does not "
             f"define {attr_name!r}. This is a package-internal "
             f"inconsistency - nexusdl.core.utils.__all__ and the "
-            f"submodules are out of sync."
-        ) from None
+            f"submodules are out of sync. Original error: {exc}"
+        ) from exc
 
     # Cache in the module namespace so subsequent lookups bypass
     # __getattr__ entirely (same behavior as a top-level import).
@@ -679,21 +693,29 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """Return the public names for interactive introspection.
+    """Return the package's visible attributes, including lazy exports.
 
-    Python's default :func:`dir` implementation collects a module's
-    ``__dict__`` and, when the module defines ``__getattr__``, calls it
-    with each candidate name to decide what to display. Because none of
-    the ~84 exports are present in ``__dict__`` at import time, an
-    unmodified :func:`dir` would not list them - the package would
-    appear empty in a REPL.
+    Python's default :func:`dir` on a module already lists ``__all__``
+    entries even when they are not bound in ``__dict__`` — so without
+    this override, ``make_manga_id``, ``RetryPolicy``, etc. would still
+    appear. Keeping the override explicit serves two purposes:
 
-    The returned list is :data:`__all__` plus the standard module
-    dunders a user typically expects to see.
+    1. It documents that the utility exports are *intentional*
+       attributes of this package, not accidental names.
+    2. It preserves the module's actual attributes (``__file__``,
+       ``__spec__``, ``__loader__``, ``__dict__``, ``__getattr__``,
+       ``__dir__``, ``list_symbols``, ``get_symbol``, …) alongside the
+       lazy ones — a plain ``dir`` would include them anyway, but
+       spelling out the union makes the contract explicit and future-
+       proof against refactors that change how ``__all__`` is built.
+
+    The result is the union of the module's actual namespace (dunders,
+    introspection helpers, any submodule already imported and cached by
+    :func:`__getattr__`) and :data:`__all__`, deduplicated and sorted
+    so that ``dir()`` output is stable across Python versions and
+    repeat calls.
     """
-    return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
-    )
+    return sorted(set(globals()) | set(__all__))
 
 
 # ===========================================================================
@@ -706,9 +728,9 @@ def list_symbols() -> list[str]:
     Useful for parametrized tests (``@pytest.mark.parametrize("name",
     list_symbols())``), documentation generators, and tooling that needs
     to enumerate the utilities' public surface without importing every
-    submodule. This is the largest ``__all__`` in the project (~84
-    symbols); a docs generator that wants to render the whole surface
-    without paying the import cost will find this function useful.
+    submodule. The list is derived from :data:`_LAZY` — it reflects the
+    actual lazy registry, not a hand-maintained second list that could
+    drift from :data:`__all__`.
     """
     # Only the public exports, not the introspection helpers themselves -
     # otherwise ``list_symbols`` would include itself.
@@ -723,6 +745,12 @@ def get_symbol(name: str) -> Any:
     (parametrized tests, documentation generators that need to introspect
     the surface, external packages that resolve a helper by name).
 
+    The lookup goes through :func:`__getattr__` so the resolution is
+    cached in ``globals()`` and subsequent calls do not pay the
+    ``importlib`` overhead again — and so a missing optional dependency
+    surfaces as an :class:`ImportError` with the ``nexusdl[core]`` hint,
+    not a raw ``ModuleNotFoundError``.
+
     Raises:
         KeyError: If ``name`` is not a public utility export.
     """
@@ -733,4 +761,4 @@ def get_symbol(name: str) -> Any:
             f"Every other symbol lives in its specific submodule - import "
             f"from 'nexusdl.core.utils.<submodule>' directly."
         )
-    return getattr(__import__(__name__, fromlist=[name]), name)
+    return __getattr__(name)

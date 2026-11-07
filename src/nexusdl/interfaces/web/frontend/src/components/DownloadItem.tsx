@@ -73,6 +73,17 @@
  * running — this component does not display them (it is a summary row, not
  * a detail view).
  *
+ * Site display
+ * ------------
+ * ``DownloadTask`` on the wire carries only ``site_id`` — the resolver
+ * that would add a ``site_name`` field is not yet part of the backend
+ * contract (``Manga`` and ``SearchResult`` already do this; ``DownloadTask``
+ * is the last holdout).  Until that resolver lands, the metadata line shows
+ * the raw ``site_id``.  A future iteration will swap this to the resolved
+ * name once :type:`~../types/download.DownloadTask` gains a ``site_name``
+ * field — the only line that needs to change is the first part of
+ * :func:`buildMetaLine`.
+ *
  * Accessibility
  * -------------
  * * The row is not focusable itself; the interactive elements (action
@@ -80,10 +91,15 @@
  * * Each action button has an explicit ``aria-label`` describing the
  *   action **and** the manga it applies to, so a screen reader announces
  *   "Pause download Berserk" rather than a bare "Pause".
- * * The status badge is a ``<span>`` with ``role="status"`` and
- *   ``aria-live="polite"`` on a wrapper, so status transitions
- *   (running → done, running → failed) are announced without the caller
- *   wiring a live region manually.
+ * * The status badge is a ``<span role="status">``.  It deliberately does
+ *   **not** carry ``aria-live="polite"``: a download list renders one
+ *   badge per task, and an ``aria-live`` on each would produce a chorus
+ *   of announcements on bulk transitions (e.g. "Clear finished" removing
+ *   ten terminal tasks).  A caller that wants live status announcements
+ *   should add **one** ``aria-live`` region on the list container, or
+ *   gate it on the presence of a single item (task-detail page).  The
+ *   ``role="status"`` alone is enough to convey the semantic role of the
+ *   badge to assistive technology.
  * * The metadata line and the progress bar carry the same information
  *   visually and to assistive technology — the bar's ``aria-valuetext``
  *   duplicates the human-readable value that the metadata line shows,
@@ -247,6 +263,12 @@ function computeProgress(task: DownloadTask): {
  * completed one needs its duration, a failed one needs its error message.
  * Every part is optional and empty parts are omitted, so a task with no
  * byte count never renders a dangling separator.
+ *
+ * **Note on site display.**  ``DownloadTask`` on the wire carries only
+ * ``site_id``, not ``site_name``.  The first part of the line therefore
+ * shows the raw id until the backend adds a resolver to the wire format
+ * (see the module docstring).  When that happens, only the first
+ * ``parts.push(...)`` line needs to change.
  */
 function buildMetaLine(task: DownloadTask): string {
   const parts: string[] = [task.site_id];
@@ -323,10 +345,10 @@ function buildMetaLine(task: DownloadTask): string {
 /**
  * The status badge.
  *
- * Rendered as a ``<span>`` inside a ``role="status"`` wrapper so that
- * transitions are announced politely.  The wrapper is on every status, not
- * only the terminal ones, because a transition from ``paused`` back to
- * ``running`` is exactly as informative as a transition to ``done``.
+ * Rendered as a ``<span role="status">`` — the semantic role of "a status
+ * the user might want to be told about" without an ``aria-live`` region.
+ * See the module docstring's accessibility section for why the live
+ * region is the caller's responsibility, not the badge's.
  */
 function StatusBadge({ status }: { status: DownloadStatus }) {
   const meta = STATUS_META[status];
@@ -335,8 +357,6 @@ function StatusBadge({ status }: { status: DownloadStatus }) {
   return (
     <span
       role="status"
-      aria-live="polite"
-      aria-atomic="true"
       className={cn(
         "inline-flex shrink-0 items-center gap-1 rounded-full",
         "px-2 py-0.5 text-xs font-medium ring-1 ring-inset",
@@ -481,7 +501,20 @@ export function DownloadItem({
       key: "cancel",
       icon: X,
       label: `Cancel download of ${task.manga_title}`,
-      onClick: () => onCancel(task.id),
+      onClick: () => {
+        // Cancel is a deliberate action on a still-active task — it may
+        // leave half-downloaded chapters on disk.  Confirm before firing
+        // so a misclick does not discard work in progress.  The
+        // ``onCancel`` callback itself is still responsible for the API
+        // call and the store update; this is purely a UX guardrail.
+        const confirmed = window.confirm(
+          `Cancel the download of "${task.manga_title}"? ` +
+            "Chapters already downloaded are kept.",
+        );
+        if (confirmed) {
+          onCancel(task.id);
+        }
+      },
       destructive: true,
     });
   }
@@ -490,7 +523,20 @@ export function DownloadItem({
       key: "remove",
       icon: Trash2,
       label: `Remove ${task.manga_title} from the download list`,
-      onClick: () => onRemove(task.id),
+      onClick: () => {
+        // "Remove" deletes the row from the client-side list.  The task
+        // is already terminal, so no server-side work is discarded — the
+        // backend retains its history for audit.  Still, removing a row
+        // is irreversible from the user's point of view, so a confirm
+        // matches the "Clear finished" flow on the downloads page.
+        const confirmed = window.confirm(
+          `Remove "${task.manga_title}" from the download list? ` +
+            "The backend keeps its history.",
+        );
+        if (confirmed) {
+          onRemove(task.id);
+        }
+      },
       destructive: true,
     });
   }

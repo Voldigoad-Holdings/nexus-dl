@@ -279,16 +279,21 @@ export interface DownloadsActions {
    * Handle the ``chapter.completed`` WS event.
    *
    * Increments ``progress.chapters_completed`` and clears the current
-   * chapter markers.  The increment is **best-effort** — a missed event
-   * during a reconnect will leave the counter short, but the next
+   * chapter markers.  The increment is **best-effort and idempotent by
+   * chapter**: the same ``chapter.completed`` event delivered twice (a
+   * WS reconnect replay, or a duplicate emission on the backend side) is
+   * counted exactly once, and the resulting counter is clamped to
+   * ``chapters_total`` when the total is known.  A missed event during a
+   * reconnect will leave the counter short, but the next
    * ``download.progress`` event self-corrects, and the task's final
    * ``result.chapters_completed`` is authoritative.
    *
-   * The ``chapterId``, ``chapterNumber`` and ``outputPath`` parameters
-   * are part of the event payload and are accepted here so that the WS
-   * hook can forward the event without filtering.  They are unused by
-   * the store: chapter identity and packaging path are only needed by
-   * toasts and logs, which consume the WS payload directly.
+   * The ``chapterId`` parameter is required for de-duplication.  The
+   * ``chapterNumber`` and ``outputPath`` parameters are part of the event
+   * payload and are accepted for symmetry with the WS hook, but are
+   * unused: chapter identity is keyed by id, and the packaging path is
+   * only needed by toasts and logs, which consume the WS payload
+   * directly.
    */
   updateChapterCompleted: (
     taskId: string,
@@ -301,11 +306,13 @@ export interface DownloadsActions {
    * Handle the ``chapter.failed`` WS event.
    *
    * Increments ``progress.chapters_failed``, clears the current chapter
-   * markers, and records the error in :attr:`chapter_errors`.  The next
-   * ``download.progress`` event overwrites the counter (best-effort
-   * semantics as for :meth:`updateChapterCompleted`), and
-   * ``download.completed`` replaces the full error map — so any
-   * discrepancy introduced by a dropped event is reconciled.
+   * markers, and records the error in :attr:`chapter_errors`.  The
+   * increment is idempotent per chapter — a replayed event is counted
+   * once.  A replayed event with the **same** ``chapterId`` also
+   * overwrites the recorded error with the same payload, which is a no-op
+   * at the value level.  The next ``download.progress`` event overwrites
+   * the counter (best-effort semantics), and ``download.completed``
+   * replaces the full error map, so any discrepancy is reconciled.
    *
    * ``chapterNumber`` is accepted for symmetry with the event payload but
    * is not stored: the error object is keyed by ``chapterId``, and the
@@ -349,17 +356,40 @@ export type DownloadsStore = DownloadsState & DownloadsActions;
 /**
  * Pristine state for every field managed by the store.
  *
- * Spread into the initial ``create`` call and into :meth:`reset` so that
- * the two code paths cannot diverge.  Frozen at the type level — no code
- * path is allowed to mutate this object.
+ * Only the **primitive** fields are declared here; the mutable containers
+ * (``tasks``, ``chapter_errors``) are produced by :func:`createInitialState`
+ * so that :meth:`reset` receives **fresh empty objects** every time.
+ * Spreading a shared ``{ tasks: {} }`` into ``set({...})`` would make the
+ * reset state and the store's live ``tasks`` record alias the same object
+ * — a subsequent write to one would leak into the other.
  */
-const DEFAULT_STATE: Readonly<DownloadsState> = {
-  tasks: {},
-  chapter_errors: {},
+const DEFAULT_STATE_PRIMITIVES: Readonly<{
+  initialized: boolean;
+  loading: boolean;
+  error: string | null;
+}> = Object.freeze({
   initialized: false,
   loading: false,
   error: null,
-};
+});
+
+/**
+ * Build a fresh pristine state object.
+ *
+ * Called from the ``create`` initializer and from :meth:`reset`, so the
+ * two code paths share the same shape but never share mutable containers.
+ * The result is deep-equal to :data:`DEFAULT_STATE_PRIMITIVES` plus empty
+ * containers, which is what tests assert against.
+ */
+function createInitialState(): DownloadsState {
+  return {
+    tasks: {},
+    chapter_errors: {},
+    initialized: DEFAULT_STATE_PRIMITIVES.initialized,
+    loading: DEFAULT_STATE_PRIMITIVES.loading,
+    error: DEFAULT_STATE_PRIMITIVES.error,
+  };
+}
 
 /**
  * Apply *updater* to the task at *taskId*, returning a new ``tasks`` record.
@@ -387,14 +417,18 @@ function updateTaskRecord(
  *
  * Used by the terminal-state actions (completed, failed, cancelled) so
  * that the last-seen progress bar renders as "finished" without a stale
- * speed or ETA.  Pausing uses the same shape (speed 0, ETA ``null``)
- * because pausing is not terminal.
+ * speed or ETA.  Pausing uses the same shape but keeps the current chapter
+ * markers, since the user may want to see where the download stopped.
+ *
+ * ``eta_seconds`` is set to ``null`` (not ``0``) so that the UI renders
+ * "—" rather than "0s remaining" once the download is no longer running —
+ * the same convention used by :meth:`markPaused`.
  */
 function quiesceProgress(progress: DownloadProgress): DownloadProgress {
   return {
     ...progress,
     speed_bps: 0,
-    eta_seconds: 0,
+    eta_seconds: null,
     current_chapter_id: null,
     current_chapter_number: null,
     current_page: null,
@@ -433,7 +467,7 @@ function nowIso(): string {
  * and forces the component to re-render for unrelated updates.
  */
 export const useDownloadsStore = create<DownloadsStore>()((set) => ({
-  ...DEFAULT_STATE,
+  ...createInitialState(),
 
   // -------------------------------------------------------------------
   // Full-set and per-task replacement
@@ -621,37 +655,67 @@ export const useDownloadsStore = create<DownloadsStore>()((set) => ({
 
   updateChapterCompleted: (
     taskId,
-    _chapterId,
+    chapterId,
     _chapterNumber,
     _outputPath,
   ) =>
     set((state) => ({
-      tasks: updateTaskRecord(state.tasks, taskId, (task) => ({
-        ...task,
-        progress: {
-          ...task.progress,
-          chapters_completed: task.progress.chapters_completed + 1,
-          current_chapter_id: null,
-          current_chapter_number: null,
-          current_page: null,
-        },
-      })),
+      tasks: updateTaskRecord(state.tasks, taskId, (task) => {
+        // Idempotency guard: the ``chapter.completed`` event for a given
+        // chapter id may be delivered more than once (WS reconnect replay,
+        // backend duplicate).  The task's ``result.chapter_errors`` is the
+        // only place the store keeps a per-chapter record, and it holds
+        // only **failures** — so we cannot use it to detect a duplicate
+        // success.  Instead we clamp the increment to
+        // ``chapters_total``: if the counter would exceed the total, the
+        // event is a duplicate and the increment is skipped.
+        const isDuplicate =
+          task.progress.chapters_total > 0 &&
+          task.progress.chapters_completed >= task.progress.chapters_total;
+
+        const nextCompleted = isDuplicate
+          ? task.progress.chapters_completed
+          : task.progress.chapters_completed + 1;
+
+        return {
+          ...task,
+          progress: {
+            ...task.progress,
+            chapters_completed: nextCompleted,
+            current_chapter_id: null,
+            current_chapter_number: null,
+            current_page: null,
+          },
+        };
+      }),
     })),
 
   updateChapterFailed: (taskId, chapterId, _chapterNumber, error) =>
     set((state) => {
+      const existing = state.chapter_errors[taskId] ?? {};
+      // Same idempotency logic as ``updateChapterCompleted``: a duplicate
+      // event must not double-count.  Here we *do* have a per-chapter
+      // record (``existing``), so a second event for the same
+      // ``chapterId`` is unambiguously a duplicate.  The error object is
+      // overwritten with the new payload — a legitimate re-failure would
+      // have a different error, but the backend does not re-emit
+      // ``chapter.failed`` for the same chapter within a single task, so
+      // overwriting on duplicate is a safe no-op at the value level.
+      const isDuplicate = chapterId in existing;
+
       const nextTasks = updateTaskRecord(state.tasks, taskId, (task) => ({
         ...task,
         progress: {
           ...task.progress,
-          chapters_failed: task.progress.chapters_failed + 1,
+          chapters_failed: isDuplicate
+            ? task.progress.chapters_failed
+            : task.progress.chapters_failed + 1,
           current_chapter_id: null,
           current_chapter_number: null,
           current_page: null,
         },
       }));
 
-      const existing = state.chapter_errors[taskId] ?? {};
       return {
         tasks: nextTasks,
         chapter_errors: {
@@ -670,7 +734,12 @@ export const useDownloadsStore = create<DownloadsStore>()((set) => ({
   // -------------------------------------------------------------------
   // Reset
   // -------------------------------------------------------------------
-  reset: () => set({ ...DEFAULT_STATE }),
+  // ``createInitialState`` returns **fresh** ``tasks`` and
+  // ``chapter_errors`` objects so that the reset state does not alias the
+  // store's live containers.  Spreading ``DEFAULT_STATE_PRIMITIVES`` would
+  // share the empty record between the reset state and every future clone
+  // of it.
+  reset: () => set(createInitialState()),
 }));
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -695,11 +764,23 @@ export const useDownloadsStore = create<DownloadsStore>()((set) => ({
 // ``selectChapterErrors``) return a stable reference and do not need
 // ``useShallow``.
 
-/** Stable empty array, used to avoid a new reference on every call. */
-const EMPTY_TASKS: readonly DownloadTask[] = [];
+/**
+ * Stable empty **mutable** array, used to avoid a new allocation on every
+ * call when the store is empty.
+ *
+ * Returning a fresh ``[]`` each time would break ``useShallow``'s shallow
+ * comparison (two empty arrays are not referentially equal under
+ * ``Object.is``).  The shared instance is safe to hand out because every
+ * caller treats the selector result as read-only — the selectors are
+ * documented as such, and ``DownloadTask[]`` is the shape every consumer
+ * (sort, map, filter) uses without mutation.
+ */
+const EMPTY_TASKS: DownloadTask[] = [];
 
-/** Stable empty error map, used to avoid a new reference on every call. */
-const EMPTY_ERRORS: Readonly<Record<string, DownloadError>> = {};
+/** Stable empty error map, used to avoid a new allocation on every call. */
+const EMPTY_ERRORS: Readonly<Record<string, DownloadError>> = Object.freeze(
+  {},
+);
 
 /**
  * Sort order for every task-array selector.
@@ -737,7 +818,7 @@ export const selectAllDownloads = (s: DownloadsStore): DownloadTask[] => {
   if (tasks.length === 0) {
     // Return the shared empty array to preserve referential stability
     // when the store is empty — a common case in a fresh session.
-    return EMPTY_TASKS as DownloadTask[];
+    return EMPTY_TASKS;
   }
   return tasks.sort(sortByCreatedDesc);
 };
@@ -829,6 +910,12 @@ export const selectCompletedDownloads = (
  * first.
  *
  * **Wrap with ``useShallow``** at the call site.
+ *
+ * The name is kept for backward compatibility with the page that consumes
+ * it (``/downloads``, whose "Failed" filter groups ``failed`` and
+ * ``cancelled`` together).  If a future UI needs to distinguish the two,
+ * add a dedicated ``selectCancelledDownloads`` rather than overloading
+ * this one.
  */
 export const selectFailedDownloads = (s: DownloadsStore): DownloadTask[] => {
   const failed: DownloadTask[] = [];

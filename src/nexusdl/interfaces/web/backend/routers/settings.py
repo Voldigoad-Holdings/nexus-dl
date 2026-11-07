@@ -37,6 +37,20 @@ composition root. This router does not assume that: it calls each, then
 ``inspect.isawaitable()`` to await coroutines if the host returned one.
 Hosts that persist asynchronously can therefore return coroutines
 without a shim.
+
+Concurrency model
+=================
+
+The ``etag`` check is **optimistic but not transactional**: the router
+fetches the snapshot, compares etags, then calls ``apply_settings``. In
+between, another request may have applied its own change (TOCTOU). This
+is acceptable for a settings UI — settings changes are rare and
+low-stakes, and the fallback behaviour (last-writer-wins) is the same as
+no etag check at all. Hosts that need true compare-and-swap must accept
+the expected etag in ``apply_settings`` and enforce the check inside a
+transaction — the router will forward the etag if the host's signature
+supports it (see :func:`_call_apply_settings`), otherwise it stays
+optimistic.
 """
 from __future__ import annotations
 
@@ -163,7 +177,7 @@ async def get_settings(
     return SettingsResponse(
         sections=sections,
         version=_schema_version(services),
-        etag=_compute_etag(services, snapshot),
+        etag=await _compute_etag(services, snapshot),
     )
 
 
@@ -181,7 +195,11 @@ async def get_settings(
         "rejected with a per-key error.\n"
         "* ``etag`` (optional) enables optimistic concurrency: on "
         "mismatch the request is rejected with 409 Conflict and the "
-        "current etag.\n"
+        "current etag. **The check is optimistic, not transactional** — "
+        "two concurrent PATCHes with the same valid etag will both "
+        "succeed, last-writer-wins. Hosts that need strict "
+        "compare-and-swap should accept the expected etag in "
+        "``apply_settings`` and enforce it under a lock.\n"
         "* ``reset_to_default=true`` resets every listed key to its "
         "schema default (the per-key values are ignored).\n\n"
         "The response always carries ``success: bool`` — per-field "
@@ -220,7 +238,7 @@ async def patch_settings(
                     "Failed to read current settings.",
                 ).model_dump(),
             )
-        current_etag = _compute_etag(services, current_snapshot)
+        current_etag = await _compute_etag(services, current_snapshot)
         if current_etag is None or body.etag != current_etag:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -237,7 +255,8 @@ async def patch_settings(
     )
 
     # --- 4. Reject unknown keys early -----------------------------
-    unknown = [k for k in changes if k not in schema.fields]
+    schema_fields = _schema_fields(schema)
+    unknown = [k for k in changes if k not in schema_fields]
     if unknown:
         return SettingsUpdateResponse(
             success=False,
@@ -249,7 +268,11 @@ async def patch_settings(
 
     # --- 5. Delegate to the service --------------------------------
     try:
-        result = await _maybe_await(services.apply_settings(changes))
+        result = await _call_apply_settings(
+            services,
+            changes=changes,
+            expected_etag=body.etag,
+        )
     except Exception:
         _log.exception("apply_settings raised")
         raise HTTPException(
@@ -265,7 +288,7 @@ async def patch_settings(
     if getattr(result, "success", False):
         try:
             post_snapshot = await _maybe_await(services.snapshot_settings())
-            new_etag = _compute_etag(services, post_snapshot)
+            new_etag = await _compute_etag(services, post_snapshot)
         except Exception:
             _log.exception("post-apply snapshot_settings failed")
             # Non-fatal: the client will re-GET if it needs the etag.
@@ -310,16 +333,23 @@ def _project_schema(
     Non-admin callers do not see admin-only sections. Field ordering
     inside a section follows :attr:`SettingSection.field_keys` (and any
     group's keys, if groups are declared).
+
+    Defensive: a broken host may return ``sections=None`` or
+    ``fields=None``; both are coerced to empty (``[]`` / ``{}``) rather
+    than crashing with a 500 on GET /settings.
     """
+    schema_sections = getattr(schema, "sections", None) or ()
+    schema_fields = _schema_fields(schema)
+
     out: list[SettingsSectionSchema] = []
-    for section in schema.sections:
+    for section in schema_sections:
         if _is_admin_section(section) and not is_admin:
             continue
         field_keys = _section_field_keys(section)
         fields = [
-            _project_field(schema.fields[key], snapshot)
+            _project_field(schema_fields[key], snapshot)
             for key in field_keys
-            if key in schema.fields
+            if key in schema_fields
         ]
         out.append(
             SettingsSectionSchema(
@@ -398,15 +428,32 @@ def _expand_resets(
 
     Unknown keys are preserved with their original value so the caller can
     produce a precise "unknown key" error rather than silently dropping
-    them.
+    them. This is important *even when* ``reset_to_default=True``: an
+    unknown key has no schema default, so we must not lose the original
+    value — otherwise a bug in the caller's payload would look like a
+    successful reset of a non-existent key.
+
+    The known fields (present in ``schema.fields``) are reset to their
+    schema default when ``reset_to_default=True``. Unknown fields keep
+    their incoming value; the caller's unknown-key check runs *after*
+    this helper and rejects the whole request, so the preserved value
+    never reaches the host.
     """
+    schema_fields = _schema_fields(schema)
     out: dict[str, Any] = {}
     for key, value in changes.items():
-        if reset_to_default:
-            field = schema.fields.get(key)
-            out[key] = getattr(field, "default", None) if field else None
-        else:
+        if not reset_to_default:
             out[key] = value
+            continue
+        field = schema_fields.get(key)
+        if field is None:
+            # Unknown key: preserve the incoming value so the caller can
+            # produce a precise "unknown key" error. Never replace with
+            # ``None`` — that would hide the actual payload from the
+            # diagnostic.
+            out[key] = value
+        else:
+            out[key] = getattr(field, "default", None)
     return out
 
 
@@ -414,15 +461,20 @@ def _expand_resets(
 # Etag / version helpers
 # ===========================================================================
 
-def _compute_etag(
+async def _compute_etag(
     services: ServicesDep, snapshot: Mapping[str, Any]
 ) -> str | None:
     """Compute an etag for the current settings.
 
     Prefers ``services.settings_etag()`` if the host implements it (gives
-    the host full control over the format). Falls back to a stable hash
-    of the snapshot. Returns ``None`` only if hashing fails — the caller
-    treats ``None`` as "no optimistic concurrency possible".
+    the host full control over the format). The host may return either a
+    ``str`` or an awaitable resolving to a ``str`` — this helper is
+    ``async`` to support both without a shim.
+
+    Falls back to a stable hash of the snapshot if the host does not
+    provide an etag or returns a non-string value. Returns ``None`` only
+    when the fallback itself fails — the caller treats ``None`` as
+    "no optimistic concurrency possible".
     """
     # Host-provided etag wins.
     provider = getattr(services, "settings_etag", None)
@@ -430,15 +482,13 @@ def _compute_etag(
         try:
             value = provider()
             if inspect.isawaitable(value):
-                # The router is not in a position to await here (this
-                # helper is synchronous). Hosts needing async etags
-                # should compute their value eagerly.
-                _log.debug(
-                    "settings_etag returned an awaitable; ignoring. "
-                    "Provide a sync value or override _compute_etag."
+                value = await value
+            if isinstance(value, str) and value:
+                return (
+                    value
+                    if value.startswith(_ETAG_PREFIX)
+                    else f"{_ETAG_PREFIX}{value}"
                 )
-            elif isinstance(value, str) and value:
-                return value if value.startswith(_ETAG_PREFIX) else f"{_ETAG_PREFIX}{value}"
         except Exception:
             _log.exception("services.settings_etag() raised")
 
@@ -458,7 +508,15 @@ def _compute_etag(
 
 
 def _jsonable(value: Any) -> Any:
-    """Best-effort JSON projection for etag stability."""
+    """Best-effort JSON projection for etag stability.
+
+    The etag ends up in a response header on 409, so any value that
+    could not be hashed consistently would either produce a spurious
+    conflict or — worse — become an oracle that lets an attacker brute
+    force a secret by observing etag changes. This helper is therefore
+    conservative: scalar types are preserved, everything else is
+    converted to a stable string representation.
+    """
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, (list, tuple)):
@@ -495,14 +553,19 @@ def _is_admin_section(section: _SettingSectionLike) -> bool:
     Precedence:
 
     1. Explicit ``section.admin_only`` attribute (host-declared).
-    2. Id convention: ``admin``, ``admin.*``, ``admin_*``.
+    2. Id convention: ``admin``, ``admin.*``, ``admin_*`` (case-insensitive
+       to accommodate hosts that use ``Admin`` / ``ADMIN``).
+
+    The lowercase comparison is defensive: a case mismatch between a
+    host declaration and this check would otherwise expose an
+    admin-only section to non-admin callers — a real privacy regression.
     """
     explicit = getattr(section, "admin_only", None)
     if explicit is True:
         return True
     if explicit is False:
         return False
-    sid = str(getattr(section, "id", ""))
+    sid = str(getattr(section, "id", "")).lower()
     return sid == "admin" or sid.startswith(("admin.", "admin_"))
 
 
@@ -533,6 +596,70 @@ def _section_field_keys(section: _SettingSectionLike) -> list[str]:
                 out.append(k)
 
     return out
+
+
+# ===========================================================================
+# Schema accessors (defensive)
+# ===========================================================================
+
+def _schema_fields(schema: _SettingsSchemaLike) -> Mapping[str, _SettingFieldLike]:
+    """Return ``schema.fields`` normalized to a non-None mapping.
+
+    A broken host may return ``fields=None`` (or a non-mapping). Both are
+    coerced to an empty dict so downstream logic (unknown-key check,
+    projection, reset expansion) sees a stable shape rather than
+    crashing with ``TypeError``. A missing fields map is a symptom of a
+    configuration error, not a client error, so returning an empty map
+    here surfaces the issue at the "unknown key" check rather than as a
+    500.
+    """
+    fields = getattr(schema, "fields", None)
+    if not isinstance(fields, Mapping):
+        return {}
+    return fields
+
+
+# ===========================================================================
+# Async-tolerant delegation
+# ===========================================================================
+
+async def _call_apply_settings(
+    services: ServicesDep,
+    *,
+    changes: Mapping[str, Any],
+    expected_etag: str | None,
+) -> Any:
+    """Call ``services.apply_settings`` with the correct signature.
+
+    The GUI contract declares ``apply_settings(changes) -> ApplyResult``.
+    Hosts that want strict compare-and-swap may declare
+    ``apply_settings(changes, *, expected_etag=None)`` — in that case
+    the router forwards the etag so the host can enforce the check
+    atomically. Both sync and async return values are supported.
+
+    Signature probing is done via ``inspect.signature``; if introspection
+    fails (C-extension, ``functools.partial`` without ``__wrapped__``),
+    the router falls back to the one-argument form.
+    """
+    apply_fn = getattr(services, "apply_settings", None)
+    if not callable(apply_fn):
+        raise AttributeError("services.apply_settings is not callable")
+
+    supports_etag = False
+    try:
+        sig = inspect.signature(apply_fn)
+        supports_etag = "expected_etag" in sig.parameters
+    except (TypeError, ValueError):
+        # Introspection not available — assume the simple contract.
+        supports_etag = False
+
+    if supports_etag:
+        result = apply_fn(changes, expected_etag=expected_etag)
+    else:
+        result = apply_fn(changes)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 # ===========================================================================
@@ -577,13 +704,13 @@ async def _maybe_await(value: Any) -> Any:
 #
 # [ ] A new setting section that should be admin-only is declared with
 #     ``admin_only = True`` on the section, or its id uses the
-#     ``admin*`` prefix convention.
+#     ``admin*`` prefix convention (case-insensitive).
 # [ ] No new code path can leak a secret value into ``current_value``.
 #     The mask happens in :func:`_project_field` only — do not bypass it.
 # [ ] A new field type is added to :data:`_FIELD_KIND_MAP` with the
 #     matching :class:`SettingFieldType` member.
-# [ ] A new etag provider implementation is *synchronous* or overrides
-#     :func:`_compute_etag`. Async etags cannot be awaited from this
-#     helper without restructuring the router.
+# [ ] If the host's ``apply_settings`` is extended with an
+#     ``expected_etag`` keyword, :func:`_call_apply_settings` picks it up
+#     automatically — no router change required.
 # [ ] Any new error code you return is documented in
 #     :class:`~..schemas.responses.ErrorCode`.

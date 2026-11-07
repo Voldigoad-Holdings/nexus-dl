@@ -130,10 +130,18 @@ def _parse(url: str) -> SplitResult:
     """Return ``urlsplit(url)``, mapping any ``ValueError`` to an empty result.
 
     ``urlsplit`` is lenient — it accepts almost anything and returns
-    whatever it could parse — but a handful of inputs (malformed IPv6
-    brackets, ports that are not numeric) raise :class:`ValueError` from
-    sub-properties. Wrapping here lets each accessor use the return value
-    safely without repeating the try/except.
+    whatever it could parse — but it raises :class:`ValueError` for
+    malformed IPv6 bracket syntax (``http://[::1``) at parse time.
+
+    **Sub-property exceptions are not caught here.** In particular,
+    accessing ``parts.port`` on an otherwise-valid URL can raise
+    :class:`ValueError` if the port is not numeric (``http://a:notaport``)
+    or exceeds 65535. That access is **not** performed by ``urlsplit``
+    itself — it happens when a caller reads the ``.port`` attribute.
+    Each accessor that touches ``.port`` (``get_port``,
+    ``normalize``, ``strip_userinfo``) has its own ``try/except`` for
+    that case; the ``except ValueError`` here only covers errors thrown
+    by ``urlsplit`` during parsing.
     """
     if not url:
         return SplitResult("", "", "", "", "")
@@ -483,7 +491,9 @@ def strip_userinfo(url: str) -> str:
 
     Returns:
         The URL without userinfo. An input that had no userinfo is
-        returned unchanged.
+        returned unchanged. A URL whose port is malformed is also
+        returned unchanged — the helper is a defensive primitive and
+        must never crash on input it cannot safely rebuild.
     """
     if not url:
         return url
@@ -491,7 +501,15 @@ def strip_userinfo(url: str) -> str:
     if parts.username is None and parts.password is None:
         return url
     host = parts.hostname or ""
-    port = f":{parts.port}" if parts.port is not None else ""
+    # ``parts.port`` can raise ``ValueError`` on a malformed port
+    # (``http://a:notaport``). We never want to crash a redaction
+    # helper — the caller's intent is "strip credentials if any", not
+    # "validate the port". If we cannot read it, rebuild without it.
+    try:
+        raw_port = parts.port
+    except ValueError:
+        raw_port = None
+    port = f":{raw_port}" if raw_port is not None else ""
     return urlunsplit(
         (
             parts.scheme,

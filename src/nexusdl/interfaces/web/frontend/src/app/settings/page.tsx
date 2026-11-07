@@ -89,7 +89,10 @@ import {
   useCallback,
   useEffect,
   useId,
+  useMemo,
+  useRef,
   useState,
+  type KeyboardEvent,
   type ReactNode,
 } from "react";
 
@@ -239,11 +242,21 @@ function SettingsBody() {
     // Tear down every client-side singleton that holds per-session
     // state.  Order matters: stop the WebSocket first (so no event
     // arrives mid-teardown), then clear the API client, then the
-    // tokens, then the downloads store.
-    resetWebSocketClient();
-    resetApiClient();
-    clearAuthTokens();
-    useDownloadsStore.getState().reset();
+    // tokens, then the downloads store.  A failure in any single step
+    // must not prevent the remaining cleanups from running.
+    try {
+      resetWebSocketClient();
+    } finally {
+      try {
+        resetApiClient();
+      } finally {
+        try {
+          clearAuthTokens();
+        } finally {
+          useDownloadsStore.getState().reset();
+        }
+      }
+    }
 
     router.replace("/auth/login");
     router.refresh();
@@ -549,6 +562,18 @@ function ServerSettingsSection() {
   const [editedJson, setEditedJson] = useState<string>("");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+
+  // ``savingRef`` is a synchronous lock: state updates are batched, so a
+  // fast double-click on "Save changes" could otherwise fire two PATCH
+  // requests before ``isSaving`` takes effect.
+  const savingRef = useRef(false);
+
+  // Tracks whether the textarea has been seeded from the current
+  // ``settingsQuery.data``.  Resetting this flag when the section
+  // collapses ensures a re-expand seeds from the (possibly refreshed)
+  // snapshot.
+  const seededRef = useRef(false);
 
   const queryClient = useQueryClient();
 
@@ -562,24 +587,87 @@ function ServerSettingsSection() {
   });
 
   // Seed the textarea from the fetched settings once per successful load.
-  // Subsequent edits are local until the user saves or discards.
+  // Driven by a ref flag rather than by ``editedJson === ""`` so that a
+  // refresh (staleTime expired, WS invalidation, manual refetch) re-seeds
+  // the textarea when the section is idle, but does not clobber edits the
+  // user has typed.
   useEffect(() => {
-    if (settingsQuery.data !== undefined && editedJson === "") {
-      setEditedJson(JSON.stringify(settingsQuery.data, null, 2));
+    if (settingsQuery.data === undefined || seededRef.current) {
+      return;
     }
+    // Only seed if the textarea is still pristine.  A user who started
+    // typing before the fetch resolved keeps their draft.
+    if (editedJson !== "") {
+      seededRef.current = true;
+      return;
+    }
+    setEditedJson(JSON.stringify(settingsQuery.data, null, 2));
+    seededRef.current = true;
   }, [settingsQuery.data, editedJson]);
 
   // Reset the textarea + status when the section is collapsed, so a
-  // re-expand starts from a fresh load.
+  // re-expand starts from a fresh load.  When the textarea holds unsaved
+  // edits, confirm before discarding them.
   useEffect(() => {
-    if (!expanded) {
-      setEditedJson("");
-      setSaveError(null);
-      setSavedAt(null);
+    if (expanded) {
+      return;
     }
-  }, [expanded]);
+    if (editedJson.trim().length > 0 && hasUnsavedChangesRef.current) {
+      // This path is only reachable when the user collapses the section
+      // via the "Hide" button (which is where the confirm is shown).
+      // Programmatic collapse (component unmount) skips the confirm to
+      // avoid blocking navigation.
+      return;
+    }
+    setEditedJson("");
+    setSaveError(null);
+    setSavedAt(null);
+    seededRef.current = false;
+  }, [expanded, editedJson]);
+
+  // ─── Dirty tracking ────────────────────────────────────────────────
+  // Compute the *formatted* server snapshot once per data change so that
+  // the stringify cost is paid once, not on every render.
+  const formattedServerJson = useMemo(
+    () =>
+      settingsQuery.data !== undefined
+        ? JSON.stringify(settingsQuery.data, null, 2)
+        : "",
+    [settingsQuery.data],
+  );
+
+  const isDirty =
+    formattedServerJson !== "" &&
+    editedJson !== "" &&
+    editedJson.trim() !== formattedServerJson.trim();
+
+  // Ref mirror so the collapse handler below reads the latest value
+  // without adding ``isDirty`` to the reset effect's dependency array
+  // (which would re-run the reset on every keystroke).
+  const hasUnsavedChangesRef = useRef(false);
+  hasUnsavedChangesRef.current = isDirty;
+
+  const handleToggleExpanded = useCallback(() => {
+    if (!expanded) {
+      setExpanded(true);
+      return;
+    }
+    // Collapsing: if there are unsaved edits, ask before discarding.
+    if (isDirty) {
+      const confirmed = window.confirm(
+        "You have unsaved server settings. Discard them?",
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+    setExpanded(false);
+  }, [expanded, isDirty]);
 
   const handleSave = useCallback(async () => {
+    if (savingRef.current) {
+      return;
+    }
     setSaveError(null);
     let parsed: unknown;
     try {
@@ -594,6 +682,8 @@ function ServerSettingsSection() {
       setSaveError("The settings object must be a JSON object.");
       return;
     }
+    savingRef.current = true;
+    setIsSaving(true);
     try {
       const updated = await api.updateSettings(
         parsed as SettingsSnapshot,
@@ -603,6 +693,9 @@ function ServerSettingsSection() {
       setEditedJson(JSON.stringify(updated, null, 2));
       queryClient.setQueryData(["server-settings"], updated);
       setSavedAt(Date.now());
+      // Mark as already seeded so a subsequent refetch does not overwrite
+      // the freshly-saved textarea.
+      seededRef.current = true;
     } catch (err) {
       const apiError =
         err instanceof NexusApiError
@@ -612,15 +705,18 @@ function ServerSettingsSection() {
               { code: "INTERNAL_ERROR", status: 0, cause: err },
             );
       setSaveError(apiError.message);
+    } finally {
+      savingRef.current = false;
+      setIsSaving(false);
     }
   }, [editedJson, queryClient]);
 
   const handleDiscard = useCallback(() => {
-    if (settingsQuery.data !== undefined) {
-      setEditedJson(JSON.stringify(settingsQuery.data, null, 2));
+    if (formattedServerJson !== "") {
+      setEditedJson(formattedServerJson);
     }
     setSaveError(null);
-  }, [settingsQuery.data]);
+  }, [formattedServerJson]);
 
   // Detect the "admin only" case from the error envelope.
   const isForbidden =
@@ -634,11 +730,6 @@ function ServerSettingsSection() {
 
   const showEditor =
     expanded && !isForbidden && !isUnauthorized && settingsQuery.data !== undefined;
-
-  const isDirty =
-    settingsQuery.data !== undefined &&
-    editedJson !== "" &&
-    editedJson.trim() !== JSON.stringify(settingsQuery.data, null, 2).trim();
 
   return (
     <section
@@ -663,7 +754,7 @@ function ServerSettingsSection() {
         </div>
         <button
           type="button"
-          onClick={() => setExpanded((v) => !v)}
+          onClick={handleToggleExpanded}
           aria-expanded={expanded}
           aria-controls="server-settings-body"
           className={cn(
@@ -829,17 +920,19 @@ function ServerSettingsSection() {
                   className="text-xs text-muted-foreground"
                   aria-live="polite"
                 >
-                  {savedAt !== null
-                    ? "Saved just now."
-                    : isDirty
-                      ? "Unsaved changes."
-                      : "No changes to save."}
+                  {isSaving
+                    ? "Saving…"
+                    : savedAt !== null
+                      ? "Saved just now."
+                      : isDirty
+                        ? "Unsaved changes."
+                        : "No changes to save."}
                 </span>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
                     onClick={handleDiscard}
-                    disabled={!isDirty}
+                    disabled={!isDirty || isSaving}
                     className={cn(
                       "inline-flex h-8 items-center gap-1 rounded-md px-2",
                       "text-xs font-medium text-muted-foreground",
@@ -855,7 +948,7 @@ function ServerSettingsSection() {
                   <button
                     type="button"
                     onClick={() => void handleSave()}
-                    disabled={!isDirty || settingsQuery.isFetching}
+                    disabled={!isDirty || isSaving}
                     className={cn(
                       "inline-flex h-8 items-center gap-1 rounded-md px-3",
                       "bg-primary text-xs font-medium text-primary-foreground",
@@ -866,7 +959,7 @@ function ServerSettingsSection() {
                       "disabled:cursor-not-allowed disabled:opacity-50",
                     )}
                   >
-                    {settingsQuery.isFetching ? (
+                    {isSaving ? (
                       <Loader2
                         className="h-3.5 w-3.5 animate-spin"
                         aria-hidden
@@ -1048,6 +1141,13 @@ function Toggle({
  * ``role="radio"`` with ``aria-checked``.  This is the WAI-ARIA pattern
  * for a group of mutually-exclusive options presented as buttons.
  *
+ * Keyboard contract (per the ARIA radio-group pattern):
+ *
+ * * ``Tab`` enters/leaves the group as a whole — only the selected radio
+ *   is focusable (``tabIndex={selected ? 0 : -1}``).
+ * * ``←`` / ``→`` cycle through options and select them.
+ * * ``Home`` / ``End`` jump to the first / last option.
+ *
  * Generic over the value type so that the ``libraryView`` control can
  * pass ``"grid" | "list"`` without casts.
  */
@@ -1064,6 +1164,35 @@ function SegmentedControl<T extends string>({
   ariaLabel: string;
   disabled?: boolean;
 }) {
+  const handleKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLButtonElement>, currentIndex: number) => {
+      const lastIndex = options.length - 1;
+      let nextIndex: number | null = null;
+      switch (event.key) {
+        case "ArrowRight":
+        case "ArrowDown":
+          nextIndex = currentIndex === lastIndex ? 0 : currentIndex + 1;
+          break;
+        case "ArrowLeft":
+        case "ArrowUp":
+          nextIndex = currentIndex === 0 ? lastIndex : currentIndex - 1;
+          break;
+        case "Home":
+          nextIndex = 0;
+          break;
+        case "End":
+          nextIndex = lastIndex;
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      const nextOption = options[nextIndex];
+      onChange(nextOption.value);
+    },
+    [onChange, options],
+  );
+
   return (
     <div
       role="radiogroup"
@@ -1073,7 +1202,7 @@ function SegmentedControl<T extends string>({
         "text-xs font-medium",
       )}
     >
-      {options.map((option) => {
+      {options.map((option, index) => {
         const selected = option.value === value;
         return (
           <button
@@ -1081,8 +1210,10 @@ function SegmentedControl<T extends string>({
             type="button"
             role="radio"
             aria-checked={selected}
+            tabIndex={selected ? 0 : -1}
             disabled={disabled}
             onClick={() => onChange(option.value)}
+            onKeyDown={(event) => handleKeyDown(event, index)}
             className={cn(
               "inline-flex h-7 items-center rounded px-2.5",
               "transition-colors",
@@ -1146,13 +1277,17 @@ function AboutItem({
  * Mirrors the page's structure — header, three form sections, session
  * section — so there is no layout shift when the real content replaces
  * it.
+ *
+ * ``aria-live`` is intentionally **not** used here: the ``sr-only`` text
+ * is static, so an ``aria-live`` region would never announce anything
+ * (screen readers only announce *changes*).  ``aria-busy`` is the correct
+ * signal for "content is loading".
  */
 function SettingsPageSkeleton() {
   return (
     <div
       className="mx-auto flex w-full max-w-3xl flex-col gap-6 p-4 sm:p-6 lg:p-8"
       aria-busy="true"
-      aria-live="polite"
     >
       <span className="sr-only">Loading settings…</span>
       <div className="space-y-2">

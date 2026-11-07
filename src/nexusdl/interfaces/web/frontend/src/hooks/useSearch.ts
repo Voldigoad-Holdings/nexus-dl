@@ -70,12 +70,13 @@
  * failing at runtime with a less helpful error.
  */
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import { api, type NexusApiError } from "../lib/api";
 import { useSettingsStore } from "../store/settings";
 import {
   isUsableSiteHealth,
+  LANGUAGES,
   type Language,
   type SearchResult,
   type Site,
@@ -94,6 +95,19 @@ const STALE_TIME_MS = 5 * 60 * 1000;
 
 /** Inactive cache retention window.  After this, results are garbage-collected. */
 const CACHE_TIME_MS = 10 * 60 * 1000;
+
+/**
+ * Runtime set of valid :type:`Language` values.
+ *
+ * Used to filter out any non-``Language`` value that a caller may have
+ * injected into ``filters.languages`` through a cast (see the note on
+ * :func:`submit`).  The compiler-level typing makes such a value
+ * unreachable through the documented API, but a programmatically-built
+ * filter state or a corrupted store payload could still smuggle one in.
+ * Filtering before sending keeps the backend's strict enum validation from
+ * rejecting the entire search because of a single invalid item.
+ */
+const VALID_LANGUAGES: ReadonlySet<string> = new Set(LANGUAGES);
 
 // ───────────────────────────────────────────────────────────────────────────
 // Types
@@ -337,6 +351,19 @@ export function useSearch(options: UseSearchOptions = {}): UseSearchReturn {
     (s) => s.default_include_unhealthy,
   );
 
+  // ``availableSites`` is typically rebuilt on every render by the caller
+  // (``sitesQuery.data?.items`` changes identity when the query resolves
+  // again, and the parent may wrap it in a fresh ``?? []`` fallback).
+  // Capturing it in a ref keeps ``submit`` stable across re-renders that
+  // do not change the actual contents, so a parent effect depending on
+  // ``submit`` does not loop.  The ref is always current at the moment
+  // ``submit`` runs — the effect that updates it runs synchronously before
+  // any user interaction can fire.
+  const availableSitesRef = useRef<ReadonlyArray<Site> | undefined>(
+    options.availableSites,
+  );
+  availableSitesRef.current = options.availableSites;
+
   // -------------------------------------------------------------------
   // Form state
   // -------------------------------------------------------------------
@@ -383,18 +410,30 @@ export function useSearch(options: UseSearchOptions = {}): UseSearchReturn {
     let sites: string[] | null = null;
     if (filters.site_ids.length > 0) {
       sites = [...filters.site_ids];
-    } else if (!filters.include_unhealthy && options.availableSites) {
-      sites = options.availableSites
-        .filter((site) => isUsableSiteHealth(site.health))
-        .map((site) => site.id);
+    } else if (!filters.include_unhealthy) {
+      const available = availableSitesRef.current;
+      if (available !== undefined) {
+        sites = available
+          .filter((site) => isUsableSiteHealth(site.health))
+          .map((site) => site.id);
+      }
     }
 
     // Resolve the languages list.  Empty means "all languages"; the
     // backend treats a missing field and an empty array identically.
+    //
+    // ``filters.languages`` is typed ``ReadonlyArray<Language>`` at the
+    // compiler level — no cast is needed for that reason.  The runtime
+    // filter is defensive: a programmatically-built filter state or a
+    // corrupted localStorage payload could still smuggle a non-Language
+    // string past the type system, and the backend's strict enum
+    // validation would reject the *whole* search if even one item were
+    // invalid.  Filtering here isolates the failure to the one bad item.
+    const validLanguages = filters.languages.filter((lang) =>
+      VALID_LANGUAGES.has(lang as string),
+    );
     const languages: Language[] | null =
-      filters.languages.length > 0
-        ? [...(filters.languages as Language[])]
-        : null;
+      validLanguages.length > 0 ? [...validLanguages] : null;
 
     // Resolve the adult flag.  The UI gates ``include_adult`` behind the
     // user's ``allow_adult`` setting, so ``filters.include_adult`` is
@@ -404,7 +443,7 @@ export function useSearch(options: UseSearchOptions = {}): UseSearchReturn {
 
     setSubmitted({ query: trimmed, sites, languages, include_adult });
     setPageState(1);
-  }, [query, filters, allowAdult, options.availableSites]);
+  }, [query, filters, allowAdult]);
 
   const reset = useCallback(() => {
     setQueryState("");

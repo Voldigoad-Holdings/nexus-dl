@@ -69,6 +69,16 @@ Filesystem safety
   in :attr:`OptimizationResult.error`; the function never raises for a
   normal optimization failure.
 
+Symlinks
+--------
+:func:`_atomic_write` (used for in-place optimization) writes to a
+sibling temp file and then :meth:`Path.replace` onto the target. On POSIX,
+``rename`` does not follow symlinks: if *source* is a symlink, the temp
+file **replaces the symlink** rather than the file it points to. This is
+the same behaviour as ``mv`` without ``-i``. If a caller relies on
+symlinks for downloads_dir routing, pass an explicit ``destination``
+(resolved by the caller) instead of relying on in-place optimization.
+
 Async-first, thread-safe
 ------------------------
 Both public functions are coroutines, because Pillow encoding is
@@ -221,6 +231,13 @@ class OptimizationOptions:
         strip_metadata: When ``True`` (default), removes the keys listed in
             :data:`_STRIPPABLE_INFO_KEYS` from ``img.info`` before saving.
             ICC profile and transparency are always preserved.
+        max_input_bytes: Maximum size, in bytes, of the input accepted by
+            :func:`optimize_file`. Matches the validator's default
+            ``max_file_size_bytes`` (50 MiB) so the two stages of the image
+            pipeline share the same upper bound. Files larger than this are
+            rejected without being read. ``optimize_bytes`` (in-memory)
+            does not consult this field — the caller already has the bytes
+            and has presumably bounded them upstream.
         jpeg_quality: JPEG quality, in ``[1, 95]``. Defaults to 85 — the
             standard "visually lossless for line art" value. Values above
             95 provide no perceptible quality gain and materially increase
@@ -255,6 +272,8 @@ class OptimizationOptions:
     apply_exif_orientation: bool = True
     strip_metadata: bool = True
 
+    max_input_bytes: int = 50 * 1024 * 1024  # 50 MiB
+
     jpeg_quality: int = 85
     jpeg_progressive: bool = True
 
@@ -271,9 +290,14 @@ class OptimizationOptions:
 
         Raises:
             ValueError: If any quality or compression parameter is out of
-                its documented range, or if ``excluded_formats`` contains a
-                value that is not a lowercase string.
+                its documented range, if ``max_input_bytes`` is negative,
+                or if ``excluded_formats`` contains a value that is not a
+                lowercase string.
         """
+        if self.max_input_bytes < 0:
+            raise ValueError(
+                f"max_input_bytes must be >= 0, got {self.max_input_bytes}"
+            )
         if not (1 <= self.jpeg_quality <= 95):
             raise ValueError(
                 f"jpeg_quality must be in [1, 95], got {self.jpeg_quality}"
@@ -542,6 +566,21 @@ def _optimize_bytes_sync(
             optimized_size=original_size,
             error=f"decompression bomb: {exc}",
         )
+    except Image.DecompressionBombWarning as exc:
+        # Pillow raises this as a warning under default filters, but a
+        # caller configured with ``warnings.simplefilter("error")`` (pytest
+        # ``-W error``, strict production setups) makes it an exception.
+        # The contract is "never raises for a normal failure", so treat it
+        # as a rejection.
+        _log.debug(
+            "Rejected optimization: decompression bomb warning ({})", exc
+        )
+        return data, OptimizationResult(
+            was_optimized=False,
+            original_size=original_size,
+            optimized_size=original_size,
+            error=f"decompression bomb: {exc}",
+        )
     except UnidentifiedImageError as exc:
         _log.debug("Rejected optimization: unrecognised format ({})", exc)
         return data, OptimizationResult(
@@ -557,6 +596,29 @@ def _optimize_bytes_sync(
             original_size=original_size,
             optimized_size=original_size,
             error=f"failed to re-encode image: {exc}",
+        )
+    except (MemoryError, RecursionError):
+        # Resource exhaustion must not be re-interpreted as an optimization
+        # failure — the caller needs to see it and abort the chapter.
+        raise
+    except Exception as exc:
+        # ``ImageOps.exif_transpose`` and Pillow's format-specific codecs
+        # occasionally surface structured errors (``struct.error``,
+        # ``KeyError`` for missing codecs, etc.) that are not in the
+        # standard tuple above. The contract says "never raises for a
+        # normal failure", so treat anything else as a rejection. Logged
+        # at WARNING because it may indicate a Pillow version drift.
+        _log.warning(
+            "Unexpected error during image optimization ({}: {}); "
+            "treating as failed",
+            type(exc).__name__,
+            exc,
+        )
+        return data, OptimizationResult(
+            was_optimized=False,
+            original_size=original_size,
+            optimized_size=original_size,
+            error=f"optimization failed: {type(exc).__name__}: {exc}",
         )
 
     optimized_size = len(optimized)
@@ -600,22 +662,66 @@ def _optimize_file_sync(
     is what actually touches the filesystem — the only I/O the optimizer
     performs is here.
     """
-    if not source.is_file():
+    try:
+        size = source.stat().st_size
+    except FileNotFoundError:
         return OptimizationResult(
             was_optimized=False,
             original_size=0,
             optimized_size=0,
             error=f"source file does not exist: {source}",
         )
+    except OSError as exc:
+        return OptimizationResult(
+            was_optimized=False,
+            original_size=0,
+            optimized_size=0,
+            error=f"cannot stat source file {source}: {exc}",
+        )
+
+    if size > options.max_input_bytes:
+        # Bounded read safety: refuse oversized inputs before allocating.
+        _log.debug(
+            "Rejected optimization: {} bytes > max_input_bytes {} ({})",
+            size,
+            options.max_input_bytes,
+            source,
+        )
+        return OptimizationResult(
+            was_optimized=False,
+            original_size=size,
+            optimized_size=size,
+            error=(
+                f"input file is too large ({size} bytes > "
+                f"{options.max_input_bytes} bytes)"
+            ),
+            output_path=destination if destination is not None else source,
+        )
 
     try:
-        data = source.read_bytes()
+        with source.open("rb") as fh:
+            # Read at most ``max_input_bytes + 1`` so a file that grew
+            # since ``stat`` cannot consume unbounded memory.
+            data = fh.read(options.max_input_bytes + 1)
     except OSError as exc:
         return OptimizationResult(
             was_optimized=False,
             original_size=0,
             optimized_size=0,
             error=f"cannot read source file {source}: {exc}",
+        )
+
+    if len(data) > options.max_input_bytes:
+        # File grew between ``stat`` and ``read``. Treat as failed.
+        return OptimizationResult(
+            was_optimized=False,
+            original_size=size,
+            optimized_size=size,
+            error=(
+                f"source file grew past max_input_bytes "
+                f"({options.max_input_bytes} bytes)"
+            ),
+            output_path=destination if destination is not None else source,
         )
 
     optimized_data, result = _optimize_bytes_sync(data, options)
@@ -730,6 +836,13 @@ def _atomic_write(target: Path, payload: bytes) -> None:
     never collide on the temp path. On any failure, the temp file is
     removed and the original *target* is left untouched — the caller sees
     an ``OSError`` and can report it, but the data on disk is intact.
+
+    **Symlink caveat**: :meth:`Path.replace` maps to POSIX ``rename``,
+    which does **not** follow symlinks. If *target* is a symlink, the temp
+    file replaces the symlink itself rather than the file it points to.
+    This matches ``mv`` behaviour without ``-i``. Callers that rely on
+    symlinks for downloads_dir routing must resolve the target themselves
+    and pass an absolute real path.
 
     Args:
         target: Final path to write to.

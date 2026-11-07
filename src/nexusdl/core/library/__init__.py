@@ -35,6 +35,8 @@ The composition root (CLI / TUI / GUI / Web) constructs one
 :class:`LibraryDatabase`, calls :meth:`LibraryDatabase.init`, and reuses
 it for the process lifetime::
 
+    from pathlib import Path
+
     from nexusdl.core.library import LibraryDatabase, LibraryScanner
 
     db = LibraryDatabase(settings.library.database_path)
@@ -60,9 +62,11 @@ Search and progress round out the API::
 
 Lazy loading
 ------------
-All twenty-seven exports are resolved through PEP 562's ``__getattr__``
-mechanism. Importing ``nexusdl.core.library`` **does not import any
-submodule**.
+Twenty-nine of the thirty-one exports are resolved through PEP 562's
+``__getattr__`` mechanism. The two remaining exports are the
+introspection helpers (:func:`list_symbols`, :func:`get_symbol`), defined
+directly in this module. Importing ``nexusdl.core.library`` **does not
+import any submodule**.
 
 This matters because :mod:`~nexusdl.core.library.database` and
 :mod:`~nexusdl.core.library.scanner` transitively pull in
@@ -73,7 +77,8 @@ needed :func:`build_fts_query` (a pure helper in ``search.py``) or
 ``migrations/__init__.py``) paid that entire cost. After this change,
 they pay only for the module they actually use.
 
-Concrete impact:
+Illustrative impact (numbers approximate, measured on a warm filesystem
+cache; exact timings vary by platform and SQLAlchemy version):
 
 =============================================  =========  =========
 Scenario                                        Before     After
@@ -188,6 +193,57 @@ __all__ = [
 
 
 # ===========================================================================
+# Introspection helpers
+# ===========================================================================
+#
+# Defined before ``__getattr__`` and ``_LAZY`` so they are always bound in
+# ``globals()`` — ``__getattr__`` is only invoked for names that are *not*
+# already present, so these bypass the lazy registry entirely.
+
+def list_symbols() -> list[str]:
+    """Return the sorted list of top-level lazy exports.
+
+    Useful for parametrized tests (``@pytest.mark.parametrize("name",
+    list_symbols())``), schema registries, and tooling that needs to
+    enumerate the library subsystem's public surface without importing
+    every submodule.
+
+    The two introspection helpers (:func:`list_symbols`, :func:`get_symbol`)
+    are part of ``__all__`` but are **not** included in the returned list:
+    they are defined directly in this module and do not live in any
+    submodule.
+    """
+    return sorted(_LAZY.keys())
+
+
+def get_symbol(name: str) -> Any:
+    """Return the library symbol registered under ``name``.
+
+    Equivalent to ``getattr(package, name)`` but with a clearer error
+    message when the name is unknown. Convenient for dynamic lookups
+    (parametrized tests, composition-root builders that resolve a symbol
+    from a config string, library inspectors).
+
+    Both the submodule exports (resolved lazily through :func:`__getattr__`)
+    and the two introspection helpers (defined in this module) are
+    accepted.
+
+    Raises:
+        KeyError: If ``name`` is not a public library export.
+    """
+    if name in ("list_symbols", "get_symbol"):
+        return globals()[name]
+    if name not in _LAZY:
+        available = ", ".join(sorted(_LAZY.keys()))
+        raise KeyError(
+            f"Unknown library symbol {name!r}. Available: {available}. "
+            f"Every other symbol lives in its specific submodule - import "
+            f"from 'nexusdl.core.library.<submodule>' directly."
+        )
+    return __getattr__(name)
+
+
+# ===========================================================================
 # Lazy import registry
 # ===========================================================================
 #
@@ -230,6 +286,19 @@ _LAZY: dict[str, tuple[str, str]] = {
     "MigrationFile": ("migrations", "MigrationFile"),
     "list_migrations": ("migrations", "list_migrations"),
 }
+
+
+# Sanity check: ``__all__`` must be exactly the union of the lazy registry
+# and the two helpers defined in this module. A mismatch means someone
+# added a symbol to one place and forgot the other — silent divergence that
+# only surfaces at runtime as ``AttributeError`` or ``ImportError`` in a
+# specific import path.
+_INTROSPECTION_HELPERS = frozenset({"list_symbols", "get_symbol"})
+assert set(__all__) == set(_LAZY) | _INTROSPECTION_HELPERS, (
+    f"__all__ / _LAZY mismatch: "
+    f"extra in __all__={set(__all__) - set(_LAZY) - _INTROSPECTION_HELPERS}, "
+    f"extra in _LAZY={set(_LAZY) - set(__all__)}"
+)
 
 
 # ===========================================================================
@@ -284,6 +353,15 @@ if TYPE_CHECKING:
 # Lazy loader
 # ===========================================================================
 
+#: Root module names of the optional dependencies that a missing import
+#: might refer to. Compared against ``exc.name.split(".")[0]`` so that a
+#: missing submodule (``sqlalchemy.orm``, ``py7zr.exceptions``) is
+#: attributed to the correct top-level package.
+_OPTIONAL_DEPENDENCY_ROOTS: frozenset[str] = frozenset(
+    {"sqlalchemy", "aiosqlite", "alembic", "py7zr"}
+)
+
+
 def __getattr__(name: str) -> Any:
     """Resolve a public library symbol on first access (PEP 562).
 
@@ -311,6 +389,9 @@ def __getattr__(name: str) -> Any:
             requested name. ``AttributeError`` - rather than
             ``ImportError`` - is required by PEP 562 so that ``hasattr``
             works.
+        ImportError: When the import failure is specifically a missing
+            dependency from the ``[core]`` extra. The original
+            :class:`ModuleNotFoundError` is chained as ``__cause__``.
     """
     # Dunder / special attributes must never route through lazy loading.
     if name.startswith("__"):
@@ -334,13 +415,12 @@ def __getattr__(name: str) -> Any:
     try:
         module = importlib.import_module(f".{submodule_basename}", __name__)
     except ModuleNotFoundError as exc:
-        # Optional dependency missing from the library subsystem.
-        if exc.name in {
-            "sqlalchemy",
-            "aiosqlite",
-            "alembic",
-            "py7zr",
-        }:
+        # Optional dependency missing from the library subsystem. Compare
+        # on the **root** module name so that a missing submodule
+        # (``sqlalchemy.orm``, ``py7zr.exceptions``) is attributed to the
+        # correct top-level package.
+        missing_root = exc.name.split(".")[0] if exc.name else None
+        if missing_root in _OPTIONAL_DEPENDENCY_ROOTS:
             raise ImportError(
                 f"{name!r} requires the core extra (library subsystem "
                 f"dependencies: sqlalchemy[asyncio], aiosqlite, alembic, "
@@ -355,7 +435,7 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(
             f"The library submodule {submodule_basename!r} does not define "
             f"{attr_name!r}. This is a package-internal inconsistency - "
-            f"nexusdl.core.library.__all__ and the submodules are out of "
+            f"nexusdl.core.library._LAZY and the submodules are out of "
             f"sync."
         ) from None
 
@@ -371,51 +451,18 @@ def __dir__() -> list[str]:
     Python's default :func:`dir` implementation collects a module's
     ``__dict__`` and, when the module defines ``__getattr__``, calls it
     with each candidate name to decide what to display. Because none of
-    the twenty-seven exports are present in ``__dict__`` at import time,
-    an unmodified :func:`dir` would not list them - the package would
-    appear empty in a REPL.
+    the lazy exports are present in ``__dict__`` at import time, an
+    unmodified :func:`dir` would not list them - the package would appear
+    empty in a REPL.
 
-    The returned list is :data:`__all__` plus the standard module dunders
-    a user typically expects to see.
+    The returned list is :data:`__all__`, the module dunders, and any
+    attribute already bound in ``globals()`` (whether via a resolved lazy
+    import or via external assignment). This matches Python's contract
+    that ``__dir__`` should report everything accessible through
+    ``getattr``.
     """
     return sorted(
-        set(__all__) | {"__all__", "__doc__", "__name__", "__package__"}
+        set(globals().keys())
+        | set(__all__)
+        | {"__all__", "__doc__", "__name__", "__package__"}
     )
-
-
-# ===========================================================================
-# Introspection helpers
-# ===========================================================================
-
-def list_symbols() -> list[str]:
-    """Return the sorted list of top-level lazy exports.
-
-    Useful for parametrized tests (``@pytest.mark.parametrize("name",
-    list_symbols())``), schema registries, and tooling that needs to
-    enumerate the library subsystem's public surface without importing
-    every submodule.
-    """
-    # Only the twenty-seven public exports, not the introspection helpers
-    # themselves - otherwise ``list_symbols`` would include itself.
-    return sorted(_LAZY.keys())
-
-
-def get_symbol(name: str) -> Any:
-    """Return the library symbol registered under ``name``.
-
-    Equivalent to ``getattr(package, name)`` but with a clearer error
-    message when the name is unknown. Convenient for dynamic lookups
-    (parametrized tests, composition-root builders that resolve a symbol
-    from a config string, library inspectors).
-
-    Raises:
-        KeyError: If ``name`` is not a public library export.
-    """
-    if name not in _LAZY:
-        available = ", ".join(sorted(_LAZY.keys()))
-        raise KeyError(
-            f"Unknown library symbol {name!r}. Available: {available}. "
-            f"Every other symbol lives in its specific submodule - import "
-            f"from 'nexusdl.core.library.<submodule>' directly."
-        )
-    return getattr(__import__(__name__, fromlist=[name]), name)

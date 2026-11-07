@@ -60,12 +60,33 @@ matches a live chapter row — so it does not carry one.
 
 HTTPS enforcement
 -----------------
-:attr:`Page.url` **must** start with ``https://``. Every source site
-NexusDL supports serves HTTPS, and a plaintext image URL is a MITM
+:attr:`Page.url` **must** be a well-formed absolute HTTPS URL. Every source
+site NexusDL supports serves HTTPS, and a plaintext image URL is a MITM
 surface for the page content. A site that genuinely serves HTTP images is
 a bug to fix upstream (or to fix with a proxy), not a compatibility issue
-the model should absorb. The check is cheap and catches more than it
-costs.
+the model should absorb. The URL is parsed with
+:func:`urllib.parse.urlparse` rather than a bare string-prefix check, so
+malformed inputs (``"https://"`` with no host) are rejected before they
+reach the worker's HTTP client.
+
+Filename safety
+---------------
+:attr:`Page.filename` (when set) is used verbatim by the worker to name
+files inside the temporary directory and inside the final CBZ. The model
+rejects every character class that:
+
+* is a path separator on POSIX or Windows (``/`` ``\\``),
+* is reserved by Windows (``<`` ``>`` ``:`` ``"`` ``|`` ``?`` ``*``),
+* is a C0 or C1 control character (``\\x00``–``\\x1f``, ``\\u0080``–``\\u009f``),
+* is a bidi control (``\\u202a``–``\\u202e``, ``\\u2066``–``\\u2069``) — these
+  can spoof the visual representation of a filename,
+* is leading or trailing whitespace.
+
+The 255-character limit (not bytes) matches the filename limit of ext4,
+NTFS, and APFS. A filename longer than that would fail at write time with
+a platform-specific ``OSError``; failing at construction time instead
+gives the parser a clear error message and a stack trace pointing at the
+offending site.
 
 Identity and equality
 ---------------------
@@ -89,6 +110,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Final
+from urllib.parse import urlparse
 
 
 __all__ = ["Page"]
@@ -98,19 +120,61 @@ __all__ = ["Page"]
 # Constants                                                                   #
 # --------------------------------------------------------------------------- #
 
-#: Only ``https://`` URLs are accepted for :attr:`Page.url`. See the module
-#: docstring for the rationale.
-_HTTPS_PREFIX: Final[str] = "https://"
+#: Expected scheme for :attr:`Page.url`. Compared case-insensitively via
+#: :func:`urllib.parse.urlparse` (RFC 3986 §3.1).
+_HTTPS_SCHEME: Final[str] = "https"
 
-#: Characters forbidden in :attr:`Page.filename`. Matches the union of
-#: Windows-reserved characters (``<>:"/\|?*``), POSIX path separators
-#: (``/``), and C0 control characters (``\x00``–``\x1f``). Rejecting the
-#: Windows set even on POSIX is deliberate — NexusDL is cross-platform, and
-#: a parser that produces a valid-POSIX-but-invalid-Windows filename would
-#: produce an unreproducible bug report on a user's machine.
+#: Filename length limit. Matches ext4, NTFS, and APFS — the shortest
+#: filename limit across the platforms NexusDL supports. A longer name
+#: would fail at write time with a platform-specific ``OSError``.
+_MAX_FILENAME_LENGTH: Final[int] = 255
+
+#: Characters forbidden in :attr:`Page.filename`. Matches the union of:
+#:
+#: * Windows-reserved characters (``<>:"/\|?*``),
+#: * POSIX path separator (``/``),
+#: * C0 control characters (``\x00``–``\x1f``).
+#:
+#: Rejecting the Windows set even on POSIX is deliberate — NexusDL is
+#: cross-platform, and a parser that produces a valid-POSIX-but-invalid-
+#: Windows filename would produce an unreproducible bug report on a
+#: user's machine.
 _INVALID_FILENAME_CHARS: Final[re.Pattern[str]] = re.compile(
     r'[<>:"/\\|?*\x00-\x1f]'
 )
+
+#: Additional characters rejected from :attr:`Page.filename`:
+#:
+#: * C1 control characters (``\u0080``–``\u009f``) — invisible and
+#:   unprintable, but not caught by the ASCII-range regex above.
+#: * Bidi control characters (``\u202a``–``\u202e`` and
+#:   ``\u2066``–``\u2069``) — these can make a filename display
+#:   differently from its actual byte content, which is a visual
+#:   spoofing surface even when the parser is trusted code.
+_UNSAFE_UNICODE_CHARS: Final[re.Pattern[str]] = re.compile(
+    "[\u0080-\u009f\u202a-\u202e\u2066-\u2069]"
+)
+
+
+def _is_https_url(value: str) -> bool:
+    """Return ``True`` iff *value* is a well-formed absolute HTTPS URL.
+
+    Performs a full parse rather than a string-prefix check so that
+    ``"https://"`` (no host) and ``"https:// space"`` (whitespace in
+    netloc) are rejected. Scheme is compared case-insensitively —
+    ``"HTTPS://x"`` is accepted per RFC 3986 §3.1.
+
+    Args:
+        value: The candidate URL.
+
+    Returns:
+        ``True`` for well-formed absolute HTTPS URLs with a non-empty host.
+    """
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == _HTTPS_SCHEME and bool(parsed.netloc)
 
 
 # --------------------------------------------------------------------------- #
@@ -138,20 +202,22 @@ class Page:
             Downstream code that displays a 1-based page number should
             use :attr:`page_number` rather than ``index + 1`` inline —
             it reads better and avoids off-by-one mistakes at call sites.
-        url: Absolute ``https://`` URL the parser will download the page
-            from. Not a ``file://`` URL and not a relative path — pages
-            are always fetched from a remote source by the worker. A
-            ``file://`` URL would mean the downloader is a no-op, which
-            is not what the pipeline is for; a local library scanner that
-            imports pre-existing archives does not use :class:`Page` at
-            all (it uses :class:`~nexusdl.core.library.metadata.ExtractedMetadata`).
+        url: Well-formed absolute ``https://`` URL the parser will
+            download the page from. Not a ``file://`` URL and not a
+            relative path — pages are always fetched from a remote source
+            by the worker. A ``file://`` URL would mean the downloader is
+            a no-op, which is not what the pipeline is for; a local
+            library scanner that imports pre-existing archives does not
+            use :class:`Page` at all (it uses
+            :class:`~nexusdl.core.library.metadata.ExtractedMetadata`).
         filename: Optional filename to use on disk, overriding the
             default (``"0001.jpg"``, ``"0002.jpg"``, …) that the worker
             would otherwise derive from :attr:`index` and :attr:`url`.
             When set, the value **must** be a single-component filename:
-            no path separators, no ``.`` or ``..``, no C0 control
-            characters, no Windows-reserved characters, no leading or
-            trailing whitespace. The worker uses the value verbatim; the
+            no path separators, no ``.`` or ``..``, no C0 / C1 control
+            characters, no bidi control characters, no Windows-reserved
+            characters, no leading or trailing whitespace, and at most
+            255 characters. The worker uses the value verbatim; the
             parser is responsible for making it unique within the
             chapter.
         width: Optional pixel width of the page, when the site exposes
@@ -176,8 +242,8 @@ class Page:
 
         Raises:
             TypeError: If a field has the wrong Python type.
-            ValueError: If ``index`` is negative, ``url`` does not start
-                with ``https://``, ``filename`` is not a valid
+            ValueError: If ``index`` is negative, ``url`` is not a
+                well-formed HTTPS URL, ``filename`` is not a valid
                 single-component filename, or ``width`` / ``height`` is
                 non-positive.
         """
@@ -196,10 +262,10 @@ class Page:
             raise TypeError(
                 f"Page.url must be a str, got {type(self.url).__name__}"
             )
-        if not self.url.startswith(_HTTPS_PREFIX):
+        if not _is_https_url(self.url):
             raise ValueError(
-                f"Page.url must start with {_HTTPS_PREFIX!r}, got "
-                f"{self.url!r}"
+                f"Page.url must be a well-formed absolute HTTPS URL, "
+                f"got {self.url!r}"
             )
 
         # --- filename ------------------------------------------------ #
@@ -236,9 +302,11 @@ class Page:
             filename: The candidate filename.
 
         Raises:
-            ValueError: If the name is empty, is ``.`` or ``..``, contains
-                a path separator, contains a Windows-reserved or C0
-                control character, or has leading / trailing whitespace.
+            ValueError: If the name is empty, is ``.`` or ``..``, exceeds
+                :data:`_MAX_FILENAME_LENGTH`, contains a path separator, a
+                Windows-reserved character, a C0 / C1 control character,
+                a bidi control character, or has leading / trailing
+                whitespace.
         """
         if not filename:
             raise ValueError(
@@ -248,9 +316,21 @@ class Page:
             raise ValueError(
                 f"Page.filename must not be {filename!r}"
             )
+        if len(filename) > _MAX_FILENAME_LENGTH:
+            raise ValueError(
+                f"Page.filename must be at most "
+                f"{_MAX_FILENAME_LENGTH} characters, got {len(filename)} "
+                f"(was the site-supplied title unusually long?)"
+            )
         if _INVALID_FILENAME_CHARS.search(filename):
             raise ValueError(
-                f"Page.filename contains invalid characters: {filename!r}"
+                f"Page.filename contains invalid ASCII characters: "
+                f"{filename!r}"
+            )
+        if _UNSAFE_UNICODE_CHARS.search(filename):
+            raise ValueError(
+                f"Page.filename contains control or bidi characters: "
+                f"{filename!r}"
             )
         if filename != filename.strip():
             raise ValueError(

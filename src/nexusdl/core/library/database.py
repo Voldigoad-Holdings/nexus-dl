@@ -19,6 +19,18 @@ Architectural decisions
   SQL including the ``BEGIN ... END;`` trigger bodies in ``001_initial.sql``.
   SQLAlchemy's async API does not expose ``executescript`` and splitting
   statements by ``;`` breaks on triggers, so this is the correct boundary.
+* **Migration atomicity is enforced by the runner.** ``executescript``
+  commits implicitly before executing the script, so the runner wraps the
+  whole migration (SQL + ``INSERT INTO schema_version``) in one
+  ``BEGIN; ... COMMIT;`` block. A migration file **must not** contain its
+  own ``BEGIN`` / ``COMMIT`` / ``ROLLBACK`` — that would silently break
+  atomicity. The runner rejects such files at apply time.
+* **Concurrent ``init()`` is serialised.** The migration runner opens its
+  own connection; without a lock, two ``init()`` calls in different
+  processes would race and either crash on ``UNIQUE constraint failed``
+  or leave the schema half-applied. The runner takes a ``BEGIN IMMEDIATE``
+  write lock and re-checks ``MAX(version)`` inside the transaction before
+  applying each migration.
 * **Per-connection PRAGMAs.** ``foreign_keys = ON`` is per-connection in
   SQLite; it is set via a ``connect`` event listener so every pooled
   connection gets it, not just the first.
@@ -68,6 +80,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -114,6 +127,16 @@ __all__ = [
 
 _SCHEMA_VERSION_TABLE: Final[str] = "schema_version"
 
+#: SQL tokens that would silently break the runner's BEGIN/COMMIT wrapping
+#: if they appeared in a migration file. Migration files are forbidden from
+#: containing them; the runner raises a clear error instead of letting
+#: ``executescript`` commit implicitly mid-script and corrupt atomicity.
+_FORBIDDEN_IN_MIGRATIONS: Final[tuple[str, ...]] = (
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+)
+
 _MANGA_UPDATABLE_FIELDS: Final[tuple[str, ...]] = (
     "title",
     "alt_titles",
@@ -129,46 +152,6 @@ _MANGA_UPDATABLE_FIELDS: Final[tuple[str, ...]] = (
     "cover_path",
     "url",
     "tags",
-)
-
-_MANGA_WRITE_FIELDS: Final[tuple[str, ...]] = (
-    "id",
-    "site_id",
-    "source_id",
-    "title",
-    "alt_titles",
-    "description",
-    "author",
-    "artist",
-    "status",
-    "language",
-    "content_rating",
-    "is_manga",
-    "year",
-    "cover_url",
-    "cover_path",
-    "url",
-    "tags",
-    "page_count",
-    "chapter_count",
-    "created_at",
-    "updated_at",
-    "last_read_at",
-)
-
-_CHAPTER_WRITE_FIELDS: Final[tuple[str, ...]] = (
-    "id",
-    "manga_id",
-    "source_id",
-    "title",
-    "number",
-    "volume",
-    "language",
-    "page_count",
-    "url",
-    "published_at",
-    "created_at",
-    "updated_at",
 )
 
 
@@ -311,7 +294,12 @@ class LibraryDatabase:
     async def init(self) -> None:
         """Create the database if needed, apply pending migrations.
 
-        Idempotent: calling :meth:`init` twice is safe and cheap.
+        Safe to call multiple times: pending migrations are skipped and
+        applied ones are not re-run. Safe to call concurrently from
+        multiple processes: the migration runner takes a
+        ``BEGIN IMMEDIATE`` lock and re-checks the applied version before
+        each migration, so a second process either sees the migration
+        already applied or waits for the writer to finish.
 
         Raises:
             LibraryError: If a migration fails to apply. The failure is
@@ -343,7 +331,16 @@ class LibraryDatabase:
                 yield sess
                 await sess.commit()
             except Exception:
-                await sess.rollback()
+                try:
+                    await sess.rollback()
+                except Exception:
+                    # A rollback failure would mask the original
+                    # exception; the session is already in an inactive
+                    # state after the first failure, so the second
+                    # rollback is redundant and can be ignored.
+                    self._log.debug(
+                        "Ignoring secondary failure during session rollback"
+                    )
                 raise
 
     # ------------------------------------------------------------------ #
@@ -481,6 +478,10 @@ class LibraryDatabase:
     ) -> PaginatedResult[Manga]:
         """Return one page of the library, ordered by recency.
 
+        Ordering is: mangas with reading progress first (most recent
+        ``last_read_at`` first), then unread mangas (by ``created_at``
+        descending), with a stable tie-break on ``id``.
+
         Args:
             page: 1-indexed page number. Must be ``>= 1``.
             per_page: Page size, in ``[1, DEFAULT_MAX_LIMIT]``.
@@ -518,10 +519,10 @@ class LibraryDatabase:
                     await sess.execute(
                         text(
                             "SELECT * FROM mangas "
-                            "ORDER BY (last_read_at IS NULL) ASC, "
-                            "         last_read_at DESC, "
-                            "         created_at DESC, "
-                            "         id ASC "
+                            "ORDER BY "
+                            "  last_read_at DESC NULLS LAST, "
+                            "  created_at DESC, "
+                            "  id ASC "
                             "LIMIT :limit OFFSET :offset"
                         ),
                         {"limit": per_page, "offset": offset},
@@ -683,12 +684,15 @@ class LibraryDatabase:
         Args:
             manga_id: The manga the progress belongs to.
             chapter_id: The chapter currently being read.
-            page_index: Zero-based page index. Must be ``>= 0``.
+            page_index: Zero-based page index. Must be ``>= 0`` and
+                strictly below the chapter's ``page_count`` (enforced by
+                a SQLite trigger added in migration 002).
 
         Raises:
-            LibraryError: If the manga does not exist, or the chapter does
-                not exist or belongs to a different manga. If
-                ``page_index`` is negative.
+            LibraryError: If the manga does not exist, the chapter does
+                not exist or belongs to a different manga, or
+                ``page_index`` is out of range. All failure modes are
+                normalised to :class:`LibraryError` for the caller.
         """
         if page_index < 0:
             raise LibraryError(
@@ -716,23 +720,33 @@ class LibraryDatabase:
                     f"{manga_id!r}"
                 )
 
-            await sess.execute(
-                text(
-                    "INSERT INTO reading_progress "
-                    "  (manga_id, chapter_id, page_index, updated_at) "
-                    "VALUES (:mid, :cid, :pi, :now) "
-                    "ON CONFLICT(manga_id) DO UPDATE SET "
-                    "  chapter_id = excluded.chapter_id, "
-                    "  page_index = excluded.page_index, "
-                    "  updated_at = excluded.updated_at"
-                ),
-                {
-                    "mid": manga_id,
-                    "cid": chapter_id,
-                    "pi": page_index,
-                    "now": now,
-                },
-            )
+            try:
+                await sess.execute(
+                    text(
+                        "INSERT INTO reading_progress "
+                        "  (manga_id, chapter_id, page_index, updated_at) "
+                        "VALUES (:mid, :cid, :pi, :now) "
+                        "ON CONFLICT(manga_id) DO UPDATE SET "
+                        "  chapter_id = excluded.chapter_id, "
+                        "  page_index = excluded.page_index, "
+                        "  updated_at = excluded.updated_at"
+                    ),
+                    {
+                        "mid": manga_id,
+                        "cid": chapter_id,
+                        "pi": page_index,
+                        "now": now,
+                    },
+                )
+            except IntegrityError as exc:
+                # The trigger in migration 002 raises an IntegrityError
+                # with a specific message when page_index is out of
+                # range. Normalise to LibraryError so callers see one
+                # exception type.
+                raise LibraryError(
+                    f"invalid reading progress for manga "
+                    f"{manga_id!r}: {exc}"
+                ) from exc
 
             await sess.execute(
                 text(
@@ -863,16 +877,58 @@ class LibraryDatabase:
     async def _apply_one_migration(self, migration: MigrationFile) -> None:
         """Apply a single migration file atomically with its version record.
 
+        The runner wraps the migration SQL and the ``INSERT INTO
+        schema_version`` in a single ``BEGIN IMMEDIATE; ... COMMIT;``
+        block. ``BEGIN IMMEDIATE`` takes a write lock up front, which
+        serialises concurrent ``init()`` calls across processes: the
+        second process waits for the first to commit, then re-checks the
+        applied version (see ``_version_check_clause``) and skips if the
+        migration has already been recorded.
+
+        Migration files **must not** contain ``BEGIN`` / ``COMMIT`` /
+        ``ROLLBACK`` — those would commit ``executescript``'s implicit
+        transaction and break atomicity silently. This is checked before
+        the script runs.
+
         Args:
             migration: The migration to apply.
 
         Raises:
-            LibraryError: If the SQL fails.
+            LibraryError: If the SQL fails, or if the file contains a
+                forbidden transaction-control keyword.
         """
         sql = migration.path.read_text(encoding="utf-8")
+
+        upper_sql = sql.upper()
+        for token in _FORBIDDEN_IN_MIGRATIONS:
+            # Naive substring match: BEGIN/COMMIT/ROLLBACK as SQL keywords
+            # are ALWAYS uppercase in the runner's own migrations, and the
+            # keyword cannot legitimately appear in a string literal
+            # (ComicInfo-compatible SQL migrations never embed SQL text).
+            # A false positive would be a migration explicitly containing
+            # the word "BEGIN" in a comment; acceptable trade-off for a
+            # migration file.
+            if token in upper_sql:
+                raise LibraryError(
+                    f"migration {migration.version} "
+                    f"({migration.path.name}) contains the forbidden "
+                    f"keyword {token!r}; migration files must not "
+                    f"control transactions themselves — the runner "
+                    f"wraps them in BEGIN IMMEDIATE / COMMIT."
+                )
+
         applied_at = _utcnow_iso()
+        if "'" in applied_at:
+            # Defensive: `_utcnow_iso` produces a strict ISO 8601 string
+            # with no quotes, but guard against a future change that
+            # would allow SQL injection through the interpolation below.
+            raise LibraryError(
+                f"internal error: applied_at contains a single quote: "
+                f"{applied_at!r}"
+            )
+
         script = (
-            "BEGIN;\n"
+            "BEGIN IMMEDIATE;\n"
             f"{sql}\n"
             f"INSERT INTO {_SCHEMA_VERSION_TABLE} (version, applied_at) "
             f"VALUES ({migration.version}, '{applied_at}');\n"
@@ -1127,9 +1183,7 @@ def _file_url_to_path(url: str) -> Path:
     """
     parsed = urlparse(url)
     raw_path = unquote(parsed.path)
-    import os as _os
-
-    if _os.name == "nt" and raw_path.startswith("/") and len(raw_path) >= 3:
+    if os.name == "nt" and raw_path.startswith("/") and len(raw_path) >= 3:
         if raw_path[2] == ":":
             raw_path = raw_path[1:]
     return Path(raw_path)

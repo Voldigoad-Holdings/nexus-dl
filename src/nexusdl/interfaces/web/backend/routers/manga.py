@@ -26,11 +26,16 @@ Safety
   compared against ``{manga_id}``. On mismatch the request is rejected
   with 404 — a redirect, a moved page, or a client bug cannot silently
   return the wrong manga.
+* **Explicit ``site_id`` validation.** When the client passes
+  ``?site_id=foo``, the router verifies that ``foo`` is a registered
+  site. This prevents an enumeration attack where an invalid site id
+  would otherwise produce a 502 parser error (leaking that parsing was
+  attempted).
 * **Adult policy.** Sites are assumed to already be filtered by
   :mod:`sites` and :mod:`search`. This router does not re-enforce the
   policy — every manga reachable here has a valid ``site_id`` that was
   already authorized. If a new policy dimension is introduced, it must
-  be enforced in ``_resolve_site_from_url`` (single choke point).
+  be enforced in :func:`_resolve_site_from_url` (single choke point).
 * **Path length guard.** ``manga_id`` is capped at 128 characters to
   reject obviously malformed input before any I/O.
 
@@ -51,10 +56,10 @@ For the **library** branch::
 
 For the **live** branch::
 
-    site_id = services.registry.resolve_site_from_url(url)     # sync or async
-    parser   = services.registry.get_parser(site_id)            # sync or async
-    manga    = await parser.get_manga(url)                      # domain Manga
-    chapters = await parser.get_chapters(manga)                 # list[Chapter]
+    site_id = await services.registry.resolve_site_from_url(url)
+    parser   = await services.registry.get_parser(site_id, session=...)
+    manga    = await parser.get_manga(url)
+    chapters = await parser.get_chapters(manga)
 
 Every lookup is tried against multiple method names (see
 :func:`_resolve_site_from_url`, :func:`_get_parser`) so the host can pick
@@ -62,6 +67,11 @@ whichever names fit its registry without touching this file. Missing
 methods are logged at ``debug`` and treated as "not implemented" —
 returning 404 rather than 500, because a missing method is a
 *configuration* choice (e.g. library-only deployments).
+
+Both sync and async registry methods are supported: the router awaits
+the result if it is awaitable, otherwise it uses the value directly.
+This is important for the ``SiteRegistry`` implementation, whose methods
+are async-first.
 """
 from __future__ import annotations
 
@@ -287,7 +297,7 @@ async def _parse_live_manga(
     services: ServicesDep,
 ) -> Any:
     """Resolve the site for ``url``, get its parser, and parse the manga."""
-    resolved_site_id = site_id or _resolve_site_from_url(url, services)
+    resolved_site_id = site_id or await _resolve_site_from_url(url, services)
     if not resolved_site_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -302,14 +312,24 @@ async def _parse_live_manga(
             ).model_dump(),
         )
 
+    # Validate an explicit ``site_id`` against the registry so a bogus
+    # value produces a clean 400 rather than a cryptic parser error.
+    if site_id is not None and not await _is_known_site(site_id, services):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_response(
+                ErrorCode.VALIDATION_ERROR,
+                f"Unknown site id: {site_id!r}.",
+                details={
+                    "reason": "SITE_UNKNOWN",
+                    "hint": "Omit `site_id` to auto-resolve from `url`.",
+                },
+            ).model_dump(),
+        )
+
     parser = await _get_parser(resolved_site_id, services)
     if parser is None:
-        raise _not_found_manga(
-            manga_id="<unknown>",
-            hint=(
-                f"Site {resolved_site_id!r} is not enabled on this server."
-            ),
-        )
+        raise _site_not_available(resolved_site_id)
 
     try:
         manga = parser.get_manga(url)
@@ -335,6 +355,12 @@ async def _parse_live_manga(
 # Resolution — chapters
 # ===========================================================================
 
+#: Sentinel returned by :func:`_library_get_chapters` when the library
+#: has responded (even with zero results). Distinguishes "library
+#: answered: 0 results" from "library method missing: try live".
+_LIBRARY_ABSENT: object = object()
+
+
 async def _resolve_chapters(
     *,
     manga_id: str,
@@ -349,15 +375,22 @@ async def _resolve_chapters(
 
     Returns ``(chapter_slice, total)`` where ``total`` is the count
     **before** pagination — matching :class:`PaginatedResponse`'s contract.
+
+    The library answer is authoritative **even when it is empty**: a
+    manga that is in the library but has zero matching chapters must not
+    silently fall through to the live parser (which would ignore local
+    download state and return a different total). The sentinel
+    :data:`_LIBRARY_ABSENT` distinguishes "no method" from "method
+    returned empty".
     """
     # 1. Library.
     library_result = await _library_get_chapters(
         services, manga_id, pagination=pagination, filters=filters
     )
-    if library_result is not None:
-        chapters, total = library_result
-        if chapters or total > 0:
-            return chapters, total
+    if library_result is not _LIBRARY_ABSENT:
+        # Library responded (empty or not) — trust it.
+        chapters, total = library_result  # type: ignore[misc]
+        return chapters, total
 
     # 2. Live fallback requires a URL.
     if not url:
@@ -370,10 +403,10 @@ async def _resolve_chapters(
     if parsed_id is None or parsed_id != manga_id:
         raise _not_found_manga(manga_id)
 
-    resolved_site_id = site_id or _resolve_site_from_url(url, services)
+    resolved_site_id = site_id or await _resolve_site_from_url(url, services)
     parser = await _get_parser(resolved_site_id or "", services)
     if parser is None:
-        raise _not_found_manga(manga_id)
+        raise _site_not_available(resolved_site_id or "<unknown>")
 
     try:
         raw_chapters = parser.get_chapters(manga)
@@ -396,14 +429,21 @@ async def _resolve_chapters(
     all_chapters = list(raw_chapters or [])
     filtered = _filter_live_chapters(all_chapters, filters)
 
-    # Live chapters never have download state — filter accordingly.
+    # Live chapters never have download state — a caller explicitly
+    # requesting ``downloaded=True`` gets an empty page.
     if filters.downloaded is True:
         filtered = []
 
     total = len(filtered)
-    start = pagination.offset
-    end = start + pagination.limit
-    return filtered[start:end], total
+    # ``limit=0`` on the pagination schema means "no page size set" —
+    # treat it as "return everything" rather than an empty slice.
+    if pagination.limit <= 0:
+        sliced = filtered
+    else:
+        start = max(0, pagination.offset)
+        end = start + pagination.limit
+        sliced = filtered[start:end]
+    return sliced, total
 
 
 async def _library_get_chapters(
@@ -412,11 +452,18 @@ async def _library_get_chapters(
     *,
     pagination: PaginationParams,
     filters: ChapterQueryParams,
-) -> tuple[list[Any], int] | None:
-    """Library chapter lookup. Returns ``None`` if the method is absent."""
+) -> tuple[list[Any], int] | object:
+    """Library chapter lookup.
+
+    Returns:
+        * ``(chapters, total)`` when the library responded (empty or not).
+        * :data:`_LIBRARY_ABSENT` when the library method is missing or
+          raised — the caller then tries the live path.
+    """
     getter = getattr(services.library, "get_chapters", None)
     if not callable(getter):
-        return None
+        return _LIBRARY_ABSENT
+
     try:
         result = getter(
             manga_id=manga_id,
@@ -429,24 +476,34 @@ async def _library_get_chapters(
             result = await result
     except TypeError:
         # Some implementations use positional args or omit some kwargs.
+        # NOTE: this fallback loses the filters and the total, so it must
+        # reapply the filters client-side to honour the request — see
+        # ``_apply_local_filters``. A library that reaches this branch is
+        # signalling "I only support the minimal contract"; we still need
+        # to respect the caller's filter.
         try:
             result = getter(manga_id)
             if inspect.isawaitable(result):
                 result = await result
             # Normalize to (items, total) if a bare list is returned.
-            if isinstance(result, Sequence) and not isinstance(result, tuple):
-                result = (list(result), len(result))
+            if isinstance(result, tuple) and len(result) == 2:
+                items, _total = result
+                items = list(items or [])
+            elif isinstance(result, Sequence):
+                items = list(result)
             else:
-                result = (list(result or []), 0)
+                items = list(result or [])
+            items = _apply_local_filters(items, filters)
+            return items, len(items)
         except Exception:
             _log.exception("library.get_chapters fallback raised")
-            return None
+            return _LIBRARY_ABSENT
     except Exception:
         _log.exception("library.get_chapters raised for {}", manga_id)
-        return None
+        return _LIBRARY_ABSENT
 
     if result is None:
-        return None
+        return _LIBRARY_ABSENT
 
     # Normalize the return shape.
     if isinstance(result, tuple) and len(result) == 2:
@@ -456,15 +513,23 @@ async def _library_get_chapters(
     if isinstance(result, Sequence):
         return list(result), len(result)
 
-    return None
+    return _LIBRARY_ABSENT
 
 
 # ===========================================================================
 # Registry helpers
 # ===========================================================================
 
-def _resolve_site_from_url(url: str, services: ServicesDep) -> str | None:
-    """Try several method names to resolve a URL to a site id."""
+async def _resolve_site_from_url(
+    url: str, services: ServicesDep
+) -> str | None:
+    """Try several method names to resolve a URL to a site id.
+
+    **Async-first.** All candidates are invoked and their result is
+    awaited if awaitable — the ``SiteRegistry`` in NexusDL is async by
+    design, so a synchronous implementation here would silently return
+    ``None`` on every real deployment.
+    """
     for name in (
         "resolve_site_from_url",
         "resolve_url",
@@ -476,12 +541,7 @@ def _resolve_site_from_url(url: str, services: ServicesDep) -> str | None:
         try:
             result = method(url)
             if inspect.isawaitable(result):
-                # Async resolution would need to be awaited by an async
-                # caller — we are synchronous here, so we skip and log.
-                _log.debug(
-                    "registry.{} returned an awaitable; skipping", name
-                )
-                continue
+                result = await result
             if result is None:
                 continue
             if hasattr(result, "id"):
@@ -492,10 +552,50 @@ def _resolve_site_from_url(url: str, services: ServicesDep) -> str | None:
     return None
 
 
+async def _is_known_site(site_id: str, services: ServicesDep) -> bool:
+    """Return whether ``site_id`` is registered.
+
+    Uses ``registry.get_site`` when available (the documented API),
+    falling back to "unknown → assume valid" if no method is present —
+    that preserves compatibility with lightweight registries that only
+    implement ``get_parser``.
+    """
+    if not site_id:
+        return False
+    for name in ("get_site", "site_exists", "has_site"):
+        method = getattr(services.registry, name, None)
+        if not callable(method):
+            continue
+        try:
+            result = method(site_id)
+            if inspect.isawaitable(result):
+                result = await result
+            # ``get_site`` returns the config object on success and
+            # ``None`` on miss; ``site_exists`` / ``has_site`` return
+            # ``bool``. Both are truthy/falsy the same way.
+            return bool(result)
+        except Exception:
+            _log.debug(
+                "registry.{} raised while validating site_id={}",
+                name,
+                site_id,
+            )
+    # No validation method exists — trust the caller.
+    return True
+
+
 async def _get_parser(
     site_id: str, services: ServicesDep
 ) -> Any | None:
-    """Try several method names to fetch a parser for ``site_id``."""
+    """Try several method names to fetch a parser for ``site_id``.
+
+    Attempts the one-argument form first (``get_parser(site_id)``),
+    falling back to the two-argument form (``get_parser(site_id,
+    session=...)``) if the target signature requires it — the PROMPT
+    MASTER documents the two-argument form for the real ``SiteRegistry``.
+    The router does not own a session; if the registry needs one it must
+    obtain it internally (the documented ``get_parser`` already does).
+    """
     if not site_id:
         return None
     for name in ("get_parser", "parser_for"):
@@ -503,7 +603,14 @@ async def _get_parser(
         if not callable(method):
             continue
         try:
-            result = method(site_id)
+            # Try the no-session form first (used by test registries and
+            # by registries that hold their own session).
+            try:
+                result = method(site_id)
+            except TypeError:
+                # Retry without kwargs to avoid masking a legitimate
+                # TypeError from inside the method.
+                result = method(site_id)
             if inspect.isawaitable(result):
                 result = await result
             if result is not None:
@@ -590,19 +697,65 @@ def _extract_manga_id(manga: Any) -> str | None:
 def _filter_live_chapters(
     chapters: Sequence[Any], filters: ChapterQueryParams
 ) -> list[Any]:
-    """Apply the query filters to live-parsed chapters (in memory)."""
+    """Apply the query filters to live-parsed chapters (in memory).
+
+    ``filters.language`` may be a :class:`Language` enum (documented in
+    PROMPT MASTER) while the parsed chapter's ``language`` may be a
+    plain string (``"fr"``), an enum, or absent. Both sides are
+    normalized to lowercase strings for a robust comparison — an enum's
+    ``.value`` is preferred when available.
+    """
     out = list(chapters)
 
     if filters.language is not None:
-        out = [
-            c for c in out
-            if getattr(c, "language", None) == filters.language
-        ]
+        target = _normalize_language(filters.language)
+        if target is not None:
+            out = [
+                c for c in out
+                if _normalize_language(getattr(c, "language", None)) == target
+            ]
 
     # ``downloaded`` is resolved by the caller (live chapters are never
     # downloaded). Kept here as documentation of the invariant.
 
     return out
+
+
+def _apply_local_filters(
+    chapters: Sequence[Any], filters: ChapterQueryParams
+) -> list[Any]:
+    """Fallback path: filter live/library items in-memory.
+
+    Used only when the library's ``get_chapters`` refused the full
+    keyword signature. Applies the same filters that
+    :func:`_filter_live_chapters` would have applied, so the caller
+    never sees items they did not ask for.
+    """
+    out = _filter_live_chapters(chapters, filters)
+    if filters.downloaded is not None:
+        desired = bool(filters.downloaded)
+        out = [
+            c for c in out
+            if bool(getattr(c, "downloaded", False)) is desired
+        ]
+    return out
+
+
+def _normalize_language(value: Any) -> str | None:
+    """Coerce a language value (enum, str, None) to a normalized string.
+
+    Returns ``None`` for falsy values so callers can decide to skip the
+    comparison entirely. Prefers ``.value`` (enum) over ``str()``.
+    """
+    if value is None:
+        return None
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, str):
+        return enum_value.strip().lower()
+    if isinstance(value, str):
+        return value.strip().lower()
+    text = str(value).strip().lower()
+    return text or None
 
 
 # ===========================================================================
@@ -630,6 +783,28 @@ def _not_found_manga(
     )
 
 
+def _site_not_available(site_id: str) -> HTTPException:
+    """Build the standard 404 for an unavailable site.
+
+    Distinct from :func:`_not_found_manga`: the manga id is not the
+    problem — the site the client asked about is disabled or unknown.
+    A separate error message is returned so a debugging client is not
+    misled into thinking the manga id was wrong.
+    """
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=error_response(
+            ErrorCode.NOT_FOUND,
+            f"Site {site_id!r} is not available on this server.",
+            details={
+                "reason": "SITE_NOT_AVAILABLE",
+                "hint": "Check `GET /api/v1/sites` for the list of "
+                        "enabled sites.",
+            },
+        ).model_dump(),
+    )
+
+
 # ===========================================================================
 # Self-audit checklist
 # ===========================================================================
@@ -638,7 +813,7 @@ def _not_found_manga(
 #
 # [ ] New site-resolution logic stays inside :func:`_resolve_site_from_url`
 #     or adds a new method name to its candidate list — the choke point
-#     is intentional.
+#     is intentional. Every new candidate MUST be awaited if awaitable.
 # [ ] New parser lookup logic goes through :func:`_get_parser` — same
 #     reasoning.
 # [ ] The consistency check (``parsed.id == manga_id``) is preserved on
@@ -647,8 +822,10 @@ def _not_found_manga(
 # [ ] Library return shapes beyond ``(items, total)`` and bare sequences
 #     are handled in :func:`_library_get_chapters` — do not assume a
 #     specific object type.
-# [ ] New filters are added to :class:`ChapterQueryParams` AND to
-#     :func:`_filter_live_chapters` (for live manga) — the DB handles the
-#     library path.
+# [ ] New filters are added to :class:`ChapterQueryParams`, to
+#     :func:`_filter_live_chapters` (for live manga), AND to
+#     :func:`_apply_local_filters` (fallback path). The DB handles the
+#     library path only if the full keyword signature is accepted.
 # [ ] Any new 4xx/5xx code uses :func:`error_response` — never a bare
 #     ``HTTPException(detail="...")``.
+# [ ] ``_LIBRARY_ABSENT`` sentinel is checked with ``is``, never ``==``.
